@@ -83,12 +83,12 @@ function compressVideo(inputPath, outputPath) {
         ffmpeg(inputPath)
             .outputOptions([
                 "-c:v libx264",
-                "-crf 28",            // فشرده‌سازی با حفظ کیفیت مناسب
-                "-preset fast",
-                "-vf scale=-2:480",   // تغییر رزولوشن به 480p
+                "-crf 28",
+                "-preset ultrafast",   // حداکثر سرعت در پردازش FFmpeg
+                "-vf scale=-2:480",     // انکود به 480p
                 "-c:a aac",
                 "-b:a 128k",
-                "-movflags +faststart" // قابلیت پخش مستقیم
+                "-movflags +faststart" // ساخت هدر مناسب جهت قابلیت پخش مستقیم
             ])
             .save(outputPath)
             .on("end", () => resolve(outputPath))
@@ -107,7 +107,7 @@ function splitVideoByBitrate(inputPath, targetMaxBytes) {
                 return reject(new Error("امکان محاسبه مدت زمان یا حجم ویدیو وجود ندارد."));
             }
 
-            // محاسبه نرخ بیت تقریبی و طول زمانی هر پارت جهت پر کردن حاشیه امن ۹۵٪ ظرفیت ۲۰ مگابایت
+            // محاسبه نرخ بیت تقریبی و زمان‌بندی هر پارت برای تکمیل حداکثر ظرفیت ۲۰ مگابایت
             const bytesPerSecond = totalSize / duration;
             const targetSegmentDuration = Math.floor((targetMaxBytes * 0.95) / bytesPerSecond);
 
@@ -140,7 +140,7 @@ function splitVideoByBitrate(inputPath, targetMaxBytes) {
 
                 command
                     .outputOptions([
-                        "-c copy", // کپی بدون انکود مجدد جهت سرعت بالا پس از فشرده‌سازی اولیه
+                        "-c copy", // کپی مستقیم استریم بدون انکود مجدد
                         "-avoid_negative_ts make_zero",
                         "-movflags +faststart"
                     ])
@@ -225,12 +225,13 @@ function cleanUpFiles(...filePaths) {
         const msg = messages[0];
         let lastUpdate = Date.now();
 
-        console.log("Downloading directly to file...");
+        console.log("Downloading directly to file with multi-threading...");
         await client.downloadMedia(msg.media, {
             outputFile: rawFilePath,
+            workers: 8, // افزایش نخ‌های دانلود برای حداکثر پهنای باند
             progressCallback: async (downloaded, total) => {
                 const now = Date.now();
-                if (now - lastUpdate > 3500 || downloaded === total) {
+                if (now - lastUpdate > 5000 || downloaded === total) {
                     lastUpdate = now;
                     const percent = total ? Math.floor((downloaded / total) * 100) : 0;
                     const bar = drawProgressBar(percent);
@@ -262,7 +263,7 @@ function cleanUpFiles(...filePaths) {
         }
 
         const fileSize = fs.statSync(targetUploadPath).size;
-        console.log(`Processing complete. Final file size: ${fileSize} bytes`);
+        console.log(`Processing complete. Final upload size: ${fileSize} bytes`);
 
         const rawCaption = msg.text || msg.caption || "";
         const endpoint = isVideo ? "sendVideo" : "sendDocument";
@@ -274,7 +275,7 @@ function cleanUpFiles(...filePaths) {
             const formData = new FormData();
             formData.append("chat_id", BALE_CHAT_ID);
             if (rawCaption) {
-                formData.append("caption", truncateCaption(rawCaption));
+                formData.append("caption", truncateCaption(rawCaption)); // رعایت سقف زیرنویس[cite: 1]
             }
             
             const uploadFileName = isVideo ? "video.mp4" : path.basename(targetUploadPath);
@@ -310,7 +311,7 @@ function cleanUpFiles(...filePaths) {
                     `📤 **در حال ارسال پارت ${i + 1} از ${totalParts} به بله...**\n\`[${drawProgressBar(Math.floor(((i + 1) / totalParts) * 100))}]\``
                 );
 
-                const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`);
+                const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`); // رعایت سقف زیرنویس[cite: 1]
 
                 const formData = new FormData();
                 formData.append("chat_id", BALE_CHAT_ID);
