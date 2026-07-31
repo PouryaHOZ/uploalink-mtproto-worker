@@ -16,7 +16,7 @@ const {
 } = process.env;
 
 const BALE_MAX_BYTES = 20 * 1024 * 1024;
-const BALE_MAX_CAPTION_LENGTH = 4096; // حداکثر طول مجاز زیرنویس در بله[cite: 1]
+const BALE_MAX_CAPTION_LENGTH = 4096;
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return "0 Bytes";
@@ -36,11 +36,8 @@ function truncateCaption(text, limit = BALE_MAX_CAPTION_LENGTH) {
     return text.length > limit ? text.substring(0, limit - 3) + "..." : text;
 }
 
-async function updateTelegramStatus(messageId, text) {
-    if (!TELEGRAM_BOT_TOKEN) {
-        console.error("TELEGRAM_BOT_TOKEN environment variable is missing!");
-        return null;
-    }
+async function updateTelegramStatus(messageId, text, replyMarkup = null) {
+    if (!TELEGRAM_BOT_TOKEN) return null;
 
     try {
         const url = messageId
@@ -51,6 +48,10 @@ async function updateTelegramStatus(messageId, text) {
             ? { chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: "Markdown" }
             : { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "Markdown" };
 
+        if (replyMarkup) {
+            body.reply_markup = replyMarkup;
+        }
+
         const res = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -58,15 +59,73 @@ async function updateTelegramStatus(messageId, text) {
         });
 
         const data = await res.json();
-        if (!data.ok) {
-            console.error("Telegram API Error:", JSON.stringify(data));
-            return messageId;
-        }
+        if (!data.ok) return messageId;
         return messageId || data.result?.message_id;
     } catch (err) {
-        console.error("Failed to update Telegram status message:", err.message);
         return messageId;
     }
+}
+
+/**
+ * Sends a message with Inline Keyboard buttons and polls until the user makes a choice.
+ */
+async function askCompressionPreference(statusMsgId) {
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: "⚡ Compress (480p)", callback_data: "compress_yes" },
+                { text: "📁 Keep Original", callback_data: "compress_no" }
+            ]
+        ]
+    };
+
+    const text = "🎬 **Video detected!**\nDo you want to compress the video before transferring?";
+    statusMsgId = await updateTelegramStatus(statusMsgId, text, keyboard);
+
+    // Poll Telegram getUpdates API for the button interaction
+    let userChoice = null;
+    let offset = 0;
+
+    // Get initial offset to ignore old updates
+    try {
+        const initRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1`);
+        const initData = await initRes.json();
+        if (initData.ok && initData.result.length > 0) {
+            offset = initData.result[initData.result.length - 1].update_id + 1;
+        }
+    } catch (e) {}
+
+    while (userChoice === null) {
+        try {
+            const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${offset}&timeout=10`);
+            const data = await res.json();
+
+            if (data.ok && data.result) {
+                for (const update of data.result) {
+                    offset = update.update_id + 1;
+                    if (update.callback_query && String(update.callback_query.message.chat.id) === String(TELEGRAM_CHAT_ID)) {
+                        const dataVal = update.callback_query.data;
+                        if (dataVal === "compress_yes") userChoice = true;
+                        if (dataVal === "compress_no") userChoice = false;
+
+                        // Answer Callback Query to stop loading animation on Telegram UI
+                        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ callback_query_id: update.callback_query.id, text: "Choice recorded!" })
+                        });
+
+                        if (userChoice !== null) break;
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("Polling error:", err);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    return { userChoice, statusMsgId };
 }
 
 function getVideoMetadata(inputPath) {
@@ -82,13 +141,14 @@ function compressVideo(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
         ffmpeg(inputPath)
             .outputOptions([
+                "-threads 0",
                 "-c:v libx264",
                 "-crf 28",
-                "-preset ultrafast",   // حداکثر سرعت در پردازش FFmpeg
-                "-vf scale=-2:480",     // انکود به 480p
+                "-preset ultrafast",
+                "-vf scale=-2:480",
                 "-c:a aac",
                 "-b:a 128k",
-                "-movflags +faststart" // ساخت هدر مناسب جهت قابلیت پخش مستقیم
+                "-movflags +faststart"
             ])
             .save(outputPath)
             .on("end", () => resolve(outputPath))
@@ -104,10 +164,9 @@ function splitVideoByBitrate(inputPath, targetMaxBytes) {
             const totalSize = metadata.format.size;
 
             if (!duration || !totalSize) {
-                return reject(new Error("امکان محاسبه مدت زمان یا حجم ویدیو وجود ندارد."));
+                return reject(new Error("Unable to calculate video duration or size."));
             }
 
-            // محاسبه نرخ بیت تقریبی و زمان‌بندی هر پارت برای تکمیل حداکثر ظرفیت ۲۰ مگابایت
             const bytesPerSecond = totalSize / duration;
             const targetSegmentDuration = Math.floor((targetMaxBytes * 0.95) / bytesPerSecond);
 
@@ -126,7 +185,6 @@ function splitVideoByBitrate(inputPath, targetMaxBytes) {
                 const currentDuration = isLastPart ? (duration - currentTime) : targetSegmentDuration;
 
                 tasks.push({ startTime, duration: currentDuration, partPath });
-
                 currentTime += targetSegmentDuration;
                 partIndex++;
             }
@@ -140,7 +198,8 @@ function splitVideoByBitrate(inputPath, targetMaxBytes) {
 
                 command
                     .outputOptions([
-                        "-c copy", // کپی مستقیم استریم بدون انکود مجدد
+                        "-threads 0",
+                        "-c copy",
                         "-avoid_negative_ts make_zero",
                         "-movflags +faststart"
                     ])
@@ -197,13 +256,13 @@ function cleanUpFiles(...filePaths) {
 
 (async () => {
     let statusMsgId = null;
-    const rawFilePath = "./temp_raw_file";
-    const compressedFilePath = "./temp_compressed.mp4";
+    
+    const rawFilePath = path.join(".", "temp_raw_file");
+    const compressedFilePath = path.join(".", "temp_compressed.mp4");
     let generatedParts = [];
 
     try {
-        statusMsgId = await updateTelegramStatus(null, "⚡ **در حال آماده‌سازی دریافت فایل...**");
-        console.log("Status Message ID created:", statusMsgId);
+        statusMsgId = await updateTelegramStatus(null, "⚡ **Preparing download pipeline...**");
 
         const client = new TelegramClient(
             new StringSession(TELEGRAM_SESSION_STRING.trim()),
@@ -219,26 +278,40 @@ function cleanUpFiles(...filePaths) {
         });
 
         if (!messages || !messages[0] || !messages[0].media) {
-            throw new Error("فایل در تلگرام یافت نشد.");
+            throw new Error("File not found in Telegram.");
         }
 
         const msg = messages[0];
-        let lastUpdate = Date.now();
+        const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
+        let shouldCompress = false;
 
-        console.log("Downloading directly to file with multi-threading...");
+        // Ask user if they want compression BEFORE downloading (only for videos)
+        if (isVideo) {
+            const result = await askCompressionPreference(statusMsgId);
+            shouldCompress = result.userChoice;
+            statusMsgId = result.statusMsgId;
+        }
+
+        statusMsgId = await updateTelegramStatus(statusMsgId, "📥 **Starting download from Telegram...**");
+
+        let lastUpdate = Date.now();
+        const writeStream = fs.createWriteStream(rawFilePath, {
+            highWaterMark: 64 * 1024 * 1024
+        });
+
         await client.downloadMedia(msg.media, {
-            outputFile: rawFilePath,
-            workers: 8, // افزایش نخ‌های دانلود برای حداکثر پهنای باند
+            outputFile: writeStream,
+            workers: 14,
             progressCallback: async (downloaded, total) => {
                 const now = Date.now();
-                if (now - lastUpdate > 5000 || downloaded === total) {
+                if (now - lastUpdate > 8000 || downloaded === total) {
                     lastUpdate = now;
                     const percent = total ? Math.floor((downloaded / total) * 100) : 0;
                     const bar = drawProgressBar(percent);
                     const text = [
-                        "📥 **در حال دریافت از تلگرام...**",
+                        "📥 **Downloading from Telegram...**",
                         `\`[${bar}]\` ${percent}%`,
-                        `📊 **حجم:** \`${formatBytes(downloaded)}\` / \`${formatBytes(total)}\``,
+                        `📊 **Size:** \`${formatBytes(downloaded)}\` / \`${formatBytes(total)}\``,
                     ].join("\n");
 
                     statusMsgId = await updateTelegramStatus(statusMsgId, text);
@@ -247,35 +320,31 @@ function cleanUpFiles(...filePaths) {
         });
 
         let targetUploadPath = rawFilePath;
-        const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
 
-        if (isVideo) {
-            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال فشرده‌سازی ویدیو (480p)...**");
-            console.log("Compressing video to 480p...");
+        // Compress only if the user approved it earlier
+        if (isVideo && shouldCompress) {
+            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **Compressing video (480p Multithreaded)...**");
             
             try {
                 await compressVideo(rawFilePath, compressedFilePath);
                 targetUploadPath = compressedFilePath;
-                console.log("Video compression successful.");
             } catch (ffmpegErr) {
                 console.warn("Compression failed, proceeding with original file:", ffmpegErr.message);
             }
         }
 
         const fileSize = fs.statSync(targetUploadPath).size;
-        console.log(`Processing complete. Final upload size: ${fileSize} bytes`);
-
         const rawCaption = msg.text || msg.caption || "";
         const endpoint = isVideo ? "sendVideo" : "sendDocument";
         const fileParamName = isVideo ? "video" : "document";
 
         if (fileSize <= BALE_MAX_BYTES) {
-            statusMsgId = await updateTelegramStatus(statusMsgId, "📤 **در حال ارسال به بله...**");
+            statusMsgId = await updateTelegramStatus(statusMsgId, "📤 **Uploading to Bale...**");
             
             const formData = new FormData();
             formData.append("chat_id", BALE_CHAT_ID);
             if (rawCaption) {
-                formData.append("caption", truncateCaption(rawCaption)); // رعایت سقف زیرنویس[cite: 1]
+                formData.append("caption", truncateCaption(rawCaption));
             }
             
             const uploadFileName = isVideo ? "video.mp4" : path.basename(targetUploadPath);
@@ -290,11 +359,10 @@ function cleanUpFiles(...filePaths) {
         } else {
             statusMsgId = await updateTelegramStatus(
                 statusMsgId,
-                `📦 **فایل بزرگتر از سقف مجاز بله (20MB) است. در حال تقسیم‌بندی...**\nحجم کل: \`${formatBytes(fileSize)}\``
+                `📦 **File exceeds Bale limit (20MB). Splitting into parts...**\nTotal Size: \`${formatBytes(fileSize)}\``
             );
 
             if (isVideo) {
-                console.log("Splitting video using bitrate calculation to optimize part sizes...");
                 generatedParts = await splitVideoByBitrate(targetUploadPath, BALE_MAX_BYTES);
             } else {
                 generatedParts = splitRawFileBytes(targetUploadPath, BALE_MAX_BYTES);
@@ -308,10 +376,10 @@ function cleanUpFiles(...filePaths) {
 
                 statusMsgId = await updateTelegramStatus(
                     statusMsgId,
-                    `📤 **در حال ارسال پارت ${i + 1} از ${totalParts} به بله...**\n\`[${drawProgressBar(Math.floor(((i + 1) / totalParts) * 100))}]\``
+                    `📤 **Uploading part ${i + 1} of ${totalParts} to Bale...**\n\`[${drawProgressBar(Math.floor(((i + 1) / totalParts) * 100))}]\``
                 );
 
-                const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`); // رعایت سقف زیرنویس[cite: 1]
+                const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`);
 
                 const formData = new FormData();
                 formData.append("chat_id", BALE_CHAT_ID);
@@ -324,14 +392,14 @@ function cleanUpFiles(...filePaths) {
                 });
 
                 if (!res.ok) {
-                    throw new Error(`خطا در ارسال پارت ${i + 1}: ${await res.text()}`);
+                    throw new Error(`Failed to upload part ${i + 1}: ${await res.text()}`);
                 }
 
                 fs.unlinkSync(partPath);
             }
         }
 
-        await updateTelegramStatus(statusMsgId, "✅ **تمامی پارت‌های فایل با موفقیت به بله منتقل شدند!**");
+        await updateTelegramStatus(statusMsgId, "✅ **Transfer completed successfully!**");
         cleanUpFiles(rawFilePath, compressedFilePath, generatedParts);
         await client.disconnect();
         process.exit(0);
@@ -339,7 +407,7 @@ function cleanUpFiles(...filePaths) {
         console.error("Transfer failed:", err);
         cleanUpFiles(rawFilePath, compressedFilePath, generatedParts);
         if (statusMsgId) {
-            await updateTelegramStatus(statusMsgId, `❌ **خطا در انتقال:** ${err.message}`);
+            await updateTelegramStatus(statusMsgId, `❌ **Transfer Error:** ${err.message}`);
         }
         process.exit(1);
     }
