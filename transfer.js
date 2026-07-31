@@ -1,8 +1,8 @@
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const { NewMessage } = require("telegram/events");
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
 const ffmpeg = require("fluent-ffmpeg");
 
 const {
@@ -25,6 +25,24 @@ function formatBytes(bytes) {
     const sizes = ["بایت", "کیلوبایت", "مگابایت", "گیگابایت"];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+
+function formatSpeed(bytesPerSecond) {
+    if (!bytesPerSecond || bytesPerSecond <= 0) return "0 بایت/ثانیه";
+    const k = 1024;
+    const sizes = ["بایت/ثانیه", "کیلوبایت/ثانیه", "مگابایت/ثانیه", "گیگابایت/ثانیه"];
+    const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
+    return parseFloat((bytesPerSecond / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+
+function formatETA(seconds) {
+    if (!seconds || !isFinite(seconds) || seconds <= 0) return "محاسبه...";
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    if (mins > 0) {
+        return `${mins} دقیقه و ${secs} ثانیه`;
+    }
+    return `${secs} ثانیه`;
 }
 
 function drawProgressBar(percent, length = 10) {
@@ -68,7 +86,7 @@ async function updateTelegramStatus(messageId, text, replyMarkup = null) {
 }
 
 /**
- * Sends button prompts to Telegram and waits for user choice via native TelegramClient listening.
+ * پرسش از کاربر جهت فشرده‌سازی ویدیو
  */
 async function askCompressionPreference(client, statusMsgId) {
     const keyboard = {
@@ -86,13 +104,11 @@ async function askCompressionPreference(client, statusMsgId) {
     return new Promise((resolve) => {
         const callbackHandler = async (event) => {
             try {
-                // Ensure the event is a callback query on our status message
                 if (event.className === "UpdateBotCallbackQuery") {
                     const dataStr = event.data.toString("utf8");
                     if (dataStr === "compress_yes" || dataStr === "compress_no") {
                         client.removeEventHandler(callbackHandler);
                         
-                        // Answer callback to resolve loading state on UI
                         await client.invoke(
                             new Api.messages.SetBotCallbackAnswer({
                                 queryId: event.queryId,
@@ -107,7 +123,7 @@ async function askCompressionPreference(client, statusMsgId) {
                     }
                 }
             } catch (err) {
-                console.error("خطا در دریافت پاسخ دکمه:", err);
+                console.error("خطا در پاسخ دکمه:", err);
             }
         };
 
@@ -124,8 +140,14 @@ function getVideoMetadata(inputPath) {
     });
 }
 
-function compressVideo(inputPath, outputPath) {
+/**
+ * فشرده‌سازی ویدیو با گزارش پیشرفت، سرعت و تخمین زمان
+ */
+function compressVideo(inputPath, outputPath, duration, onProgress) {
     return new Promise((resolve, reject) => {
+        const startTime = Date.now();
+        let lastUpdate = 0;
+
         ffmpeg(inputPath)
             .outputOptions([
                 "-threads 0",
@@ -138,8 +160,123 @@ function compressVideo(inputPath, outputPath) {
                 "-movflags +faststart"
             ])
             .save(outputPath)
+            .on("progress", (progress) => {
+                let percent = progress.percent;
+                if ((!percent || percent <= 0) && duration && progress.timemark) {
+                    const parts = progress.timemark.split(":");
+                    if (parts.length === 3) {
+                        const secs = parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+                        percent = (secs / duration) * 100;
+                    }
+                }
+
+                percent = Math.min(100, Math.max(0, percent || 0));
+                const now = Date.now();
+
+                if (now - lastUpdate > 5000 || percent === 100) {
+                    lastUpdate = now;
+                    const elapsedSec = (now - startTime) / 1000;
+                    let etaSec = 0;
+                    if (percent > 0 && elapsedSec > 0) {
+                        const totalEstimatedSec = (elapsedSec / percent) * 100;
+                        etaSec = Math.max(0, totalEstimatedSec - elapsedSec);
+                    }
+                    if (onProgress) {
+                        onProgress({ percent: Math.floor(percent), etaSec, fps: progress.currentFps });
+                    }
+                }
+            })
             .on("end", () => resolve(outputPath))
             .on("error", (err) => reject(err));
+    });
+}
+
+/**
+ * آپلود فایل به بله همراه با استریم و محاسبه سرعت و ETA
+ */
+function uploadToBaleWithProgress(endpoint, fileParamName, filePath, fileName, caption, onProgress) {
+    return new Promise((resolve, reject) => {
+        const boundary = "----BaleUploadBoundary" + Date.now().toString(16);
+        const stats = fs.statSync(filePath);
+        const fileSize = stats.size;
+
+        let headerStr = `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${BALE_CHAT_ID}\r\n`;
+        if (caption) {
+            headerStr += `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`;
+        }
+        headerStr += `--${boundary}\r\nContent-Disposition: form-data; name="${fileParamName}"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+
+        const footerStr = `\r\n--${boundary}--\r\n`;
+
+        const headerBuffer = Buffer.from(headerStr, "utf8");
+        const footerBuffer = Buffer.from(footerStr, "utf8");
+        const totalPayloadSize = headerBuffer.length + fileSize + footerBuffer.length;
+
+        const options = {
+            hostname: "tapi.bale.ai",
+            path: `/bot${BALE_BOT_TOKEN}/${endpoint}`,
+            method: "POST",
+            headers: {
+                "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                "Content-Length": totalPayloadSize
+            }
+        };
+
+        const req = https.request(options, (res) => {
+            let resData = "";
+            res.on("data", (chunk) => { resData += chunk; });
+            res.on("end", () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                        const json = JSON.parse(resData);
+                        if (json.ok) resolve(json);
+                        else reject(new Error(json.description || resData));
+                    } catch (e) {
+                        resolve(resData);
+                    }
+                } else {
+                    reject(new Error(`HTTP ${res.statusCode}: ${resData}`));
+                }
+            });
+        });
+
+        req.on("error", (err) => reject(err));
+
+        req.write(headerBuffer);
+
+        const fileStream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
+        let uploadedBytes = 0;
+        const startTime = Date.now();
+        let lastUpdate = Date.now();
+
+        fileStream.on("data", (chunk) => {
+            uploadedBytes += chunk.length;
+            req.write(chunk);
+
+            const now = Date.now();
+            if (now - lastUpdate > 5000 || uploadedBytes === fileSize) {
+                lastUpdate = now;
+                const elapsedSec = (now - startTime) / 1000;
+                const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
+                const remainingBytes = fileSize - uploadedBytes;
+                const etaSec = speed > 0 ? Math.max(0, remainingBytes / speed) : 0;
+                const percent = Math.min(100, Math.floor((uploadedBytes / fileSize) * 100));
+
+                if (onProgress) {
+                    onProgress({ percent, uploaded: uploadedBytes, total: fileSize, speed, etaSec });
+                }
+            }
+        });
+
+        fileStream.on("end", () => {
+            req.write(footerBuffer);
+            req.end();
+        });
+
+        fileStream.on("error", (err) => {
+            req.destroy();
+            reject(err);
+        });
     });
 }
 
@@ -272,7 +409,7 @@ function cleanUpFiles(...filePaths) {
         const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
         let shouldCompress = false;
 
-        // Ask compression preference BEFORE downloading
+        // پرسش قبل از شروع دانلود
         if (isVideo) {
             const result = await askCompressionPreference(client, statusMsgId);
             shouldCompress = result.userChoice;
@@ -282,6 +419,7 @@ function cleanUpFiles(...filePaths) {
         statusMsgId = await updateTelegramStatus(statusMsgId, "📥 **در حال شروع دانلود از تلگرام...**");
 
         let lastUpdate = Date.now();
+        const downloadStartTime = Date.now();
         const writeStream = fs.createWriteStream(rawFilePath, {
             highWaterMark: 64 * 1024 * 1024
         });
@@ -291,14 +429,21 @@ function cleanUpFiles(...filePaths) {
             workers: 14,
             progressCallback: async (downloaded, total) => {
                 const now = Date.now();
-                if (now - lastUpdate > 8000 || downloaded === total) {
+                if (now - lastUpdate > 5000 || downloaded === total) {
                     lastUpdate = now;
+                    const elapsedSec = (now - downloadStartTime) / 1000;
+                    const speed = elapsedSec > 0 ? downloaded / elapsedSec : 0;
+                    const remainingBytes = total - downloaded;
+                    const etaSec = speed > 0 ? Math.max(0, remainingBytes / speed) : 0;
+
                     const percent = total ? Math.floor((downloaded / total) * 100) : 0;
                     const bar = drawProgressBar(percent);
                     const text = [
                         "📥 **در حال دانلود از تلگرام...**",
                         `\`[${bar}]\` ${percent}%`,
                         `📊 **حجم:** \`${formatBytes(downloaded)}\` / \`${formatBytes(total)}\``,
+                        `🚀 **سرعت دانلود:** \`${formatSpeed(speed)}\``,
+                        `⏳ **زمان باقی‌مانده دانلود:** \`${formatETA(etaSec)}\``,
                     ].join("\n");
 
                     statusMsgId = await updateTelegramStatus(statusMsgId, text);
@@ -308,12 +453,26 @@ function cleanUpFiles(...filePaths) {
 
         let targetUploadPath = rawFilePath;
 
-        // Perform compression only if selected by user
+        // فشرده‌سازی در صورت تأیید کاربر
         if (isVideo && shouldCompress) {
-            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال فشرده‌سازی ویدیو (480p چندنخی)...**");
+            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال شروع فشرده‌سازی ویدیو...**");
             
             try {
-                await compressVideo(rawFilePath, compressedFilePath);
+                const metadata = await getVideoMetadata(rawFilePath).catch(() => null);
+                const duration = metadata?.format?.duration || 0;
+
+                await compressVideo(rawFilePath, compressedFilePath, duration, async (p) => {
+                    const bar = drawProgressBar(p.percent);
+                    const fpsText = p.fps ? `\n⚡ **سرعت پردازش:** \`${p.fps} فریم/ثانیه\`` : "";
+                    const text = [
+                        "⚙️ **در حال فشرده‌سازی ویدیو (480p)...**",
+                        `\`[${bar}]\` ${p.percent}%`,
+                        fpsText,
+                        `⏳ **زمان باقی‌مانده فشرده‌سازی:** \`${formatETA(p.etaSec)}\``
+                    ].filter(Boolean).join("\n");
+
+                    statusMsgId = await updateTelegramStatus(statusMsgId, text);
+                });
                 targetUploadPath = compressedFilePath;
             } catch (ffmpegErr) {
                 console.warn("فشرده‌سازی ناموفق بود، ادامه با فایل اصلی:", ffmpegErr.message);
@@ -326,23 +485,27 @@ function cleanUpFiles(...filePaths) {
         const fileParamName = isVideo ? "video" : "document";
 
         if (fileSize <= BALE_MAX_BYTES) {
-            statusMsgId = await updateTelegramStatus(statusMsgId, "📤 **در حال آپلود به بله...**");
-            
-            const formData = new FormData();
-            formData.append("chat_id", BALE_CHAT_ID);
-            if (rawCaption) {
-                formData.append("caption", truncateCaption(rawCaption));
-            }
-            
             const uploadFileName = isVideo ? "video.mp4" : path.basename(targetUploadPath);
-            formData.append(fileParamName, new Blob([fs.readFileSync(targetUploadPath)]), uploadFileName);
 
-            const res = await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/${endpoint}`, {
-                method: "POST",
-                body: formData,
-            });
+            await uploadToBaleWithProgress(
+                endpoint,
+                fileParamName,
+                targetUploadPath,
+                uploadFileName,
+                truncateCaption(rawCaption),
+                async (p) => {
+                    const bar = drawProgressBar(p.percent);
+                    const text = [
+                        "📤 **در حال آپلود به بله...**",
+                        `\`[${bar}]\` ${p.percent}%`,
+                        `📊 **حجم:** \`${formatBytes(p.uploaded)}\` / \`${formatBytes(p.total)}\``,
+                        `🚀 **سرعت آپلود:** \`${formatSpeed(p.speed)}\``,
+                        `⏳ **زمان باقی‌مانده آپلود:** \`${formatETA(p.etaSec)}\``,
+                    ].join("\n");
 
-            if (!res.ok) throw new Error(await res.text());
+                    statusMsgId = await updateTelegramStatus(statusMsgId, text);
+                }
+            );
         } else {
             statusMsgId = await updateTelegramStatus(
                 statusMsgId,
@@ -360,27 +523,27 @@ function cleanUpFiles(...filePaths) {
             for (let i = 0; i < totalParts; i++) {
                 const partPath = generatedParts[i];
                 const partFileName = path.basename(partPath);
-
-                statusMsgId = await updateTelegramStatus(
-                    statusMsgId,
-                    `📤 **در حال آپلود پارت ${i + 1} از ${totalParts} به بله...**\n\`[${drawProgressBar(Math.floor(((i + 1) / totalParts) * 100))}]\``
-                );
-
                 const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`);
 
-                const formData = new FormData();
-                formData.append("chat_id", BALE_CHAT_ID);
-                formData.append("caption", partCaption);
-                formData.append(fileParamName, new Blob([fs.readFileSync(partPath)]), partFileName);
+                await uploadToBaleWithProgress(
+                    endpoint,
+                    fileParamName,
+                    partPath,
+                    partFileName,
+                    partCaption,
+                    async (p) => {
+                        const bar = drawProgressBar(p.percent);
+                        const text = [
+                            `📤 **در حال آپلود پارت ${i + 1} از ${totalParts} به بله...**`,
+                            `\`[${bar}]\` ${p.percent}%`,
+                            `📊 **حجم پارت:** \`${formatBytes(p.uploaded)}\` / \`${formatBytes(p.total)}\``,
+                            `🚀 **سرعت آپلود:** \`${formatSpeed(p.speed)}\``,
+                            `⏳ **زمان باقی‌مانده پارت:** \`${formatETA(p.etaSec)}\``,
+                        ].join("\n");
 
-                const res = await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/${endpoint}`, {
-                    method: "POST",
-                    body: formData,
-                });
-
-                if (!res.ok) {
-                    throw new Error(`خطا در آپلود پارت ${i + 1}: ${await res.text()}`);
-                }
+                        statusMsgId = await updateTelegramStatus(statusMsgId, text);
+                    }
+                );
 
                 fs.unlinkSync(partPath);
             }
