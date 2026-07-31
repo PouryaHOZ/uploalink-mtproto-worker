@@ -16,7 +16,7 @@ const {
 } = process.env;
 
 // Set max split size to 20 MB to stay well under Nginx proxy limits
-const BALE_MAX_BYTES = 20 * 1024 * 1024;
+const BALE_MAX_BYTES = 50 * 1024 * 1024;
 const BALE_MAX_CAPTION_LENGTH = 4096;
 
 function formatBytes(bytes) {
