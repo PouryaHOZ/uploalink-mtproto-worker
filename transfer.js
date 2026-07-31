@@ -14,10 +14,10 @@ const {
     BALE_CHAT_ID,
 } = process.env;
 
-const BALE_MAX_BYTES = 45 * 1024 * 1024; // 45 MB safety margin for Bale's 50MB limit
+const BALE_MAX_BYTES = 45 * 1024 * 1024;
 
 function formatBytes(bytes) {
-    if (bytes === 0) return "0 Bytes";
+    if (!bytes || bytes === 0) return "0 Bytes";
     const k = 1024;
     const sizes = ["Bytes", "KB", "MB", "GB"];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
@@ -25,17 +25,22 @@ function formatBytes(bytes) {
 }
 
 function drawProgressBar(percent, length = 10) {
-    const filled = Math.round((percent / 100) * length);
+    const filled = Math.min(length, Math.max(0, Math.round((percent / 100) * length)));
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
 async function updateTelegramStatus(messageId, text) {
+    if (!TELEGRAM_BOT_TOKEN) {
+        console.error("TELEGRAM_BOT_TOKEN environment variable is missing!");
+        return null;
+    }
+
     try {
-        const url = messageId 
+        const url = messageId
             ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`
             : `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-        
-        const body = messageId 
+
+        const body = messageId
             ? { chat_id: TELEGRAM_CHAT_ID, message_id: messageId, text, parse_mode: "Markdown" }
             : { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "Markdown" };
 
@@ -44,15 +49,19 @@ async function updateTelegramStatus(messageId, text) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
         });
+
         const data = await res.json();
+        if (!data.ok) {
+            console.error("Telegram API Error:", JSON.stringify(data));
+            return messageId;
+        }
         return messageId || data.result?.message_id;
     } catch (err) {
-        console.error("Failed to update status message:", err.message);
+        console.error("Failed to update Telegram status message:", err.message);
         return messageId;
     }
 }
 
-// Splits a large file buffer into smaller 45MB files on disk
 function splitFile(filePath, chunkSize) {
     const stats = fs.statSync(filePath);
     const totalSize = stats.size;
@@ -83,6 +92,7 @@ function splitFile(filePath, chunkSize) {
     let statusMsgId = null;
     try {
         statusMsgId = await updateTelegramStatus(null, "⚡ **در حال آماده‌سازی دریافت فایل...**");
+        console.log("Status Message ID created:", statusMsgId);
 
         const client = new TelegramClient(
             new StringSession(TELEGRAM_SESSION_STRING.trim()),
@@ -105,13 +115,14 @@ function splitFile(filePath, chunkSize) {
         const filePath = "./temp_file";
         let lastUpdate = 0;
 
-        // 1. Download from Telegram
-        const buffer = await client.downloadMedia(msg.media, {
+        console.log("Downloading directly to file...");
+        await client.downloadMedia(msg.media, {
+            outputFile: filePath,
             progressCallback: async (downloaded, total) => {
                 const now = Date.now();
                 if (now - lastUpdate > 3500 || downloaded === total) {
                     lastUpdate = now;
-                    const percent = Math.floor((downloaded / total) * 100);
+                    const percent = total ? Math.floor((downloaded / total) * 100) : 0;
                     const bar = drawProgressBar(percent);
                     const text = [
                         "📥 **در حال دریافت از تلگرام...**",
@@ -119,20 +130,18 @@ function splitFile(filePath, chunkSize) {
                         `📊 **حجم:** \`${formatBytes(downloaded)}\` / \`${formatBytes(total)}\``,
                     ].join("\n");
 
-                    await updateTelegramStatus(statusMsgId, text);
+                    statusMsgId = await updateTelegramStatus(statusMsgId, text);
                 }
             },
         });
 
-        fs.writeFileSync(filePath, buffer);
-        const fileSize = buffer.length;
+        const fileSize = fs.statSync(filePath).size;
+        console.log(`Download finished. File size: ${fileSize} bytes`);
 
-        // 2. Upload handling
         const caption = msg.text || msg.caption || "";
 
         if (fileSize <= BALE_MAX_BYTES) {
-            // Send normally if <= 45MB
-            await updateTelegramStatus(statusMsgId, "📤 **در حال ارسال به بله...**");
+            statusMsgId = await updateTelegramStatus(statusMsgId, "📤 **در حال ارسال به بله...**");
             const formData = new FormData();
             formData.append("chat_id", BALE_CHAT_ID);
             if (caption) formData.append("caption", caption);
@@ -144,9 +153,11 @@ function splitFile(filePath, chunkSize) {
             });
             if (!res.ok) throw new Error(await res.text());
         } else {
-            // Split and send in parts if > 45MB
-            await updateTelegramStatus(statusMsgId, `📦 **فایل بزرگتر از ۴۵ مگابایت است. در حال تقسیم‌بندی...**\nحجم کل: \`${formatBytes(fileSize)}\``);
-            
+            statusMsgId = await updateTelegramStatus(
+                statusMsgId,
+                `📦 **فایل بزرگتر از ۴۵ مگابایت است. در حال تقسیم‌بندی...**\nحجم کل: \`${formatBytes(fileSize)}\``
+            );
+
             const parts = splitFile(filePath, BALE_MAX_BYTES);
             const totalParts = parts.length;
 
@@ -154,7 +165,7 @@ function splitFile(filePath, chunkSize) {
                 const partPath = parts[i];
                 const partFileName = path.basename(partPath);
 
-                await updateTelegramStatus(
+                statusMsgId = await updateTelegramStatus(
                     statusMsgId,
                     `📤 **در حال ارسال پارت ${i + 1} از ${totalParts} به بله...**\n\`[${drawProgressBar(Math.floor(((i + 1) / totalParts) * 100))}]\``
                 );
@@ -181,7 +192,7 @@ function splitFile(filePath, chunkSize) {
         }
 
         await updateTelegramStatus(statusMsgId, "✅ **تمامی پارت‌های فایل با موفقیت به بله منتقل شدند!**");
-        fs.unlinkSync(filePath);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
         await client.disconnect();
         process.exit(0);
     } catch (err) {
