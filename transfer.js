@@ -141,7 +141,7 @@ function getVideoMetadata(inputPath) {
 }
 
 /**
- * فشرده‌سازی ویدیو با گزارش پیشرفت، سرعت و تخمین زمان
+ * فشرده‌سازی ویدیو با گزارش پیشرفت و به‌روزرسانی هر ۱ ثانیه
  */
 function compressVideo(inputPath, outputPath, duration, onProgress) {
     return new Promise((resolve, reject) => {
@@ -173,7 +173,8 @@ function compressVideo(inputPath, outputPath, duration, onProgress) {
                 percent = Math.min(100, Math.max(0, percent || 0));
                 const now = Date.now();
 
-                if (now - lastUpdate > 5000 || percent === 100) {
+                // به‌روزرسانی هر ۱ ثانیه (1000 میلی‌ثانیه)
+                if (now - lastUpdate >= 1000 || percent === 100) {
                     lastUpdate = now;
                     const elapsedSec = (now - startTime) / 1000;
                     let etaSec = 0;
@@ -192,7 +193,7 @@ function compressVideo(inputPath, outputPath, duration, onProgress) {
 }
 
 /**
- * آپلود فایل به بله همراه با استریم و محاسبه سرعت و ETA
+ * آپلود فایل به بله همراه با استریم و به‌روزرسانی هر ۱ ثانیه
  */
 function uploadToBaleWithProgress(endpoint, fileParamName, filePath, fileName, caption, onProgress) {
     return new Promise((resolve, reject) => {
@@ -254,7 +255,8 @@ function uploadToBaleWithProgress(endpoint, fileParamName, filePath, fileName, c
             req.write(chunk);
 
             const now = Date.now();
-            if (now - lastUpdate > 5000 || uploadedBytes === fileSize) {
+            // به‌روزرسانی هر ۱ ثانیه (1000 میلی‌ثانیه)
+            if (now - lastUpdate >= 1000 || uploadedBytes === fileSize) {
                 lastUpdate = now;
                 const elapsedSec = (now - startTime) / 1000;
                 const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
@@ -409,7 +411,6 @@ function cleanUpFiles(...filePaths) {
         const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
         let shouldCompress = false;
 
-        // پرسش قبل از شروع دانلود
         if (isVideo) {
             const result = await askCompressionPreference(client, statusMsgId);
             shouldCompress = result.userChoice;
@@ -429,7 +430,8 @@ function cleanUpFiles(...filePaths) {
             workers: 14,
             progressCallback: async (downloaded, total) => {
                 const now = Date.now();
-                if (now - lastUpdate > 5000 || downloaded === total) {
+                // به‌روزرسانی هر ۱ ثانیه (1000 میلی‌ثانیه)
+                if (now - lastUpdate >= 1000 || downloaded === total) {
                     lastUpdate = now;
                     const elapsedSec = (now - downloadStartTime) / 1000;
                     const speed = elapsedSec > 0 ? downloaded / elapsedSec : 0;
@@ -453,7 +455,6 @@ function cleanUpFiles(...filePaths) {
 
         let targetUploadPath = rawFilePath;
 
-        // فشرده‌سازی در صورت تأیید کاربر
         if (isVideo && shouldCompress) {
             statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال شروع فشرده‌سازی ویدیو...**");
             
