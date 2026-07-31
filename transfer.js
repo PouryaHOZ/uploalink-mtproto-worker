@@ -86,8 +86,32 @@ async function updateTelegramStatus(messageId, text, replyMarkup = null) {
 }
 
 /**
- * پرسش از کاربر جهت فشرده‌سازی ویدیو
+ * تخمین اولیه زمان‌ها بر اساس حجم فایل و نوع عملیات
  */
+function estimateProcessTimes(fileSize, isVideo, willCompress) {
+    // فرضیات میانگین برای تخمین اولیه:
+    // دانلود: ~10 MB/s | فشرده‌سازی: ~3x real-time سرعت | آپلود بله: ~3 MB/s
+    const estDownloadSec = Math.ceil(fileSize / (10 * 1024 * 1024));
+    
+    let estCompressSec = 0;
+    if (isVideo && willCompress) {
+        // فرض متوسط ویدیو 1MB ≈ 3 ثانیه پردازش
+        estCompressSec = Math.ceil((fileSize / (1024 * 1024)) * 2.5);
+    }
+
+    const estUploadSize = willCompress ? fileSize * 0.4 : fileSize; // خروجی فشرده‌سازی حدوداً 40% حجم اصلی
+    const estUploadSec = Math.ceil(estUploadSize / (3 * 1024 * 1024));
+
+    const totalEstSec = estDownloadSec + estCompressSec + estUploadSec;
+
+    return {
+        estDownloadSec,
+        estCompressSec,
+        estUploadSec,
+        totalEstSec
+    };
+}
+
 async function askCompressionPreference(client, statusMsgId) {
     const keyboard = {
         inline_keyboard: [
@@ -140,9 +164,6 @@ function getVideoMetadata(inputPath) {
     });
 }
 
-/**
- * فشرده‌سازی ویدیو با گزارش پیشرفت و به‌روزرسانی هر ۱ ثانیه
- */
 function compressVideo(inputPath, outputPath, duration, onProgress) {
     return new Promise((resolve, reject) => {
         const startTime = Date.now();
@@ -173,7 +194,6 @@ function compressVideo(inputPath, outputPath, duration, onProgress) {
                 percent = Math.min(100, Math.max(0, percent || 0));
                 const now = Date.now();
 
-                // به‌روزرسانی هر ۱ ثانیه (1000 میلی‌ثانیه)
                 if (now - lastUpdate >= 1000 || percent === 100) {
                     lastUpdate = now;
                     const elapsedSec = (now - startTime) / 1000;
@@ -192,9 +212,6 @@ function compressVideo(inputPath, outputPath, duration, onProgress) {
     });
 }
 
-/**
- * آپلود فایل به بله همراه با استریم و به‌روزرسانی هر ۱ ثانیه
- */
 function uploadToBaleWithProgress(endpoint, fileParamName, filePath, fileName, caption, onProgress) {
     return new Promise((resolve, reject) => {
         const boundary = "----BaleUploadBoundary" + Date.now().toString(16);
@@ -255,7 +272,6 @@ function uploadToBaleWithProgress(endpoint, fileParamName, filePath, fileName, c
             req.write(chunk);
 
             const now = Date.now();
-            // به‌روزرسانی هر ۱ ثانیه (1000 میلی‌ثانیه)
             if (now - lastUpdate >= 1000 || uploadedBytes === fileSize) {
                 lastUpdate = now;
                 const elapsedSec = (now - startTime) / 1000;
@@ -388,7 +404,7 @@ function cleanUpFiles(...filePaths) {
     let generatedParts = [];
 
     try {
-        statusMsgId = await updateTelegramStatus(null, "⚡ **در حال آماده‌سازی خط انتقال...**");
+        statusMsgId = await updateTelegramStatus(null, "⚡ **در حال دریافت اطلاعات فایل...**");
 
         const client = new TelegramClient(
             new StringSession(TELEGRAM_SESSION_STRING.trim()),
@@ -409,6 +425,8 @@ function cleanUpFiles(...filePaths) {
 
         const msg = messages[0];
         const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
+        const totalFileSize = msg.media.document?.size || msg.media.photo?.sizes?.slice(-1)[0]?.size || 0;
+
         let shouldCompress = false;
 
         if (isVideo) {
@@ -417,7 +435,23 @@ function cleanUpFiles(...filePaths) {
             statusMsgId = result.statusMsgId;
         }
 
-        statusMsgId = await updateTelegramStatus(statusMsgId, "📥 **در حال شروع دانلود از تلگرام...**");
+        // محاسبه وزن مراحل برای Master Progress Bar
+        // دانلود: 40% | فشرده‌سازی: 30% (در صورت وجود) | آپلود: 30% (یا 60% بدون فشرده‌سازی)
+        const downloadWeight = 40;
+        const compressWeight = shouldCompress ? 30 : 0;
+        const uploadWeight = shouldCompress ? 30 : 60;
+
+        // نمایش تخمین اولیه زمان انجام فرایند
+        const estimates = estimateProcessTimes(totalFileSize, isVideo, shouldCompress);
+        let estimationHeader = [
+            `⏱ **تخمین کل زمان انجام:** \`~${formatETA(estimates.totalEstSec)}\``,
+            `🔹 **دانلود:** \`~${formatETA(estimates.estDownloadSec)}\``,
+            shouldCompress ? `🔹 **فشرده‌سازی:** \`~${formatETA(estimates.estCompressSec)}\`` : null,
+            `🔹 **آپلود به بله:** \`~${formatETA(estimates.estUploadSec)}\``,
+            "-----------------------------------"
+        ].filter(Boolean).join("\n");
+
+        statusMsgId = await updateTelegramStatus(statusMsgId, `${estimationHeader}\n📥 **در حال شروع دانلود...**`);
 
         let lastUpdate = Date.now();
         const downloadStartTime = Date.now();
@@ -430,7 +464,6 @@ function cleanUpFiles(...filePaths) {
             workers: 14,
             progressCallback: async (downloaded, total) => {
                 const now = Date.now();
-                // به‌روزرسانی هر ۱ ثانیه (1000 میلی‌ثانیه)
                 if (now - lastUpdate >= 1000 || downloaded === total) {
                     lastUpdate = now;
                     const elapsedSec = (now - downloadStartTime) / 1000;
@@ -438,14 +471,21 @@ function cleanUpFiles(...filePaths) {
                     const remainingBytes = total - downloaded;
                     const etaSec = speed > 0 ? Math.max(0, remainingBytes / speed) : 0;
 
-                    const percent = total ? Math.floor((downloaded / total) * 100) : 0;
-                    const bar = drawProgressBar(percent);
+                    const stepPercent = total ? Math.floor((downloaded / total) * 100) : 0;
+                    const masterPercent = Math.floor((stepPercent * downloadWeight) / 100);
+
+                    const masterBar = drawProgressBar(masterPercent);
+                    const stepBar = drawProgressBar(stepPercent);
+
                     const text = [
-                        "📥 **در حال دانلود از تلگرام...**",
-                        `\`[${bar}]\` ${percent}%`,
+                        estimationHeader,
+                        `🏆 **پیشرفت کل:** \`[${masterBar}]\` ${masterPercent}%`,
+                        "-----------------------------------",
+                        "📥 **مرحله ۱/۳: دانلود از تلگرام**",
+                        `\`[${stepBar}]\` ${stepPercent}%`,
                         `📊 **حجم:** \`${formatBytes(downloaded)}\` / \`${formatBytes(total)}\``,
-                        `🚀 **سرعت دانلود:** \`${formatSpeed(speed)}\``,
-                        `⏳ **زمان باقی‌مانده دانلود:** \`${formatETA(etaSec)}\``,
+                        `🚀 **سرعت:** \`${formatSpeed(speed)}\``,
+                        `⏳ **زمان باقی‌مانده این مرحله:** \`${formatETA(etaSec)}\``,
                     ].join("\n");
 
                     statusMsgId = await updateTelegramStatus(statusMsgId, text);
@@ -456,20 +496,26 @@ function cleanUpFiles(...filePaths) {
         let targetUploadPath = rawFilePath;
 
         if (isVideo && shouldCompress) {
-            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال شروع فشرده‌سازی ویدیو...**");
-            
             try {
                 const metadata = await getVideoMetadata(rawFilePath).catch(() => null);
                 const duration = metadata?.format?.duration || 0;
 
                 await compressVideo(rawFilePath, compressedFilePath, duration, async (p) => {
-                    const bar = drawProgressBar(p.percent);
+                    const stepPercent = p.percent;
+                    const masterPercent = Math.floor(downloadWeight + ((stepPercent * compressWeight) / 100));
+
+                    const masterBar = drawProgressBar(masterPercent);
+                    const stepBar = drawProgressBar(stepPercent);
                     const fpsText = p.fps ? `\n⚡ **سرعت پردازش:** \`${p.fps} فریم/ثانیه\`` : "";
+
                     const text = [
-                        "⚙️ **در حال فشرده‌سازی ویدیو (480p)...**",
-                        `\`[${bar}]\` ${p.percent}%`,
+                        estimationHeader,
+                        `🏆 **پیشرفت کل:** \`[${masterBar}]\` ${masterPercent}%`,
+                        "-----------------------------------",
+                        "⚙️ **مرحله ۲/۳: فشرده‌سازی ویدیو (480p)**",
+                        `\`[${stepBar}]\` ${stepPercent}%`,
                         fpsText,
-                        `⏳ **زمان باقی‌مانده فشرده‌سازی:** \`${formatETA(p.etaSec)}\``
+                        `⏳ **زمان باقی‌مانده این مرحله:** \`${formatETA(p.etaSec)}\``
                     ].filter(Boolean).join("\n");
 
                     statusMsgId = await updateTelegramStatus(statusMsgId, text);
@@ -495,13 +541,21 @@ function cleanUpFiles(...filePaths) {
                 uploadFileName,
                 truncateCaption(rawCaption),
                 async (p) => {
-                    const bar = drawProgressBar(p.percent);
+                    const stepPercent = p.percent;
+                    const masterPercent = Math.floor(downloadWeight + compressWeight + ((stepPercent * uploadWeight) / 100));
+
+                    const masterBar = drawProgressBar(masterPercent);
+                    const stepBar = drawProgressBar(stepPercent);
+
                     const text = [
-                        "📤 **در حال آپلود به بله...**",
-                        `\`[${bar}]\` ${p.percent}%`,
+                        estimationHeader,
+                        `🏆 **پیشرفت کل:** \`[${masterBar}]\` ${masterPercent}%`,
+                        "-----------------------------------",
+                        `📤 **مرحله ${shouldCompress ? '۳/۳' : '۲/۲'}: آپلود به بله**`,
+                        `\`[${stepBar}]\` ${stepPercent}%`,
                         `📊 **حجم:** \`${formatBytes(p.uploaded)}\` / \`${formatBytes(p.total)}\``,
-                        `🚀 **سرعت آپلود:** \`${formatSpeed(p.speed)}\``,
-                        `⏳ **زمان باقی‌مانده آپلود:** \`${formatETA(p.etaSec)}\``,
+                        `🚀 **سرعت:** \`${formatSpeed(p.speed)}\``,
+                        `⏳ **زمان باقی‌مانده این مرحله:** \`${formatETA(p.etaSec)}\``,
                     ].join("\n");
 
                     statusMsgId = await updateTelegramStatus(statusMsgId, text);
@@ -533,13 +587,23 @@ function cleanUpFiles(...filePaths) {
                     partFileName,
                     partCaption,
                     async (p) => {
-                        const bar = drawProgressBar(p.percent);
+                        const stepPercent = p.percent;
+                        const partProgressWeight = uploadWeight / totalParts;
+                        const currentPartBase = downloadWeight + compressWeight + (i * partProgressWeight);
+                        const masterPercent = Math.floor(currentPartBase + ((stepPercent * partProgressWeight) / 100));
+
+                        const masterBar = drawProgressBar(masterPercent);
+                        const stepBar = drawProgressBar(stepPercent);
+
                         const text = [
-                            `📤 **در حال آپلود پارت ${i + 1} از ${totalParts} به بله...**`,
-                            `\`[${bar}]\` ${p.percent}%`,
+                            estimationHeader,
+                            `🏆 **پیشرفت کل:** \`[${masterBar}]\` ${masterPercent}%`,
+                            "-----------------------------------",
+                            `📤 **مرحله ${shouldCompress ? '۳/۳' : '۲/۲'}: آپلود پارت ${i + 1} از ${totalParts} به بله**`,
+                            `\`[${stepBar}]\` ${stepPercent}%`,
                             `📊 **حجم پارت:** \`${formatBytes(p.uploaded)}\` / \`${formatBytes(p.total)}\``,
-                            `🚀 **سرعت آپلود:** \`${formatSpeed(p.speed)}\``,
-                            `⏳ **زمان باقی‌مانده پارت:** \`${formatETA(p.etaSec)}\``,
+                            `🚀 **سرعت:** \`${formatSpeed(p.speed)}\``,
+                            `⏳ **زمان باقی‌مانده این پارت:** \`${formatETA(p.etaSec)}\``,
                         ].join("\n");
 
                         statusMsgId = await updateTelegramStatus(statusMsgId, text);
@@ -550,7 +614,12 @@ function cleanUpFiles(...filePaths) {
             }
         }
 
-        await updateTelegramStatus(statusMsgId, "✅ **انتقال با موفقیت انجام شد!**");
+        const finalMasterBar = drawProgressBar(100);
+        await updateTelegramStatus(
+            statusMsgId,
+            `🏆 **پیشرفت کل:** \`[${finalMasterBar}]\` 100%\n-----------------------------------\n✅ **انتقال با موفقیت کامل انجام شد!**`
+        );
+
         cleanUpFiles(rawFilePath, compressedFilePath, generatedParts);
         await client.disconnect();
         process.exit(0);
