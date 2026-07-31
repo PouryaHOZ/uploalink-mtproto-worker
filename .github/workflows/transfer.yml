@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install telegram
+      - run: npm install telegram archiver
       - run: node transfer.js
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
