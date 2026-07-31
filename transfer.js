@@ -14,7 +14,10 @@ const {
     BALE_CHAT_ID,
 } = process.env;
 
-const BALE_MAX_BYTES = 45 * 1024 * 1024;
+// حداکثر حجم مجاز ارسال اسناد در بله از طریق multipart/form-data برابر با 50 مگابایت است.
+// جهت اطمینان، مقدار سقف روی 48 مگابایت تنظیم می‌شود.
+const BALE_MAX_BYTES = 48 * 1024 * 1024;
+const BALE_MAX_CAPTION_LENGTH = 4096; // حداکثر طول مجاز زیرنویس در بله
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return "0 Bytes";
@@ -27,6 +30,11 @@ function formatBytes(bytes) {
 function drawProgressBar(percent, length = 10) {
     const filled = Math.min(length, Math.max(0, Math.round((percent / 100) * length)));
     return "█".repeat(filled) + "░".repeat(length - filled);
+}
+
+function truncateCaption(text, limit = BALE_MAX_CAPTION_LENGTH) {
+    if (!text) return "";
+    return text.length > limit ? text.substring(0, limit - 3) + "..." : text;
 }
 
 async function updateTelegramStatus(messageId, text) {
@@ -88,8 +96,22 @@ function splitFile(filePath, chunkSize) {
     return parts;
 }
 
+function cleanUpFiles(filePath, parts = []) {
+    if (filePath && fs.existsSync(filePath)) {
+        try { fs.unlinkSync(filePath); } catch (e) {}
+    }
+    for (const part of parts) {
+        if (fs.existsSync(part)) {
+            try { fs.unlinkSync(part); } catch (e) {}
+        }
+    }
+}
+
 (async () => {
     let statusMsgId = null;
+    const filePath = "./temp_file";
+    let generatedParts = [];
+
     try {
         statusMsgId = await updateTelegramStatus(null, "⚡ **در حال آماده‌سازی دریافت فایل...**");
         console.log("Status Message ID created:", statusMsgId);
@@ -112,7 +134,6 @@ function splitFile(filePath, chunkSize) {
         }
 
         const msg = messages[0];
-        const filePath = "./temp_file";
         let lastUpdate = 0;
 
         console.log("Downloading directly to file...");
@@ -138,31 +159,37 @@ function splitFile(filePath, chunkSize) {
         const fileSize = fs.statSync(filePath).size;
         console.log(`Download finished. File size: ${fileSize} bytes`);
 
-        const caption = msg.text || msg.caption || "";
+        const rawCaption = msg.text || msg.caption || "";
 
         if (fileSize <= BALE_MAX_BYTES) {
             statusMsgId = await updateTelegramStatus(statusMsgId, "📤 **در حال ارسال به بله...**");
+            
             const formData = new FormData();
             formData.append("chat_id", BALE_CHAT_ID);
-            if (caption) formData.append("caption", caption);
+            if (rawCaption) {
+                formData.append("caption", truncateCaption(rawCaption));
+            }
+            
+            const fileStream = fs.createReadStream(filePath);
             formData.append("document", new Blob([fs.readFileSync(filePath)]), "file");
 
             const res = await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument`, {
                 method: "POST",
                 body: formData,
             });
+
             if (!res.ok) throw new Error(await res.text());
         } else {
             statusMsgId = await updateTelegramStatus(
                 statusMsgId,
-                `📦 **فایل بزرگتر از ۴۵ مگابایت است. در حال تقسیم‌بندی...**\nحجم کل: \`${formatBytes(fileSize)}\``
+                `📦 **فایل بزرگتر از سقف مجاز بله است. در حال تقسیم‌بندی...**\nحجم کل: \`${formatBytes(fileSize)}\``
             );
 
-            const parts = splitFile(filePath, BALE_MAX_BYTES);
-            const totalParts = parts.length;
+            generatedParts = splitFile(filePath, BALE_MAX_BYTES);
+            const totalParts = generatedParts.length;
 
             for (let i = 0; i < totalParts; i++) {
-                const partPath = parts[i];
+                const partPath = generatedParts[i];
                 const partFileName = path.basename(partPath);
 
                 statusMsgId = await updateTelegramStatus(
@@ -170,12 +197,11 @@ function splitFile(filePath, chunkSize) {
                     `📤 **در حال ارسال پارت ${i + 1} از ${totalParts} به بله...**\n\`[${drawProgressBar(Math.floor(((i + 1) / totalParts) * 100))}]\``
                 );
 
+                const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`);
+
                 const formData = new FormData();
                 formData.append("chat_id", BALE_CHAT_ID);
-                formData.append(
-                    "caption",
-                    `پارت ${i + 1} از ${totalParts}${caption ? `\n\n${caption}` : ""}`
-                );
+                formData.append("caption", partCaption);
                 formData.append("document", new Blob([fs.readFileSync(partPath)]), partFileName);
 
                 const res = await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument`, {
@@ -192,11 +218,12 @@ function splitFile(filePath, chunkSize) {
         }
 
         await updateTelegramStatus(statusMsgId, "✅ **تمامی پارت‌های فایل با موفقیت به بله منتقل شدند!**");
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        cleanUpFiles(filePath, generatedParts);
         await client.disconnect();
         process.exit(0);
     } catch (err) {
         console.error("Transfer failed:", err);
+        cleanUpFiles(filePath, generatedParts);
         if (statusMsgId) {
             await updateTelegramStatus(statusMsgId, `❌ **خطا در انتقال:** ${err.message}`);
         }
