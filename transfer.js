@@ -78,7 +78,25 @@ function getVideoMetadata(inputPath) {
     });
 }
 
-function splitVideoByDuration(inputPath, targetMaxBytes) {
+function compressVideo(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .outputOptions([
+                "-c:v libx264",
+                "-crf 28",            // فشرده‌سازی با حفظ کیفیت مناسب
+                "-preset fast",
+                "-vf scale=-2:480",   // تغییر رزولوشن به 480p
+                "-c:a aac",
+                "-b:a 128k",
+                "-movflags +faststart" // قابلیت پخش مستقیم
+            ])
+            .save(outputPath)
+            .on("end", () => resolve(outputPath))
+            .on("error", (err) => reject(err));
+    });
+}
+
+function splitVideoByBitrate(inputPath, targetMaxBytes) {
     return new Promise(async (resolve, reject) => {
         try {
             const metadata = await getVideoMetadata(inputPath);
@@ -89,36 +107,48 @@ function splitVideoByDuration(inputPath, targetMaxBytes) {
                 return reject(new Error("امکان محاسبه مدت زمان یا حجم ویدیو وجود ندارد."));
             }
 
-            const numParts = Math.ceil(totalSize / targetMaxBytes);
-            const segmentDuration = Math.floor(duration / numParts);
+            // محاسبه نرخ بیت تقریبی و طول زمانی هر پارت جهت پر کردن حاشیه امن ۹۵٪ ظرفیت ۲۰ مگابایت
+            const bytesPerSecond = totalSize / duration;
+            const targetSegmentDuration = Math.floor((targetMaxBytes * 0.95) / bytesPerSecond);
 
             const parts = [];
             const outputPrefix = inputPath.replace(/\.[^/.]+$/, "");
 
+            let currentTime = 0;
+            let partIndex = 1;
             let completed = 0;
+            const tasks = [];
 
-            for (let i = 0; i < numParts; i++) {
-                const partIndex = i + 1;
+            while (currentTime < duration) {
                 const partPath = `${outputPrefix}_part${String(partIndex).padStart(3, "0")}.mp4`;
-                const startTime = i * segmentDuration;
+                const startTime = currentTime;
+                const isLastPart = (currentTime + targetSegmentDuration) >= duration;
+                const currentDuration = isLastPart ? (duration - currentTime) : targetSegmentDuration;
 
-                const command = ffmpeg(inputPath).setStartTime(startTime);
+                tasks.push({ startTime, duration: currentDuration, partPath });
 
-                if (i < numParts - 1) {
-                    command.setDuration(segmentDuration);
+                currentTime += targetSegmentDuration;
+                partIndex++;
+            }
+
+            for (const task of tasks) {
+                const command = ffmpeg(inputPath).setStartTime(task.startTime);
+
+                if (task.startTime + task.duration < duration) {
+                    command.setDuration(task.duration);
                 }
 
                 command
                     .outputOptions([
-                        "-c copy", // کپی مستقیم استریم بدون انکود مجدد یا فشرده‌سازی
+                        "-c copy", // کپی بدون انکود مجدد جهت سرعت بالا پس از فشرده‌سازی اولیه
                         "-avoid_negative_ts make_zero",
                         "-movflags +faststart"
                     ])
-                    .save(partPath)
+                    .save(task.partPath)
                     .on("end", () => {
-                        parts.push(partPath);
+                        parts.push(task.partPath);
                         completed++;
-                        if (completed === numParts) {
+                        if (completed === tasks.length) {
                             parts.sort();
                             resolve(parts);
                         }
@@ -168,6 +198,7 @@ function cleanUpFiles(...filePaths) {
 (async () => {
     let statusMsgId = null;
     const rawFilePath = "./temp_raw_file";
+    const compressedFilePath = "./temp_compressed.mp4";
     let generatedParts = [];
 
     try {
@@ -214,9 +245,24 @@ function cleanUpFiles(...filePaths) {
             },
         });
 
+        let targetUploadPath = rawFilePath;
         const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
-        const fileSize = fs.statSync(rawFilePath).size;
-        console.log(`Processing complete. File size: ${fileSize} bytes`);
+
+        if (isVideo) {
+            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال فشرده‌سازی ویدیو (480p)...**");
+            console.log("Compressing video to 480p...");
+            
+            try {
+                await compressVideo(rawFilePath, compressedFilePath);
+                targetUploadPath = compressedFilePath;
+                console.log("Video compression successful.");
+            } catch (ffmpegErr) {
+                console.warn("Compression failed, proceeding with original file:", ffmpegErr.message);
+            }
+        }
+
+        const fileSize = fs.statSync(targetUploadPath).size;
+        console.log(`Processing complete. Final file size: ${fileSize} bytes`);
 
         const rawCaption = msg.text || msg.caption || "";
         const endpoint = isVideo ? "sendVideo" : "sendDocument";
@@ -228,11 +274,11 @@ function cleanUpFiles(...filePaths) {
             const formData = new FormData();
             formData.append("chat_id", BALE_CHAT_ID);
             if (rawCaption) {
-                formData.append("caption", truncateCaption(rawCaption)); // رعایت سقف کاراکتر زیرنویس[cite: 1]
+                formData.append("caption", truncateCaption(rawCaption));
             }
             
-            const uploadFileName = isVideo ? "video.mp4" : path.basename(rawFilePath);
-            formData.append(fileParamName, new Blob([fs.readFileSync(rawFilePath)]), uploadFileName);
+            const uploadFileName = isVideo ? "video.mp4" : path.basename(targetUploadPath);
+            formData.append(fileParamName, new Blob([fs.readFileSync(targetUploadPath)]), uploadFileName);
 
             const res = await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/${endpoint}`, {
                 method: "POST",
@@ -247,10 +293,10 @@ function cleanUpFiles(...filePaths) {
             );
 
             if (isVideo) {
-                console.log("Splitting video using FFmpeg stream copy to preserve playable headers...");
-                generatedParts = await splitVideoByDuration(rawFilePath, BALE_MAX_BYTES);
+                console.log("Splitting video using bitrate calculation to optimize part sizes...");
+                generatedParts = await splitVideoByBitrate(targetUploadPath, BALE_MAX_BYTES);
             } else {
-                generatedParts = splitRawFileBytes(rawFilePath, BALE_MAX_BYTES);
+                generatedParts = splitRawFileBytes(targetUploadPath, BALE_MAX_BYTES);
             }
 
             const totalParts = generatedParts.length;
@@ -264,7 +310,7 @@ function cleanUpFiles(...filePaths) {
                     `📤 **در حال ارسال پارت ${i + 1} از ${totalParts} به بله...**\n\`[${drawProgressBar(Math.floor(((i + 1) / totalParts) * 100))}]\``
                 );
 
-                const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`); // رعایت سقف کاراکتر زیرنویس[cite: 1]
+                const partCaption = truncateCaption(`پارت ${i + 1} از ${totalParts}${rawCaption ? `\n\n${rawCaption}` : ""}`);
 
                 const formData = new FormData();
                 formData.append("chat_id", BALE_CHAT_ID);
@@ -285,12 +331,12 @@ function cleanUpFiles(...filePaths) {
         }
 
         await updateTelegramStatus(statusMsgId, "✅ **تمامی پارت‌های فایل با موفقیت به بله منتقل شدند!**");
-        cleanUpFiles(rawFilePath, generatedParts);
+        cleanUpFiles(rawFilePath, compressedFilePath, generatedParts);
         await client.disconnect();
         process.exit(0);
     } catch (err) {
         console.error("Transfer failed:", err);
-        cleanUpFiles(rawFilePath, generatedParts);
+        cleanUpFiles(rawFilePath, compressedFilePath, generatedParts);
         if (statusMsgId) {
             await updateTelegramStatus(statusMsgId, `❌ **خطا در انتقال:** ${err.message}`);
         }
