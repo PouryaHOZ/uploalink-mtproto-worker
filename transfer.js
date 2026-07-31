@@ -16,7 +16,7 @@ const {
 } = process.env;
 
 // Set max split size to 20 MB to stay well under Nginx proxy limits
-const BALE_MAX_BYTES = 30 * 1024 * 1024;
+const BALE_MAX_BYTES = 20 * 1024 * 1024;
 const BALE_MAX_CAPTION_LENGTH = 4096;
 
 function formatBytes(bytes) {
@@ -174,18 +174,18 @@ function cleanUpFiles(...filePaths) {
         let targetUploadPath = rawFilePath;
         const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
 
-        // if (isVideo) {
-        //     statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال فشرده‌سازی ویدیو (480p)...**");
-        //     console.log("Compressing video to 480p...");
+        if (isVideo) {
+            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال فشرده‌سازی ویدیو (480p)...**");
+            console.log("Compressing video to 480p...");
             
-        //     try {
-        //         await compressVideo(rawFilePath, compressedFilePath);
-        //         targetUploadPath = compressedFilePath;
-        //         console.log("Video compression successful.");
-        //     } catch (ffmpegErr) {
-        //         console.warn("Compression failed, proceeding with original file:", ffmpegErr.message);
-        //     }
-        // }
+            try {
+                await compressVideo(rawFilePath, compressedFilePath);
+                targetUploadPath = compressedFilePath;
+                console.log("Video compression successful.");
+            } catch (ffmpegErr) {
+                console.warn("Compression failed, proceeding with original file:", ffmpegErr.message);
+            }
+        }
 
         const fileSize = fs.statSync(targetUploadPath).size;
         console.log(`Processing complete. Final upload size: ${fileSize} bytes`);
