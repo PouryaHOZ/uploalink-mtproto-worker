@@ -2,6 +2,7 @@ const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const fs = require("fs");
 const path = require("path");
+const ffmpeg = require("fluent-ffmpeg");
 
 const {
     TELEGRAM_API_ID,
@@ -14,10 +15,9 @@ const {
     BALE_CHAT_ID,
 } = process.env;
 
-// حداکثر حجم مجاز ارسال اسناد در بله از طریق multipart/form-data برابر با 50 مگابایت است.
-// جهت اطمینان، مقدار سقف روی 48 مگابایت تنظیم می‌شود.
-const BALE_MAX_BYTES = 48 * 1024 * 1024;
-const BALE_MAX_CAPTION_LENGTH = 4096; // حداکثر طول مجاز زیرنویس در بله
+// Set max split size to 20 MB to stay well under Nginx proxy limits
+const BALE_MAX_BYTES = 20 * 1024 * 1024;
+const BALE_MAX_CAPTION_LENGTH = 4096;
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return "0 Bytes";
@@ -70,6 +70,23 @@ async function updateTelegramStatus(messageId, text) {
     }
 }
 
+function compressVideo(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .outputOptions([
+                "-c:v libx264",
+                "-crf 28",            // High compression quality target
+                "-preset fast",
+                "-vf scale=-2:480",   // Downscale height to 480p
+                "-c:a aac",
+                "-b:a 128k"
+            ])
+            .save(outputPath)
+            .on("end", () => resolve(outputPath))
+            .on("error", (err) => reject(err));
+    });
+}
+
 function splitFile(filePath, chunkSize) {
     const stats = fs.statSync(filePath);
     const totalSize = stats.size;
@@ -96,20 +113,18 @@ function splitFile(filePath, chunkSize) {
     return parts;
 }
 
-function cleanUpFiles(filePath, parts = []) {
-    if (filePath && fs.existsSync(filePath)) {
-        try { fs.unlinkSync(filePath); } catch (e) {}
-    }
-    for (const part of parts) {
-        if (fs.existsSync(part)) {
-            try { fs.unlinkSync(part); } catch (e) {}
+function cleanUpFiles(...filePaths) {
+    for (const filePath of filePaths.flat()) {
+        if (filePath && fs.existsSync(filePath)) {
+            try { fs.unlinkSync(filePath); } catch (e) {}
         }
     }
 }
 
 (async () => {
     let statusMsgId = null;
-    const filePath = "./temp_file";
+    const rawFilePath = "./temp_raw_file";
+    const compressedFilePath = "./temp_compressed.mp4";
     let generatedParts = [];
 
     try {
@@ -134,11 +149,11 @@ function cleanUpFiles(filePath, parts = []) {
         }
 
         const msg = messages[0];
-        let lastUpdate = 0;
+        let lastUpdate = Date.now();
 
         console.log("Downloading directly to file...");
         await client.downloadMedia(msg.media, {
-            outputFile: filePath,
+            outputFile: rawFilePath,
             progressCallback: async (downloaded, total) => {
                 const now = Date.now();
                 if (now - lastUpdate > 3500 || downloaded === total) {
@@ -156,8 +171,24 @@ function cleanUpFiles(filePath, parts = []) {
             },
         });
 
-        const fileSize = fs.statSync(filePath).size;
-        console.log(`Download finished. File size: ${fileSize} bytes`);
+        let targetUploadPath = rawFilePath;
+        const isVideo = msg.media.document?.mimeType?.startsWith("video/") || false;
+
+        if (isVideo) {
+            statusMsgId = await updateTelegramStatus(statusMsgId, "⚙️ **در حال فشرده‌سازی ویدیو (480p)...**");
+            console.log("Compressing video to 480p...");
+            
+            try {
+                await compressVideo(rawFilePath, compressedFilePath);
+                targetUploadPath = compressedFilePath;
+                console.log("Video compression successful.");
+            } catch (ffmpegErr) {
+                console.warn("Compression failed, proceeding with original file:", ffmpegErr.message);
+            }
+        }
+
+        const fileSize = fs.statSync(targetUploadPath).size;
+        console.log(`Processing complete. Final upload size: ${fileSize} bytes`);
 
         const rawCaption = msg.text || msg.caption || "";
 
@@ -170,8 +201,7 @@ function cleanUpFiles(filePath, parts = []) {
                 formData.append("caption", truncateCaption(rawCaption));
             }
             
-            const fileStream = fs.createReadStream(filePath);
-            formData.append("document", new Blob([fs.readFileSync(filePath)]), "file");
+            formData.append("document", new Blob([fs.readFileSync(targetUploadPath)]), path.basename(targetUploadPath));
 
             const res = await fetch(`https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument`, {
                 method: "POST",
@@ -182,10 +212,10 @@ function cleanUpFiles(filePath, parts = []) {
         } else {
             statusMsgId = await updateTelegramStatus(
                 statusMsgId,
-                `📦 **فایل بزرگتر از سقف مجاز بله است. در حال تقسیم‌بندی...**\nحجم کل: \`${formatBytes(fileSize)}\``
+                `📦 **فایل بزرگتر از سقف مجاز بله (20MB) است. در حال تقسیم‌بندی...**\nحجم کل: \`${formatBytes(fileSize)}\``
             );
 
-            generatedParts = splitFile(filePath, BALE_MAX_BYTES);
+            generatedParts = splitFile(targetUploadPath, BALE_MAX_BYTES);
             const totalParts = generatedParts.length;
 
             for (let i = 0; i < totalParts; i++) {
@@ -218,12 +248,12 @@ function cleanUpFiles(filePath, parts = []) {
         }
 
         await updateTelegramStatus(statusMsgId, "✅ **تمامی پارت‌های فایل با موفقیت به بله منتقل شدند!**");
-        cleanUpFiles(filePath, generatedParts);
+        cleanUpFiles(rawFilePath, compressedFilePath, generatedParts);
         await client.disconnect();
         process.exit(0);
     } catch (err) {
         console.error("Transfer failed:", err);
-        cleanUpFiles(filePath, generatedParts);
+        cleanUpFiles(rawFilePath, compressedFilePath, generatedParts);
         if (statusMsgId) {
             await updateTelegramStatus(statusMsgId, `❌ **خطا در انتقال:** ${err.message}`);
         }
