@@ -1,0 +1,23 @@
+name: Transfer Large File
+on:
+  repository_dispatch:
+    types: [forward_file]
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install telegram
+      - run: node transfer.js
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          MESSAGE_ID: ${{ github.event.client_payload.message_id }}
+          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          BALE_CHAT_ID: ${{ github.event.client_payload.bale_chat_id }}
