@@ -1,0 +1,27 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "uploalink-mtproto-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-07-27",
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true,
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"kv_namespaces": [
+		{
+			"binding": "LINKS",
+			"id": "c83364535de2446694a1ab74aa3d640f",
+			"preview_id": "c83364535de2446694a1ab74aa3d640f"
+		}
+	],
+	"vars": {
+		"TELEGRAM_BASE_URL": "https://api.telegram.org",
+		"BALE_BASE_URL": "https://tapi.bale.ai",
+		"RUBIKA_BASE_URL": "https://botapi.rubika.ir/v3/",
+		"MAX_CONCURRENT_TRANSFERS": "5",
+		"RATE_LIMIT": "10"
+	}
+}

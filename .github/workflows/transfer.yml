@@ -1,30 +1,124 @@
 name: Transfer Large File
+
 on:
   repository_dispatch:
     types: [forward_file]
+  workflow_dispatch:
+    inputs:
+      message_id:
+        description: 'Telegram Message ID'
+        required: true
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      file_name:
+        description: 'File Name'
+        required: false
+        default: ''
+      file_size:
+        description: 'File Size in bytes'
+        required: false
+        default: '0'
+      is_video:
+        description: 'Is Video File (true/false)'
+        required: false
+        default: 'false'
+      mime_type:
+        description: 'File MIME Type'
+        required: false
+        default: ''
+      file_id:
+        description: 'Telegram File ID'
+        required: false
+        default: ''
+      destinations:
+        description: 'Destinations (bale,rubika,both)'
+        required: false
+        default: 'both'
+      should_compress:
+        description: 'Should Compress Video (true/false)'
+        required: false
+        default: 'false'
+      account:
+        description: 'Account (bale/rubika/both)'
+        required: false
+        default: 'both'
+      user_id:
+        description: 'User ID'
+        required: false
+        default: ''
+      user_name:
+        description: 'User Name'
+        required: false
+        default: ''
+      cloudflare_webhook:
+        description: 'Cloudflare Webhook URL'
+        required: false
+        default: ''
 
 jobs:
   transfer:
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # Increased for large files
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '20'
+          cache: 'npm'
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-      - name: Install Node Packages
-        run: npm install telegram archiver fluent-ffmpeg
+
+      - name: Install Node Dependencies
+        run: npm install
+
+      - name: Create temp directory
+        run: mkdir -p temp_transfers
+
       - name: Execute Transfer Script
-        run: node transfer.js
+        run: node src/transfer.js
         env:
+          # Telegram Configuration
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.chat_id || inputs.chat_id }}
+
+          # Destination Accounts
           BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          MESSAGE_ID: ${{ github.event.client_payload.message_id }}
-          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.chat_id }}
-          BALE_CHAT_ID: ${{ github.event.client_payload.bale_chat_id }}
+          BALE_CHAT_ID: ${{ github.event.client_payload.bale_chat_id || secrets.BALE_CHAT_ID }}
+          RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
+          RUBIKA_CHAT_ID: ${{ github.event.client_payload.rubika_chat_id || secrets.RUBIKA_CHAT_ID }}
+
+          # Transfer Parameters
+          MESSAGE_ID: ${{ github.event.client_payload.message_id || inputs.message_id }}
+          FILE_NAME: ${{ github.event.client_payload.file_name || inputs.file_name }}
+          FILE_SIZE: ${{ github.event.client_payload.file_size || inputs.file_size }}
+          IS_VIDEO: ${{ github.event.client_payload.is_video || inputs.is_video }}
+          MIME_TYPE: ${{ github.event.client_payload.mime_type || inputs.mime_type }}
+          FILE_ID: ${{ github.event.client_payload.file_id || inputs.file_id }}
+          DESTINATIONS: ${{ github.event.client_payload.destinations || inputs.destinations }}
+          SHOULD_COMPRESS: ${{ github.event.client_payload.should_compress || inputs.should_compress }}
+          ACCOUNT: ${{ github.event.client_payload.account || inputs.account }}
+          USER_ID: ${{ github.event.client_payload.user_id || inputs.user_id }}
+          USER_NAME: ${{ github.event.client_payload.user_name || inputs.user_name }}
+
+          # Cloudflare Callback (for KV updates)
+          CLOUDFLARE_WEBHOOK_URL: ${{ github.event.client_payload.cloudflare_webhook || inputs.cloudflare_webhook || secrets.CLOUDFLARE_WEBHOOK_URL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+          # Performance Settings
+          DOWNLOAD_WORKERS: 32
+          DOWNLOAD_CHUNK_SIZE: 16777216
+          UPLOAD_CHUNK_SIZE: 16777216
+          MAX_RETRIES: 5
+          TEMP_DIR: ./temp_transfers
+          MAX_CONCURRENT_TRANSFERS: 5
