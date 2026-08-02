@@ -15,23 +15,19 @@ export async function triggerGitHubWorkflow(env: Env, kv: KVService, transferReq
         createdAt: Date.now()
     });
 
-    // GitHub repository_dispatch strictly requires this exact JSON format
+    // Exactly 9 properties inside client_payload (Well under GitHub's 10-property limit)
     const payload = {
         event_type: 'forward_file',
         client_payload: {
             MESSAGE_ID: transferRequest.messageId.toString(),
             CHAT_ID: transferRequest.chatId,
-            TELEGRAM_CHAT_ID: transferRequest.chatId,
             FILE_NAME: transferRequest.fileName,
             FILE_SIZE: transferRequest.fileSize.toString(),
             IS_VIDEO: transferRequest.isVideo ? 'true' : 'false',
             MIME_TYPE: transferRequest.mimeType || '',
             FILE_ID: transferRequest.fileId || '',
             DESTINATIONS: (transferRequest.destinations || []).join(','),
-            SHOULD_COMPRESS: transferRequest.shouldCompress ? 'true' : 'false',
-            ACCOUNT: transferRequest.account || 'both',
-            USER_ID: transferRequest.userId || '',
-            PLATFORM: transferRequest.platform
+            SHOULD_COMPRESS: transferRequest.shouldCompress ? 'true' : 'false'
         }
     };
 
@@ -51,7 +47,7 @@ export async function triggerGitHubWorkflow(env: Env, kv: KVService, transferReq
             const errorText = await res.text();
             console.error(`GitHub Action Trigger Failed [HTTP ${res.status}]:`, errorText);
         } else {
-            console.log("GitHub Action Triggered Successfully!");
+            console.log("✅ GitHub Action Triggered Successfully!");
         }
     } catch (err) {
         console.error("Network error triggering GitHub Action:", err);

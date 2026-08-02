@@ -83,7 +83,7 @@ jobs:
         run: mkdir -p /dev/shm/temp_transfers
 
       - name: Execute Transfer Script
-        run: node transfer.js
+        run: node src/transfer.js
         env:
           # Telegram Secrets
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
