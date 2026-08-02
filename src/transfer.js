@@ -316,16 +316,21 @@ class FileTransferBot {
     async uploadToRubikaAsDocument(filePath, fileName, caption, fileSize) {
         const rubikaBaseUrl = config.rubika.baseUrl || 'https://botapi.rubika.ir/v3/';
 
+        // 1. Request upload URL
         const uploadInfo = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/requestSendFile`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type: 'File' })
         }).then(r => r.json());
 
-        if (!uploadInfo || !uploadInfo.upload_url) {
+        // Rubika wraps response under data object: { status: "OK", data: { upload_url: "..." } }
+        const uploadUrl = uploadInfo?.data?.upload_url || uploadInfo?.upload_url;
+
+        if (!uploadUrl) {
             throw new Error(`Rubika requestSendFile failed: ${JSON.stringify(uploadInfo)}`);
         }
 
+        // 2. Upload file binary stream
         const uploadResult = await new Promise((resolve, reject) => {
             const formData = new FormData();
             const fileStream = fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize });
@@ -335,7 +340,7 @@ class FileTransferBot {
                 knownLength: fileSize
             });
 
-            const parsedUrl = new URL(uploadInfo.upload_url);
+            const parsedUrl = new URL(uploadUrl);
             const req = https.request({
                 hostname: parsedUrl.hostname,
                 path: parsedUrl.pathname + parsedUrl.search,
@@ -353,21 +358,26 @@ class FileTransferBot {
             formData.pipe(req);
         });
 
-        if (!uploadResult || !uploadResult.file_id) {
+        const fileId = uploadResult?.data?.file_id || uploadResult?.file_id;
+
+        if (!fileId) {
             throw new Error(`Rubika binary upload failed: ${JSON.stringify(uploadResult)}`);
         }
 
+        // 3. Finalize message send
         const sendResponse = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/sendFile`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: config.rubika.chatId,
-                file_id: uploadResult.file_id,
+                file_id: fileId,
                 text: caption || `📥 فایل ${fileName}`
             })
         }).then(r => r.json());
 
-        if (!sendResponse || !sendResponse.message_id) {
+        const messageId = sendResponse?.data?.message_id || sendResponse?.message_id;
+
+        if (!messageId) {
             throw new Error(`Rubika sendFile failed: ${JSON.stringify(sendResponse)}`);
         }
     }
