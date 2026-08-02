@@ -108,6 +108,16 @@ export default {
                 return await this.handleCompressionPreference(request, env);
             }
 
+            // Link command webhook
+            if (path === '/link') {
+                return await this.handleLinkCommand(request, env);
+            }
+
+            // Link selection callback
+            if (path === '/select-link') {
+                return await this.handleLinkSelection(request, env);
+            }
+
             // Status check endpoint
             if (path === '/status') {
                 return await this.handleStatusCheck(request, env);
@@ -307,6 +317,15 @@ export default {
     // Handle message updates (Telegram, Bale, Rubika)
     async handleMessageUpdate(update: any, env: Env, platform: 'telegram' | 'bale' | 'rubika'): Promise<Response> {
         const message = update.message;
+
+        // Handle /link command
+        if (message.text === '/link' || message.text === '/link@your_bot_name') {
+            await this.askLinkSelection(env, message.chat.id.toString(), platform);
+            return new Response(
+                JSON.stringify({ status: 'link_command_handled' }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
 
         // Ignore non-file messages
         if (!this.isFileMessage(message, platform)) {
@@ -620,6 +639,20 @@ export default {
                 );
             }
 
+            // Handle link selection
+            if (action === 'select' && params[0] === 'link') {
+                const selectedPlatform = params[1] as 'bale' | 'rubika';
+                const link = this.generatePlatformLink(selectedPlatform);
+
+                await this.answerCallbackQuery(env, callbackQuery.id, `لینک ${selectedPlatform === 'rubika' ? 'روبیکا' : 'بله'} برای شما ارسال شد.`, platform);
+                await this.sendMessage(env, platform, chatId, link);
+
+                return new Response(
+                    JSON.stringify({ status: 'link_sent' }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } }
+                );
+            }
+
             // Unknown callback
             await this.answerCallbackQuery(env, callbackQuery.id, 'دستور ناشناخته.', platform);
             return new Response(
@@ -807,6 +840,82 @@ export default {
             JSON.stringify({ status: 'compression_preference_set' }),
             { status: 200, headers: { 'Content-Type': 'application/json' } }
         );
+    },
+
+    // Handle /link command
+    async handleLinkCommand(request: Request, env: Env): Promise<Response> {
+        const body = await request.json();
+        const chatId = body.chatId;
+        const platform = body.platform || 'telegram';
+
+        if (!chatId) {
+            return new Response(
+                JSON.stringify({ error: 'Missing chatId' }),
+                { status: 400, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        // Ask user to select platform for linking
+        await this.askLinkSelection(env, chatId, platform);
+
+        return new Response(
+            JSON.stringify({ status: 'link_selection_required' }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+    },
+
+    // Handle link selection callback
+    async handleLinkSelection(request: Request, env: Env): Promise<Response> {
+        const body = await request.json();
+        const chatId = body.chatId;
+        const platform = body.platform || 'telegram';
+        const selectedPlatform = body.selectedPlatform; // 'bale' or 'rubika'
+
+        if (!chatId || !selectedPlatform) {
+            return new Response(
+                JSON.stringify({ error: 'Missing parameters' }),
+                { status: 400, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        // Generate the appropriate link
+        const link = this.generatePlatformLink(selectedPlatform);
+
+        // Send the link to the user
+        await this.sendMessage(env, platform, chatId, link);
+
+        return new Response(
+            JSON.stringify({ status: 'link_sent', link }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+    },
+
+    // Helper: Ask user to select platform for linking
+    async askLinkSelection(env: Env, chatId: string, platform: 'telegram' | 'bale' | 'rubika'): Promise<void> {
+        const message = `🔗 **لطفاً پلتفرم مورد نظر برای لینک را انتخاب کنید:**`;
+
+        const replyMarkup = {
+            inline_keyboard: [
+                [
+                    { text: '📌 روبیکا', callback_data: `select_link_rubika_${chatId}` },
+                    { text: '📌 بله', callback_data: `select_link_bale_${chatId}` }
+                ]
+            ]
+        };
+
+        await this.sendMessage(env, platform, chatId, message, replyMarkup);
+    },
+
+    // Helper: Generate platform link
+    generatePlatformLink(platform: 'bale' | 'rubika'): string {
+        switch (platform) {
+            case 'rubika':
+                return `🔗 **لینک روبیکا:**\n\nhttps://web.rubika.ir/#c=b0uwt09b5987c707fddc7443e136a601`;
+            case 'bale':
+                return `🔗 **لینک بله:**\n\nhttps://bale.ai/join/<invite_code>`; // Replace with actual Bale invite link
+            default:
+                return `🔗 **لینک نامعتبر**`;
+        }
     },
 
     // Handle status check
