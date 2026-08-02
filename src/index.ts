@@ -8,7 +8,7 @@ import { Messenger } from './platforms/messenger';
 import { handleStartCommand, handleConnectionCode, askLinkSelection, askUnlinkSelection, handleStatusCommand } from './handlers/commands';
 import { createTransferRequest, processFileTransfer } from './handlers/transfers';
 import { triggerGitHubWorkflow } from './services/github';
-import { generateConnectionCode, generatePlatformLink } from './utils/helpers';
+import { generateConnectionCode, generatePlatformLink, calculateEstimates } from './utils/helpers';
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -66,7 +66,7 @@ export default {
         if (normalized.isCallback) {
             const simulatedQuery = {
                 data: rawText,
-                message: { chat: { id: chatId } },
+                message: { chat: { id: chatId }, message_id: messageId },
                 from: { id: userId },
                 id: messageId
             };
@@ -174,14 +174,15 @@ export default {
 
     async handleCallbackQuery(query: any, env: Env, kv: KVService, messenger: Messenger, platform: Platform): Promise<Response> {
         const data = query.data;
-        const chatId = query.message.chat.id.toString();
-        const userId = query.from.id.toString();
+        const chatId = query.message?.chat?.id?.toString() || query.chat_id?.toString() || "";
+        const messageId = query.message?.message_id?.toString() || query.message_id?.toString() || query.id;
+        const userId = query.from?.id?.toString() || query.sender_id?.toString() || "";
+        
         const parts = data.split(':');
         const action = parts[0];
 
-        // 1. Destination Selection Handlers
         if (action === 'dest') {
-            const destChoice = parts[1]; // 'bale' | 'rubika' | 'both'
+            const destChoice = parts[1];
             const transferId = parts[2];
             const transferReq = await kv.getTransferRequest(transferId);
 
@@ -189,14 +190,33 @@ export default {
                 transferReq.destinations = destChoice === 'both' ? ['bale', 'rubika'] : [destChoice as any];
                 await kv.saveTransferRequest(transferId, transferReq);
 
-                // Resume processing
-                await processFileTransfer(env, kv, messenger, transferReq);
+                if (transferReq.isVideo) {
+                    const est = calculateEstimates(transferReq.fileSize, true, transferReq.destinations);
+                    const promptText = `🎬 **تنظیمات ویدیو پیش از ارسال:**\n\n` +
+                                       `📁 **نام فایل:** ${transferReq.fileName}\n` +
+                                       `📏 **حجم اصلی:** ${est.originalSizeFormatted}\n` +
+                                       `⚡ **حجم تقریبی فشرده (480p):** ${est.compressedSizeFormatted} (${est.reductionPercentage} کاهش)\n\n` +
+                                       `لطفاً وضعیت فشرده‌سازی را انتخاب کنید:`;
+                    
+                    // Replace the message and inject the new compression options
+                    await messenger.editMessageText(chatId, messageId, promptText, {
+                        inline_keyboard: [
+                            [{ text: `⚡ فشرده‌سازی [~${est.compressedTimeFormatted}]`, callback_data: `comp:yes:${transferId}` }],
+                            [{ text: `📁 کیفیت اصلی [~${est.uncompressedTimeFormatted}]`, callback_data: `comp:no:${transferId}` }]
+                        ]
+                    });
+                } else {
+                    await triggerGitHubWorkflow(env, kv, { ...transferReq, shouldCompress: false });
+                    // Edit message to strictly text, which deletes the inline keyboard
+                    await messenger.editMessageText(chatId, messageId, `✅ **مقصد ثبت شد. پردازش و انتقال فایل آغاز شد.**`);
+                }
+            } else {
+                await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست انتقال یافت نشد یا منقضی شده است.`);
             }
             await messenger.answerCallbackQuery(query.id, 'مقصد ثبت شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        // 2. Compression Handlers
         if (action === 'comp') {
             const shouldCompress = parts[1] === 'yes';
             const transferId = parts[2];
@@ -204,13 +224,15 @@ export default {
 
             if (transferReq) {
                 await triggerGitHubWorkflow(env, kv, { ...transferReq, shouldCompress });
-                await messenger.sendMessage(chatId, `🚀 **پردازش و ارسال شروع شد.**`);
+                // Replace message and clear inline keyboard
+                await messenger.editMessageText(chatId, messageId, `🚀 **تنظیمات اعمال شد. پردازش و انتقال آغاز شد.**`);
+            } else {
+                await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست انتقال یافت نشد یا منقضی شده است.`);
             }
             await messenger.answerCallbackQuery(query.id, 'تنظیمات اعمال شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        // 3. Link Requests
         if (action === 'link') {
             const targetPlatform = parts[1] as Platform;
             const session = await kv.getSession(userId);
@@ -225,12 +247,11 @@ export default {
             });
 
             const linkMsg = generatePlatformLink(targetPlatform, code);
-            await messenger.sendMessage(chatId, linkMsg);
-            await messenger.answerCallbackQuery(query.id, 'کد ارسال شد.');
+            await messenger.editMessageText(chatId, messageId, linkMsg);
+            await messenger.answerCallbackQuery(query.id, 'کد ایجاد شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        // 4. Unlink Requests
         if (action === 'unlink') {
             const targetPlatform = parts[1] as Platform;
             await kv.deletePlatformReverseAccount(targetPlatform, chatId);
@@ -242,7 +263,7 @@ export default {
                 await kv.saveConnectedAccount(userId, connectedAcc);
             }
 
-            await messenger.sendMessage(chatId, `✅ **اتصال ${targetPlatform === 'bale' ? 'بله' : 'روبیکا'} قطع شد.**`);
+            await messenger.editMessageText(chatId, messageId, `✅ **اتصال ${targetPlatform === 'bale' ? 'بله' : 'روبیکا'} قطع شد.**`);
             await messenger.answerCallbackQuery(query.id, 'حساب قطع شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }

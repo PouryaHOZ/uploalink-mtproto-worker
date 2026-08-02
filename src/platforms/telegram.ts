@@ -18,6 +18,21 @@ export class TelegramPlatform implements Messenger {
         });
     }
 
+    async editMessageText(chatId: string, messageId: string, text: string, replyMarkup?: any): Promise<void> {
+        const url = `https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/editMessageText`;
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId,
+                text,
+                parse_mode: 'Markdown',
+                reply_markup: replyMarkup ? JSON.stringify(replyMarkup) : { inline_keyboard: [] }
+            })
+        });
+    }
+
     async answerCallbackQuery(callbackQueryId: string, text: string): Promise<void> {
         const url = `https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
         await fetch(url, {

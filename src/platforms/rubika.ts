@@ -11,8 +11,8 @@ export class RubikaPlatform implements Messenger {
     async sendMessage(chatId: string, text: string, replyMarkup?: any): Promise<void> {
         if (!this.env.RUBIKA_BOT_TOKEN) return;
         const url = `${this.baseUrl}${this.env.RUBIKA_BOT_TOKEN}/sendMessage`;
-
         let inlineKeypad: any = undefined;
+        
         if (replyMarkup && replyMarkup.inline_keyboard) {
             inlineKeypad = {
                 rows: replyMarkup.inline_keyboard.map((row: any[]) => ({
@@ -25,16 +25,51 @@ export class RubikaPlatform implements Messenger {
             };
         }
 
-        const body: any = {
+        const body = {
             chat_id: chatId,
             text,
             ...(inlineKeypad && { inline_keypad: inlineKeypad })
         };
 
-        await fetch(url, {
+        try {
+            await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+        } catch (err) {
+            console.error(`[Rubika] Network Error in sendMessage:`, err);
+        }
+    }
+
+    async editMessageText(chatId: string, messageId: string, text: string, replyMarkup?: any): Promise<void> {
+        if (!this.env.RUBIKA_BOT_TOKEN) return;
+        
+        // 1. Edit the message text
+        await fetch(`${this.baseUrl}${this.env.RUBIKA_BOT_TOKEN}/editMessageText`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId, text })
+        });
+
+        // 2. Clear or update the inline keypad
+        let inlineKeypad = { rows: [] }; // Empty rows removes the keypad
+        if (replyMarkup && replyMarkup.inline_keyboard && replyMarkup.inline_keyboard.length > 0) {
+            inlineKeypad = {
+                rows: replyMarkup.inline_keyboard.map((row: any[]) => ({
+                    buttons: row.map((btn: any) => ({
+                        id: btn.callback_data,
+                        type: 'Simple',
+                        button_text: btn.text
+                    }))
+                }))
+            } as any;
+        }
+
+        await fetch(`${this.baseUrl}${this.env.RUBIKA_BOT_TOKEN}/editInlineKeypad`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId, inline_keypad: inlineKeypad })
         });
     }
 
