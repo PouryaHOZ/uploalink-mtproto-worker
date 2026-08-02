@@ -493,9 +493,9 @@ export default {
 
         const successMessage = platform === 'bale'
             ? `✅ اتصال با موفقیت برقرار شد!\nble.ir/uploalinkbot?start=${code}`
-            : `✅ اتصال با موفقیت برقرار شد!\nhttps://web.rubika.ir/#c=b0uwt09b5987c707fddc7443e136a601`;
+            : `✅ اتصال با موفقیت برقرار شد!\nrubika.ir/uploalinkbot`;
 
-        await this.sendMessage(env, platform, chatId, successMessage);
+			await this.sendMessage(env, platform, chatId, successMessage);
         await env.LINKS.delete(`connection_request:${code}`);
     },
 
@@ -606,8 +606,8 @@ export default {
 
     generatePlatformLink(platform: 'bale' | 'rubika', code: string): string {
         return platform === 'rubika'
-            ? `🔗 **روبیکا:**\nhttps://web.rubika.ir/#c=b0uwt09b5987c707fddc7443e136a601\nکد: \`${code}\``
-            : `🔗 **بله:**\nble.ir/uploalinkbot?start=${code}\nکد: \`${code}\``;
+            ? `🔗 **روبیکا:**\nrubika.ir/uploalinkbot\n\n📌 کد یکبار مصرف: \`${code}\`\n\n💡 برای اتصال، کد بالا را به @uploalinkbot در روبیکا ارسال کنید.`
+            : `🔗 **بله:**\nble.ir/uploalinkbot?start=${code}\n\n📌 کد یکبار مصرف: \`${code}\`\n\n💡 برای اتصال، کد بالا را به @uploalinkbot در بله ارسال کنید.`;
     },
 
     async getTransferRequest(env: Env, transferId: string): Promise<TransferRequest | null> {
