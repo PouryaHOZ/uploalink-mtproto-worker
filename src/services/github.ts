@@ -7,6 +7,8 @@ export async function triggerGitHubWorkflow(env: Env, kv: KVService, transferReq
         return;
     }
 
+    const connectedAccounts = await kv.getConnectedAccount(transferRequest.userId || '');
+
     const transferId = `TR${Date.now()}`;
     await kv.saveActiveTransfer(transferId, {
         id: transferId,
@@ -15,7 +17,6 @@ export async function triggerGitHubWorkflow(env: Env, kv: KVService, transferReq
         createdAt: Date.now()
     });
 
-    // Exactly 9 properties inside client_payload (Well under GitHub's 10-property limit)
     const payload = {
         event_type: 'forward_file',
         client_payload: {
@@ -27,7 +28,9 @@ export async function triggerGitHubWorkflow(env: Env, kv: KVService, transferReq
             MIME_TYPE: transferRequest.mimeType || '',
             FILE_ID: transferRequest.fileId || '',
             DESTINATIONS: (transferRequest.destinations || []).join(','),
-            SHOULD_COMPRESS: transferRequest.shouldCompress ? 'true' : 'false'
+            SHOULD_COMPRESS: transferRequest.shouldCompress ? 'true' : 'false',
+            BALE_CHAT_ID: connectedAccounts?.baleChatId || '',
+            RUBIKA_CHAT_ID: connectedAccounts?.rubikaChatId || ''
         }
     };
 
