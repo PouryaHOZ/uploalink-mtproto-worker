@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "uploalink-mtproto-worker",
+	"name": "lively-leaf-6a9c",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-07-27",
 	"observability": {

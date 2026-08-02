@@ -7,6 +7,9 @@ const { spawn } = require("child_process");
 const FormData = require("form-data");
 const stream = require("stream");
 
+// استفاده از RAM Disk (شبیه‌سازی حافظه موقت در لینوکس) برای جلوگیری از گلوگاه I/O دیسک
+const TEMP_DIR = fs.existsSync("/dev/shm") ? "/dev/shm/temp_transfers" : "./temp_transfers";
+
 // Configuration
 const config = {
     telegram: {
@@ -14,7 +17,7 @@ const config = {
         apiHash: process.env.TELEGRAM_API_HASH || '',
         sessionString: process.env.TELEGRAM_SESSION_STRING || '',
         botToken: process.env.TELEGRAM_BOT_TOKEN || '',
-        chatId: process.env.TELEGRAM_CHAT_ID || '',
+        chatId: process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '',
         baseUrl: process.env.TELEGRAM_BASE_URL || 'https://api.telegram.org'
     },
     bale: process.env.BALE_BOT_TOKEN && process.env.BALE_CHAT_ID ? {
@@ -28,11 +31,11 @@ const config = {
         baseUrl: process.env.RUBIKA_BASE_URL || "https://botapi.rubika.ir/v3/"
     } : null,
     performance: {
-        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '32'),
-        downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '16777216'), // 16MB
-        uploadChunkSize: parseInt(process.env.UPLOAD_CHUNK_SIZE || '8388608'), // 8MB
+        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '14'), // سقف اتصال موازی ایمن
+        downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '67108864'), // 64MB High-Water Mark
+        uploadChunkSize: parseInt(process.env.UPLOAD_CHUNK_SIZE || '16777216'), // 16MB
         maxRetries: parseInt(process.env.MAX_RETRIES || '5'),
-        tempDir: process.env.TEMP_DIR || './temp_transfers',
+        tempDir: TEMP_DIR,
         maxConcurrentTransfers: parseInt(process.env.MAX_CONCURRENT_TRANSFERS || '5')
     },
     cloudflare: {
@@ -41,7 +44,7 @@ const config = {
     }
 };
 
-// Ensure temp directory exists
+// Ensure temp directory exists asynchronously
 if (!fs.existsSync(config.performance.tempDir)) {
     fs.mkdirSync(config.performance.tempDir, { recursive: true });
 }
@@ -114,8 +117,8 @@ class TransferManager {
             console.error("Error in message queue:", err);
         }
 
-        // Small delay to prevent rate limiting
-        await new Promise(resolve => setTimeout(resolve, 50));
+        // Throttle updates to avoid API limits (1.5 seconds)
+        await new Promise(resolve => setTimeout(resolve, 1500));
         await this.processQueue();
     }
 
@@ -141,17 +144,6 @@ class TransferManager {
         this.removeTransfer(id);
     }
 }
-
-// Optimized HTTP Agent
-const optimizedAgent = new https.Agent({
-    keepAlive: true,
-    keepAliveMsecs: 60000,
-    maxSockets: 100,
-    maxFreeSockets: 50,
-    scheduling: 'lifo',
-    timeout: 30000,
-    freeSocketTimeout: 30000
-});
 
 // Utility Functions
 function formatBytes(bytes) {
@@ -185,11 +177,6 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-function truncateCaption(text, limit = 4096) {
-    if (!text) return "";
-    return text.length > limit ? text.substring(0, limit - 3) + "..." : text;
-}
-
 // Telegram Client Manager
 class TelegramClientManager {
     constructor() {
@@ -203,7 +190,6 @@ class TelegramClientManager {
                 floodSleepThreshold: 10,
                 requestRetries: 5,
                 downloadWorkers: config.performance.downloadWorkers,
-                downloadBufferSize: config.performance.downloadChunkSize,
                 useWSS: false,
                 deviceModel: 'FileTransferBot',
                 systemVersion: 'Optimized',
@@ -237,7 +223,6 @@ class FileTransferBot {
     constructor() {
         this.transferManager = new TransferManager();
         this.telegramClient = new TelegramClientManager();
-        this.activeAccount = this.getDefaultAccount();
         this.availableAccounts = this.getAvailableAccounts();
     }
 
@@ -257,17 +242,10 @@ class FileTransferBot {
 
     async start() {
         try {
-            // Connect to Telegram
             await this.telegramClient.connect();
-            console.log("Connected to Telegram");
+            console.log("Connected to Telegram via MTProto");
 
-            // Check if we have a specific message to process
-            if (process.env.MESSAGE_ID) {
-                await this.processMessage(parseInt(process.env.MESSAGE_ID));
-            } else {
-                // In GitHub Actions, we expect to be triggered with specific parameters
-                await this.processFromEnv();
-            }
+            await this.processFromEnv();
         } catch (error) {
             console.error("Error starting bot:", error);
             process.exit(1);
@@ -275,27 +253,25 @@ class FileTransferBot {
     }
 
     async processFromEnv() {
-        // Get parameters from environment variables
+        // Read upper-case mappings sent directly from index.ts / Action workflow payload
         const messageId = process.env.MESSAGE_ID || '0';
-        const chatId = process.env.CHAT_ID || config.telegram.chatId;
+        const chatId = config.telegram.chatId;
         const fileName = process.env.FILE_NAME || `file_${Date.now()}`;
         const fileSize = parseInt(process.env.FILE_SIZE || '0');
         const isVideo = process.env.IS_VIDEO === 'true';
         const mimeType = process.env.MIME_TYPE || '';
         const fileId = process.env.FILE_ID || '';
-        const destinations = process.env.DESTINATIONS ?
-            process.env.DESTINATIONS.split(',') :
-            this.getDefaultDestinations();
+        const rawDestinations = process.env.DESTINATIONS || '';
+        const destinations = rawDestinations ? rawDestinations.split(',') : this.getDefaultDestinations();
         const shouldCompress = process.env.SHOULD_COMPRESS === 'true';
         const account = process.env.ACCOUNT || this.getDefaultAccount();
         const platform = process.env.PLATFORM || 'telegram';
 
-        if (!messageId) {
-            console.error("No message ID provided in environment variables");
+        if (!messageId || messageId === '0') {
+            console.error("No valid message ID provided in environment variables");
             process.exit(1);
         }
 
-        // For Telegram, we need to fetch the message from Telegram's API
         if (platform === 'telegram') {
             await this.processMessage(parseInt(messageId), {
                 chatId,
@@ -310,8 +286,6 @@ class FileTransferBot {
                 platform
             });
         } else {
-            // For Bale and Rubika, we assume the file is already available in the environment
-            // and we can directly process it
             await this.processFileFromEnv({
                 messageId,
                 chatId,
@@ -336,7 +310,6 @@ class FileTransferBot {
         return destinations.length > 0 ? destinations : ['bale', 'rubika', 'telegram'];
     }
 
-    // Process file directly from environment variables (for Bale and Rubika)
     async processFileFromEnv(overrides = {}) {
         const fileId = await this.transferManager.addTransfer({
             messageId: overrides.messageId || Date.now().toString(),
@@ -364,7 +337,7 @@ class FileTransferBot {
             );
 
             if (!messages || !messages[0] || !messages[0].media) {
-                throw new Error("پیام یا فایل یافت نشد.");
+                throw new Error("پیام یا فایل در چت تلگرام یافت نشد.");
             }
 
             const message = messages[0];
@@ -376,17 +349,10 @@ class FileTransferBot {
                 mimeType: overrides.mimeType || message.media.document?.mimeType,
                 fileId: overrides.fileId || message.media.document?.id.toString(),
                 destinations: overrides.destinations || this.getDefaultDestinations(),
-                shouldCompress: overrides.shouldCompress || undefined,
+                shouldCompress: overrides.shouldCompress !== undefined ? overrides.shouldCompress : false,
                 account: overrides.account || this.getDefaultAccount(),
                 originalMessage: message
             });
-
-            // If compression preference wasn't provided, ask for it (in a real app)
-            const transfer = this.transferManager.getTransfer(fileId);
-            if (transfer.isVideo && transfer.shouldCompress === undefined) {
-                // In GitHub Actions, we can't ask interactively, so default to false
-                transfer.shouldCompress = false;
-            }
 
             await this.processFile(fileId);
         } catch (error) {
@@ -411,18 +377,9 @@ class FileTransferBot {
             const destinations = transfer.destinations || [];
             const platform = transfer.platform || 'telegram';
 
-            // Download the file if it's from Telegram
-            let filePath = '';
-            if (platform === 'telegram' && transfer.originalMessage) {
-                filePath = await this.downloadFile(fileId, transfer.originalMessage, 30, this.estimateProcessTimes(fileSize, isVideo, shouldCompress));
-            } else {
-                // For Bale and Rubika, we assume the file is already available in the temp directory
-                // In a real implementation, you would download the file from Bale/Rubika's API
-                filePath = path.join(config.performance.tempDir, transfer.fileName || `file_${fileId}`);
-                console.log(`Using existing file for platform ${platform}: ${filePath}`);
-            }
+            const estimates = this.estimateProcessTimes(fileSize, isVideo, shouldCompress);
 
-            // Calculate weights for progress bar
+            // Calculate weights
             const downloadWeight = 30;
             const compressWeight = shouldCompress && isVideo ? 20 : 0;
             const uploadWeights = {
@@ -431,42 +388,27 @@ class FileTransferBot {
                 telegram: 10
             };
 
-            // Estimate times
-            const estimates = this.estimateProcessTimes(fileSize, isVideo, shouldCompress);
+            let filePath = '';
+            if (platform === 'telegram' && transfer.originalMessage) {
+                filePath = await this.downloadFile(fileId, transfer.originalMessage, downloadWeight, estimates);
+            } else {
+                filePath = path.join(config.performance.tempDir, transfer.fileName || `file_${fileId}`);
+                console.log(`Using existing local file for platform ${platform}: ${filePath}`);
+            }
 
-            // Create initial status message
-            const initialText = this.createStatusMessage(
-                fileId,
-                0,
-                downloadWeight,
-                compressWeight,
-                uploadWeights,
-                estimates,
-                'downloading',
-                0,
-                fileSize
-            );
-
-            // In GitHub Actions, we can't update Telegram messages, so we'll just log
-            console.log(`File ${fileId} - ${initialText}`);
-
-            // Compression if needed
             let targetPath = filePath;
             if (isVideo && shouldCompress) {
                 targetPath = await this.compressFile(fileId, filePath, compressWeight, estimates);
             }
 
-            // Upload to destinations
             const fileStats = fs.statSync(targetPath);
             const actualFileSize = fileStats.size;
             const caption = transfer.originalMessage?.text || transfer.originalMessage?.caption || "";
 
-            // Upload to Telegram (forward) if not the source platform
             if (uploadWeights.telegram > 0 && platform !== 'telegram') {
                 await this.uploadToTelegram(fileId, transfer, uploadWeights.telegram, estimates);
             }
 
-            // Upload to Bale if selected and not the source platform
             if ((destinations.includes('bale') || transfer.account === 'bale' || transfer.account === 'both') && platform !== 'bale') {
                 await this.uploadToBale(
                     fileId,
@@ -481,7 +423,6 @@ class FileTransferBot {
                 );
             }
 
-            // Upload to Rubika if selected and not the source platform
             if ((destinations.includes('rubika') || transfer.account === 'rubika' || transfer.account === 'both') && platform !== 'rubika') {
                 const rubikaFileType = this.getRubikaFileType(transfer);
                 await this.uploadToRubika(
@@ -496,13 +437,11 @@ class FileTransferBot {
                 );
             }
 
-            // Final status
             const elapsedTime = (Date.now() - transfer.startTime) / 1000;
             const finalText = this.createFinalMessage(fileId, fileSize, shouldCompress, destinations, elapsedTime);
 
-            console.log(`File ${fileId} - ${finalText}`);
+            console.log(`\n✅ File ${fileId} Processing Complete:\n${finalText}`);
 
-            // Notify Cloudflare Workers of completion
             await this.notifyCompletion(fileId, {
                 status: 'completed',
                 fileId,
@@ -512,8 +451,8 @@ class FileTransferBot {
                 elapsedTime
             });
 
-            // Clean up
             await this.transferManager.cleanupTransfer(fileId);
+            await this.telegramClient.disconnect();
 
         } catch (error) {
             console.error(`Error processing file ${fileId}:`, error);
@@ -524,6 +463,8 @@ class FileTransferBot {
                 error: error instanceof Error ? error.message : String(error)
             });
             await this.transferManager.cleanupTransfer(fileId);
+            await this.telegramClient.disconnect();
+            process.exit(1);
         }
     }
 
@@ -533,10 +474,10 @@ class FileTransferBot {
 
         const client = this.telegramClient.getClient();
         const filePath = transfer.filePath;
-        const fileSize = transfer.fileSize || 0;
 
         return new Promise(async (resolve, reject) => {
             try {
+                // Backpressure stream to handle fast network to disk I/O cleanly
                 const writeStream = fs.createWriteStream(filePath, {
                     highWaterMark: config.performance.downloadChunkSize
                 });
@@ -547,41 +488,19 @@ class FileTransferBot {
 
                 await client.downloadMedia(message.media, {
                     outputFile: writeStream,
-                    workers: config.performance.downloadWorkers,
+                    workers: config.performance.downloadWorkers, // Concurrent chunks
                     progressCallback: async (downloaded, total) => {
                         downloadedBytes = downloaded;
                         const now = Date.now();
 
-                        if (now - lastUpdate >= 500 || downloaded === total) {
+                        // Throttle logging to strictly 5 seconds
+                        if (now - lastUpdate >= 5000 || downloaded === total) {
                             lastUpdate = now;
                             const elapsedSec = (now - startTime) / 1000;
                             const speed = elapsedSec > 0 ? downloaded / elapsedSec : 0;
-                            const remainingBytes = total - downloaded;
-                            const etaSec = speed > 0 ? Math.max(0, remainingBytes / speed) : 0;
-
                             const stepPercent = total ? Math.floor((downloaded / total) * 100) : 0;
-                            const masterPercent = Math.floor((stepPercent * downloadWeight) / 100);
 
-                            const text = this.createStatusMessage(
-                                fileId,
-                                masterPercent,
-                                downloadWeight,
-                                transfer.shouldCompress && transfer.isVideo ? 20 : 0,
-                                {
-                                    bale: transfer.destinations?.includes('bale') ? 20 : 0,
-                                    rubika: transfer.destinations?.includes('rubika') ? 20 : 0,
-                                    telegram: 10
-                                },
-                                estimates,
-                                'downloading',
-                                stepPercent,
-                                total,
-                                downloaded,
-                                speed,
-                                etaSec
-                            );
-
-                            console.log(`File ${fileId} Download: ${stepPercent}% - ${formatBytes(downloaded)}/${formatBytes(total)}`);
+                            console.log(`[File ${fileId}] Download: ${stepPercent}% - ${formatBytes(downloaded)}/${formatBytes(total)} | Speed: ${formatSpeed(speed)}`);
                         }
                     }
                 });
@@ -598,15 +517,13 @@ class FileTransferBot {
         if (!transfer) throw new Error("Transfer not found");
 
         const outputPath = transfer.compressedPath;
-        const isVideo = transfer.isVideo || false;
 
         return new Promise((resolve, reject) => {
-            const startTime = Date.now();
-            let lastUpdate = 0;
+            let lastUpdate = Date.now();
 
             const command = spawn('ffmpeg', [
                 '-i', inputPath,
-                '-threads', '0',
+                '-threads', '0', // Utilize all GitHub Runner CPUs
                 '-c:v', 'libx264',
                 '-crf', '28',
                 '-preset', 'ultrafast',
@@ -614,7 +531,6 @@ class FileTransferBot {
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-movflags', '+faststart',
-                '-x264-params', 'ref=1:bframes=1:scenecut=0',
                 '-y', outputPath
             ]);
 
@@ -623,15 +539,10 @@ class FileTransferBot {
                 const progressMatch = output.match(/time=(\d+:\d+:\d+\.\d+)/);
                 if (progressMatch) {
                     const timeStr = progressMatch[1];
-                    const [hours, minutes, seconds] = timeStr.split(':').map(parseFloat);
-                    const currentTime = hours * 3600 + minutes * 60 + seconds;
-
-                    // We need duration for percentage calculation
-                    // For now, we'll just log the progress
                     const now = Date.now();
-                    if (now - lastUpdate >= 500) {
+                    if (now - lastUpdate >= 5000) {
                         lastUpdate = now;
-                        console.log(`File ${fileId} Compression: ${timeStr} processed`);
+                        console.log(`[File ${fileId}] Compression: ${timeStr} processed`);
                     }
                 }
             });
@@ -644,56 +555,15 @@ class FileTransferBot {
                 }
             });
 
-            command.on('error', (err) => {
-                reject(err);
-            });
-        });
-    }
-
-    async getVideoMetadata(inputPath) {
-        return new Promise((resolve, reject) => {
-            const command = spawn('ffprobe', [
-                '-v', 'error',
-                '-show_entries', 'format=duration,size',
-                '-show_entries', 'stream=codec_type,width,height',
-                '-of', 'json',
-                inputPath
-            ]);
-
-            let output = '';
-            command.stdout.on('data', (data) => {
-                output += data.toString();
-            });
-
-            command.on('close', (code) => {
-                if (code === 0) {
-                    try {
-                        const metadata = JSON.parse(output);
-                        resolve(metadata);
-                    } catch (e) {
-                        reject(e);
-                    }
-                } else {
-                    reject(new Error(`ffprobe failed with code ${code}`));
-                }
-            });
-
-            command.on('error', (err) => {
-                reject(err);
-            });
+            command.on('error', (err) => reject(err));
         });
     }
 
     async uploadToTelegram(fileId, transfer, weight, estimates) {
-        if (!transfer) {
-            console.error(`Transfer ${fileId} not found`);
-            return;
-        }
-
+        if (!transfer) return;
         const client = this.telegramClient.getClient();
 
         try {
-            // If the transfer has an original message (from Telegram), forward it
             if (transfer.originalMessage) {
                 await client.invoke(
                     new Api.messages.ForwardMessages({
@@ -710,32 +580,22 @@ class FileTransferBot {
                         scheduleDate: undefined
                     })
                 );
-                console.log(`File ${fileId} - Forwarded to Telegram`);
-            } else {
-                // If the transfer is from another platform, upload the file directly
-                // This is a simplified approach; in a real implementation, you would upload the file
-                console.log(`File ${fileId} - Upload to Telegram not implemented for non-Telegram sources`);
+                console.log(`[File ${fileId}] Forwarded securely to Telegram`);
             }
         } catch (err) {
-            console.error(`Error uploading to Telegram for file ${fileId}:`, err);
-            // Continue with other uploads even if Telegram upload fails
+            console.error(`Error uploading/forwarding to Telegram for file ${fileId}:`, err);
         }
     }
 
     async uploadToBale(fileId, filePath, fileType, endpoint, fileName, caption, weight, estimates, fileSize) {
         const transfer = this.transferManager.getTransfer(fileId);
-        if (!transfer) throw new Error("Transfer not found");
-
-        if (!config.bale) {
-            console.warn("Bale configuration not available");
-            return;
-        }
+        if (!transfer || !config.bale) return;
 
         const BALE_MAX_BYTES = 20 * 1024 * 1024;
 
         if (fileSize > BALE_MAX_BYTES) {
-            // Split the file
-            const parts = this.splitFile(filePath, BALE_MAX_BYTES, transfer.isVideo || false);
+            console.log(`[File ${fileId}] Exceeds Bale limit. Executing asynchronous split...`);
+            const parts = await this.splitFile(filePath, BALE_MAX_BYTES, transfer.isVideo || false);
             transfer.parts = parts;
 
             const totalParts = parts.length;
@@ -745,87 +605,163 @@ class FileTransferBot {
                 const partCaption = `پارت ${i + 1} از ${totalParts}\n${caption}`;
 
                 await this.uploadToBaleSingle(
-                    fileId,
-                    partPath,
-                    fileType,
-                    endpoint,
-                    partFileName,
-                    partCaption,
-                    weight / totalParts,
-                    estimates,
-                    i,
-                    totalParts
+                    fileId, partPath, fileType, endpoint, partFileName, partCaption, i, totalParts
                 );
-
-                // Clean up part file
-                try {
-                    await fs.promises.unlink(partPath);
-                } catch (err) {
-                    console.error(`Error deleting part file ${partPath}:`, err);
-                }
             }
         } else {
-            await this.uploadToBaleSingle(
-                fileId,
-                filePath,
-                fileType,
-                endpoint,
-                fileName,
-                caption,
-                weight,
-                estimates
-            );
+            await this.uploadToBaleSingle(fileId, filePath, fileType, endpoint, fileName, caption);
         }
     }
 
-    async uploadToBaleSingle(fileId, filePath, fileType, endpoint, fileName, caption, weight, estimates, partIndex, totalParts) {
-        const transfer = this.transferManager.getTransfer(fileId);
-        if (!transfer) throw new Error("Transfer not found");
-
+    async uploadToBaleSingle(fileId, filePath, fileType, endpoint, fileName, caption, partIndex, totalParts) {
         if (!config.bale) return;
-
-        const stats = fs.statSync(filePath);
+        const stats = await fs.promises.stat(filePath);
         const fileSize = stats.size;
 
-        return new Promise(async (resolve, reject) => {
-            try {
-                const boundary = `----BaleUploadBoundary${Date.now()}${Math.random().toString(16).substring(2)}`;
-                const headerStr = `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${config.bale.chatId}\r\n` +
-                                  (caption ? `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n` : '') +
-                                  `--${boundary}\r\nContent-Disposition: form-data; name="${fileType}"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+        return new Promise((resolve, reject) => {
+            const formData = new FormData();
+            formData.append('chat_id', config.bale.chatId);
+            if (caption) formData.append('caption', caption);
 
-                const footerStr = `\r\n--${boundary}--\r\n`;
-                const headerBuffer = Buffer.from(headerStr, 'utf8');
-                const footerBuffer = Buffer.from(footerStr, 'utf8');
+            // Create progress tracking transform stream
+            let uploadedBytes = 0;
+            const startTime = Date.now();
+            let lastUpdate = 0;
 
+            const trackedStream = new stream.Transform({
+                transform(chunk, encoding, callback) {
+                    uploadedBytes += chunk.length;
+                    const now = Date.now();
+
+                    if (now - lastUpdate >= 5000 || uploadedBytes === fileSize) {
+                        lastUpdate = now;
+                        const elapsedSec = (now - startTime) / 1000;
+                        const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
+                        const percent = Math.min(100, Math.floor((uploadedBytes / fileSize) * 100));
+                        console.log(`[File ${fileId}] Bale Upload: ${percent}% - ${formatBytes(uploadedBytes)}/${formatBytes(fileSize)} | Speed: ${formatSpeed(speed)}`);
+                    }
+                    this.push(chunk);
+                    callback();
+                }
+            });
+
+            const fileStream = fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize });
+            fileStream.pipe(trackedStream);
+
+            // Using form-data package appended streams
+            formData.append(fileType === 'video' ? 'video' : 'document', trackedStream, {
+                filename: fileName,
+                knownLength: fileSize
+            });
+
+            const options = {
+                hostname: 'tapi.bale.ai',
+                path: `/bot${config.bale.botToken}/${endpoint}`,
+                method: 'POST',
+                headers: formData.getHeaders()
+            };
+
+            const req = https.request(options, (res) => {
+                let resData = '';
+                res.on('data', (chunk) => { resData += chunk; });
+                res.on('end', () => {
+                    if (res.statusCode >= 200 && res.statusCode < 300) {
+                        try {
+                            const json = JSON.parse(resData);
+                            if (json.ok) {
+                                console.log(`[File ${fileId}] Uploaded to Bale: ${partIndex !== undefined ? `Part ${partIndex + 1}/${totalParts}` : 'Complete'}`);
+                                resolve();
+                            } else {
+                                reject(new Error(json.description || resData));
+                            }
+                        } catch (e) { resolve(); }
+                    } else {
+                        reject(new Error(`HTTP ${res.statusCode}: ${resData}`));
+                    }
+                });
+            });
+
+            req.on('error', (err) => reject(err));
+            formData.pipe(req); // Native piping prevents RAM overflow
+        });
+    }
+
+    async uploadToRubika(fileId, filePath, fileType, fileName, caption, weight, estimates, fileSize) {
+        if (!config.rubika) return;
+
+        try {
+            const rubikaBaseUrl = config.rubika.baseUrl || 'https://botapi.rubika.ir/v3/';
+
+            // Native Fetch uses standard API without optimizedAgent that breaks Node 18+ undici
+            const uploadInfo = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/requestSendFile`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type: fileType })
+            }).then(res => res.json());
+
+            if (!uploadInfo.ok) {
+                throw new Error(uploadInfo.description || "خطا در دریافت اطلاعات آپلود روبیکا");
+            }
+
+            return new Promise((resolve, reject) => {
+                const formData = new FormData();
+                let uploadedBytes = 0;
+                let lastUpdate = Date.now();
+
+                const trackedStream = new stream.Transform({
+                    transform(chunk, encoding, callback) {
+                        uploadedBytes += chunk.length;
+                        const now = Date.now();
+                        if (now - lastUpdate >= 5000 || uploadedBytes === fileSize) {
+                            lastUpdate = now;
+                            const percent = Math.min(100, Math.floor((uploadedBytes / fileSize) * 100));
+                            console.log(`[File ${fileId}] Rubika Upload: ${percent}% - ${formatBytes(uploadedBytes)}/${formatBytes(fileSize)}`);
+                        }
+                        this.push(chunk);
+                        callback();
+                    }
+                });
+
+                const fileStream = fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize });
+                fileStream.pipe(trackedStream);
+
+                formData.append('file', trackedStream, {
+                    filename: fileName,
+                    knownLength: fileSize
+                });
+
+                // Utilize https request natively to maintain pure streaming pipeline for form-data
+                const parsedUrl = new URL(uploadInfo.result.upload_url);
                 const options = {
-                    hostname: 'tapi.bale.ai',
-                    path: `/bot${config.bale.botToken}/${endpoint}`,
+                    hostname: parsedUrl.hostname,
+                    path: parsedUrl.pathname + parsedUrl.search,
                     method: 'POST',
-                    headers: {
-                        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-                        'Content-Length': headerBuffer.length + fileSize + footerBuffer.length,
-                        'Connection': 'keep-alive'
-                    },
-                    agent: optimizedAgent
+                    headers: formData.getHeaders()
                 };
 
                 const req = https.request(options, (res) => {
                     let resData = '';
                     res.on('data', (chunk) => { resData += chunk; });
-                    res.on('end', () => {
+                    res.on('end', async () => {
                         if (res.statusCode >= 200 && res.statusCode < 300) {
+                            const uploadResult = JSON.parse(resData);
+                            if (!uploadResult.ok) return reject(new Error(uploadResult.description));
+
                             try {
-                                const json = JSON.parse(resData);
-                                if (json.ok) {
-                                    console.log(`File ${fileId} - Uploaded to Bale: ${partIndex !== undefined ? `Part ${partIndex + 1}/${totalParts}` : 'Complete'}`);
-                                    resolve();
-                                } else {
-                                    reject(new Error(json.description || resData));
-                                }
-                            } catch (e) {
+                                const sendResponse = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/sendFile`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        chat_id: config.rubika.chatId,
+                                        file_id: uploadResult.result.file_id,
+                                        text: caption
+                                    })
+                                }).then(r => r.json());
+
+                                if (!sendResponse.ok) throw new Error(sendResponse.description);
+                                console.log(`[File ${fileId}] Uploaded to Rubika successfully`);
                                 resolve();
-                            }
+                            } catch (e) { reject(e); }
                         } else {
                             reject(new Error(`HTTP ${res.statusCode}: ${resData}`));
                         }
@@ -833,232 +769,46 @@ class FileTransferBot {
                 });
 
                 req.on('error', (err) => reject(err));
-
-                // Stream the file with progress tracking
-                const fileStream = fs.createReadStream(filePath, { highWaterMark: config.performance.downloadChunkSize });
-                let uploadedBytes = 0;
-                const startTime = Date.now();
-                let lastUpdate = 0;
-
-                fileStream.on('data', (chunk) => {
-                    uploadedBytes += chunk.length;
-                    req.write(chunk);
-
-                    const now = Date.now();
-                    if (now - lastUpdate >= 500 || uploadedBytes === fileSize) {
-                        lastUpdate = now;
-                        const elapsedSec = (now - startTime) / 1000;
-                        const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
-                        const remainingBytes = fileSize - uploadedBytes;
-                        const etaSec = speed > 0 ? Math.max(0, remainingBytes / speed) : 0;
-                        const percent = Math.min(100, Math.floor((uploadedBytes / fileSize) * 100));
-
-                        console.log(`File ${fileId} Bale Upload: ${percent}% - ${formatBytes(uploadedBytes)}/${formatBytes(fileSize)}`);
-                    }
-                });
-
-                fileStream.on('end', () => {
-                    req.write(footerBuffer);
-                    req.end();
-                });
-
-                fileStream.on('error', (err) => {
-                    req.destroy();
-                    reject(err);
-                });
-
-                // Write header
-                req.write(headerBuffer);
-            } catch (err) {
-                reject(err);
-            }
-        });
-    }
-
-    async uploadToRubika(fileId, filePath, fileType, fileName, caption, weight, estimates, fileSize) {
-        const transfer = this.transferManager.getTransfer(fileId);
-        if (!transfer) throw new Error("Transfer not found");
-
-        if (!config.rubika) {
-            console.warn("Rubika configuration not available");
-            return;
-        }
-
-        try {
-            // Step 1: Request upload URL using the correct Rubika API method
-            const rubikaBaseUrl = config.rubika.baseUrl || 'https://botapi.rubika.ir/v3/';
-            const uploadInfo = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/requestSendFile`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ type: fileType }),
-                agent: optimizedAgent
-            }).then(res => res.json());
-
-            if (!uploadInfo.ok) {
-                throw new Error(uploadInfo.description || "خطا در دریافت اطلاعات آپلود روبیکا");
-            }
-
-            // Step 2: Upload the file using multipart/form-data
-            let uploadedBytes = 0;
-            const startTime = Date.now();
-            let lastUpdate = 0;
-
-            // Create a file stream with progress tracking
-            const fileStream = fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize });
-            
-            // Create a custom stream to track bytes uploaded
-            const trackedStream = new stream.Transform({
-                transform(chunk, encoding, callback) {
-                    uploadedBytes += chunk.length;
-                    
-                    const now = Date.now();
-                    if (now - lastUpdate >= 500 || uploadedBytes === fileSize) {
-                        lastUpdate = now;
-                        const elapsedSec = (now - startTime) / 1000;
-                        const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
-                        const remainingBytes = fileSize - uploadedBytes;
-                        const etaSec = speed > 0 ? Math.max(0, remainingBytes / speed) : 0;
-                        const percent = Math.min(100, Math.floor((uploadedBytes / fileSize) * 100));
-
-                        // Update progress
-                        const downloadWeight = 30;
-                        const compressWeight = transfer.shouldCompress && transfer.isVideo ? 20 : 0;
-                        const telegramWeight = 10;
-                        const baleWeight = transfer.destinations?.includes('bale') ? 20 : 0;
-                        
-                        const currentWeight = downloadWeight + compressWeight + telegramWeight + baleWeight + (percent * weight / 100);
-                        const masterPercent = Math.min(100, Math.floor(currentWeight));
-
-                        console.log(`File ${fileId} Rubika Upload: ${percent}% - ${formatBytes(uploadedBytes)}/${formatBytes(fileSize)}`);
-                    }
-                    
-                    this.push(chunk);
-                    callback();
-                }
+                formData.pipe(req);
             });
-
-            // Pipe the file stream through the tracking stream
-            fileStream.pipe(trackedStream);
-
-            // Create form data with the tracked stream
-            const formData = new FormData();
-            formData.append('file', trackedStream, {
-                filename: fileName,
-                knownLength: fileSize
-            });
-
-            // Step 3: Upload to Rubika using the provided upload URL
-            const uploadResponse = await fetch(uploadInfo.result.upload_url, {
-                method: 'POST',
-                body: formData,
-                headers: formData.getHeaders(),
-                agent: optimizedAgent
-            });
-
-            if (!uploadResponse.ok) {
-                const errorText = await uploadResponse.text();
-                throw new Error(`HTTP ${uploadResponse.status}: ${errorText}`);
-            }
-
-            const uploadResult = await uploadResponse.json();
-
-            if (!uploadResult.ok) {
-                throw new Error(uploadResult.description || "خطا در آپلود فایل به روبیکا");
-            }
-
-            // Step 4: Send the file to chat using sendFile method
-            const sendResponse = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/sendFile`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    chat_id: config.rubika.chatId,
-                    file_id: uploadResult.result.file_id,
-                    text: caption
-                }),
-                agent: optimizedAgent
-            }).then(res => res.json());
-
-            if (!sendResponse.ok) {
-                throw new Error(sendResponse.description || "خطا در ارسال فایل به روبیکا");
-            }
-
-            console.log(`File ${fileId} - Uploaded to Rubika successfully`);
-            transfer.rubikaMsgId = sendResponse.result?.message_id;
-            
-            // Notify Cloudflare Worker of completion
-            if (process.env.CLOUDFLARE_WEBHOOK_URL) {
-                await fetch(process.env.CLOUDFLARE_WEBHOOK_URL, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`
-                    },
-                    body: JSON.stringify({
-                        event: 'transfer_progress',
-                        fileId: fileId,
-                        progress: 100,
-                        status: 'completed'
-                    })
-                }).catch(err => console.error('Failed to notify Cloudflare:', err));
-                
-            }
-            
         } catch (err) {
             console.error(`Error uploading to Rubika for file ${fileId}:`, err);
-            
-            // Notify Cloudflare Worker of failure
-            if (process.env.CLOUDFLARE_WEBHOOK_URL) {
-                await fetch(process.env.CLOUDFLARE_WEBHOOK_URL, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`
-                    },
-                    body: JSON.stringify({
-                        event: 'transfer_error',
-                        fileId: fileId,
-                        error: err.message
-                    })
-                }).catch(err => console.error('Failed to notify Cloudflare:', err));
-            }
-            
             throw err;
         }
     }
 
-    splitFile(filePath, maxSize, isVideo) {
-        const stats = fs.statSync(filePath);
+    async splitFile(filePath, maxSize, isVideo) {
+        if (isVideo) {
+            return await this.splitVideoByBitrate(filePath, maxSize);
+        }
+
+        const stats = await fs.promises.stat(filePath);
         const fileSize = stats.size;
         const parts = [];
         const baseName = path.basename(filePath, path.extname(filePath));
         const ext = path.extname(filePath);
         const dir = path.dirname(filePath);
 
-        if (isVideo) {
-            // For videos, we'll use ffmpeg to split by time
-            return this.splitVideoByBitrate(filePath, maxSize);
-        } else {
-            // For other files, split by bytes
-            const fd = fs.openSync(filePath, 'r');
-            let bytesRead = 0;
-            let partIndex = 1;
+        // Asynchronous non-blocking file read/write for memory safety
+        const fd = await fs.promises.open(filePath, 'r');
+        let bytesReadTotal = 0;
+        let partIndex = 1;
 
-            while (bytesRead < fileSize) {
-                const chunkSize = Math.min(maxSize, fileSize - bytesRead);
-                const buffer = Buffer.alloc(chunkSize);
-                fs.readSync(fd, buffer, 0, chunkSize, bytesRead);
+        while (bytesReadTotal < fileSize) {
+            const chunkSize = Math.min(maxSize, fileSize - bytesReadTotal);
+            const buffer = Buffer.alloc(chunkSize);
+            const { bytesRead } = await fd.read(buffer, 0, chunkSize, bytesReadTotal);
 
-                const partName = path.join(dir, `${baseName}_part${partIndex.toString().padStart(3, '0')}${ext}`);
-                fs.writeFileSync(partName, buffer);
-                parts.push(partName);
+            const partName = path.join(dir, `${baseName}_part${partIndex.toString().padStart(3, '0')}${ext}`);
+            await fs.promises.writeFile(partName, buffer.subarray(0, bytesRead));
+            parts.push(partName);
 
-                bytesRead += chunkSize;
-                partIndex++;
-            }
-
-            fs.closeSync(fd);
-            return parts;
+            bytesReadTotal += chunkSize;
+            partIndex++;
         }
+
+        await fd.close();
+        return parts;
     }
 
     splitVideoByBitrate(filePath, targetMaxBytes) {
@@ -1072,23 +822,17 @@ class FileTransferBot {
                 ]);
 
                 let output = '';
-                command.stdout.on('data', (data) => {
-                    output += data.toString();
-                });
+                command.stdout.on('data', (data) => { output += data.toString(); });
 
                 command.on('close', async (code) => {
-                    if (code !== 0) {
-                        return reject(new Error('Failed to get video metadata'));
-                    }
+                    if (code !== 0) return reject(new Error('Failed to get video metadata'));
 
                     try {
                         const metadata = JSON.parse(output);
                         const duration = parseFloat(metadata.format.duration);
                         const totalSize = parseInt(metadata.format.size);
 
-                        if (!duration || !totalSize) {
-                            return reject(new Error("Could not determine video duration or size"));
-                        }
+                        if (!duration || !totalSize) return reject(new Error("Could not determine video duration or size"));
 
                         const bytesPerSecond = totalSize / duration;
                         const targetSegmentDuration = Math.floor((targetMaxBytes * 0.95) / bytesPerSecond);
@@ -1121,31 +865,20 @@ class FileTransferBot {
                                         parts.push(partPath);
                                         resolve();
                                     } else {
-                                        reject(new Error(`FFmpeg failed with code ${code}`));
+                                        reject(new Error(`FFmpeg split failed with code ${code}`));
                                     }
                                 });
-
-                                ffmpegCommand.on('error', (err) => {
-                                    reject(err);
-                                });
+                                ffmpegCommand.on('error', (err) => reject(err));
                             });
 
                             currentTime += targetSegmentDuration;
                             partIndex++;
                         }
-
                         resolve(parts);
-                    } catch (e) {
-                        reject(e);
-                    }
+                    } catch (e) { reject(e); }
                 });
-
-                command.on('error', (err) => {
-                    reject(err);
-                });
-            } catch (err) {
-                reject(err);
-            }
+                command.on('error', (err) => reject(err));
+            } catch (err) { reject(err); }
         });
     }
 
@@ -1159,176 +892,46 @@ class FileTransferBot {
             compressedSizeRatio = 0.4;
         }
 
-        const estUploadSizeBale = willCompress ? fileSize * compressedSizeRatio : fileSize;
-        const estUploadSecBale = Math.ceil(estUploadSizeBale / (3 * 1024 * 1024));
-
-        const estUploadSizeRubika = willCompress ? fileSize * compressedSizeRatio : fileSize;
-        const estUploadSecRubika = Math.ceil(estUploadSizeRubika / (5 * 1024 * 1024));
-
+        const estUploadSize = willCompress ? fileSize * compressedSizeRatio : fileSize;
+        const estUploadSecBale = Math.ceil(estUploadSize / (3 * 1024 * 1024));
+        const estUploadSecRubika = Math.ceil(estUploadSize / (5 * 1024 * 1024));
         const totalEstSec = estDownloadSec + estCompressSec + estUploadSecBale + estUploadSecRubika;
 
-        return {
-            estDownloadSec,
-            estCompressSec,
-            estUploadSecBale,
-            estUploadSecRubika,
-            totalEstSec
-        };
+        return { estDownloadSec, estCompressSec, estUploadSecBale, estUploadSecRubika, totalEstSec };
     }
 
-    // Helper: Get Rubika file type based on transfer info
     getRubikaFileType(transfer) {
         if (!transfer) return 'File';
-
         const mimeType = transfer.mimeType || '';
         const isVideo = transfer.isVideo || false;
 
-        if (isVideo || mimeType.startsWith('video/')) {
-            return 'Video';
-        }
-
-        if (mimeType.startsWith('image/')) {
-            return 'Image';
-        }
-
-        if (mimeType.startsWith('audio/')) {
-            // Check if it's a voice message (typically OGG)
-            if (mimeType.includes('ogg')) {
-                return 'Voice';
-            }
-            // Otherwise, treat as music
-            return 'Music';
-        }
-
-        // Check file extension for GIF
-        const fileName = transfer.fileName || '';
-        if (fileName.toLowerCase().endsWith('.gif') || mimeType.includes('gif')) {
-            return 'Gif';
-        }
-
-        // Default to File
+        if (isVideo || mimeType.startsWith('video/')) return 'Video';
+        if (mimeType.startsWith('image/')) return 'Image';
+        if (mimeType.startsWith('audio/')) return mimeType.includes('ogg') ? 'Voice' : 'Music';
+        if ((transfer.fileName || '').toLowerCase().endsWith('.gif') || mimeType.includes('gif')) return 'Gif';
         return 'File';
     }
 
-    createStatusMessage(fileId, masterPercent, downloadWeight, compressWeight, uploadWeights, estimates, currentStage, stepPercent = 0, totalBytes = 0, currentBytes = 0, speed = 0, etaSec = 0) {
-        const transfer = this.transferManager.getTransfer(fileId);
-        if (!transfer) return "Transfer not found";
-
-        const fileSize = transfer.fileSize || 0;
-        const isVideo = transfer.isVideo || false;
-        const shouldCompress = transfer.shouldCompress || false;
-        const destinations = transfer.destinations || [];
-
-        const masterBar = drawProgressBar(masterPercent);
-        const stepBar = drawProgressBar(stepPercent);
-
-        let stageDescription = '';
-        let stageDetails = '';
-
-        switch (currentStage) {
-            case 'downloading':
-                stageDescription = '📥 **مرحله ۱: دانلود از تلگرام**';
-                stageDetails = `📊 **حجم:** \`${formatBytes(currentBytes)}\` / \`${formatBytes(totalBytes)}\``;
-                break;
-            case 'compressing':
-                stageDescription = '⚙️ **مرحله ۲: فشرده‌سازی ویدیو (480p)**';
-                stageDetails = `⏳ **زمان باقی‌مانده:** \`${formatETA(etaSec)}\``;
-                if (speed > 0) {
-                    stageDetails += `\n⚡ **سرعت پردازش:** \`${speed.toFixed(1)} فریم/ثانیه\``;
-                }
-                break;
-            case 'uploading_telegram':
-                stageDescription = '📤 **مرحله ۳: آپلود به تلگرام**';
-                stageDetails = '✅ **فایل با موفقیت به تلگرام ارسال شد**';
-                break;
-            case 'uploading_bale':
-                stageDescription = '📤 **مرحله ۴: آپلود به بله**';
-                stageDetails = `📊 **حجم:** \`${formatBytes(currentBytes)}\` / \`${formatBytes(totalBytes)}\``;
-                break;
-            case 'uploading_rubika':
-                stageDescription = '📤 **مرحله ۵: آپلود به روبیکا**';
-                stageDetails = `📊 **حجم:** \`${formatBytes(currentBytes)}\` / \`${formatBytes(totalBytes)}\``;
-                break;
-            default:
-                stageDescription = '🔄 **در حال پردازش**';
-        }
-
-        if (speed > 0 && currentStage !== 'compressing') {
-            stageDetails += `\n🚀 **سرعت:** \`${formatSpeed(speed)}\``;
-        }
-        if (etaSec > 0) {
-            stageDetails += `\n⏳ **زمان باقی‌مانده:** \`${formatETA(etaSec)}\``;
-        }
-
-        const estimationLines = [
-            `📁 **فایل ${fileId} - ${formatBytes(fileSize)}**`,
-            `⏱ **تخمین کل زمان:** \`~${formatETA(estimates.totalEstSec)}\``,
-            `🔹 **دانلود:** \`~${formatETA(estimates.estDownloadSec)}\` (سرعت: ~25 مگابایت/ثانیه)`
-        ];
-
-        if (shouldCompress && isVideo) {
-            estimationLines.push(`🔹 **فشرده‌سازی:** \`~${formatETA(estimates.estCompressSec)}\``);
-        }
-
-        if (uploadWeights.telegram > 0) {
-            estimationLines.push(`🔹 **آپلود به تلگرام:** \`~${formatETA(estimates.estUploadSecBale)}\``);
-        }
-
-        if (destinations.includes('bale')) {
-            estimationLines.push(`🔹 **آپلود به بله:** \`~${formatETA(estimates.estUploadSecBale)}\``);
-        }
-
-        if (destinations.includes('rubika')) {
-            estimationLines.push(`🔹 **آپلود به روبیکا:** \`~${formatETA(estimates.estUploadSecRubika)}\``);
-        }
-
-        estimationLines.push("-----------------------------------");
-
-        const messageParts = [
-            ...estimationLines,
-            `🏆 **پیشرفت کل:** \`[${masterBar}]\` ${masterPercent}%`,
-            "-----------------------------------",
-            stageDescription,
-            `\`[${stepBar}]\` ${stepPercent}%`,
-            stageDetails
-        ];
-
-        if (destinations.length > 0) {
-            messageParts.push("-----------------------------------");
-            messageParts.push(`📌 **مقصد(های) ارسال:** ${destinations.map(d => d === 'bale' ? 'بله' : 'روبیکا').join(' و ')}`);
-        }
-
-        return messageParts.filter(Boolean).join("\n");
-    }
-
     createFinalMessage(fileId, originalSize, wasCompressed, destinations, elapsedTime) {
-        const transfer = this.transferManager.getTransfer(fileId);
-        if (!transfer) return "Transfer not found";
-
-        const finalBar = drawProgressBar(100);
         const compressedSize = wasCompressed ? Math.floor(originalSize * 0.4) : originalSize;
-
         const messageParts = [
             `📁 **فایل ${fileId}**`,
-            `🏆 **پیشرفت کل:** \`[${finalBar}]\` 100%`,
+            `🏆 **پیشرفت کل:** \`[${drawProgressBar(100)}]\` 100%`,
             "-----------------------------------",
             "✅ **انتقال با موفقیت کامل انجام شد!**",
             "",
             "📌 **خلاصه انتقال:**",
             `- حجم اصلی: ${formatBytes(originalSize)}`,
             wasCompressed ? `- حجم فشرده: ${formatBytes(compressedSize)}` : '',
-            `- مقصد(های) ارسال: ${destinations.map(d => d === 'bale' ? 'بله' : 'روبیکا').join(' و ')}`,
+            `- مقصد(های) ارسال: ${destinations.map(d => d === 'bale' ? 'بله' : d === 'rubika' ? 'روبیکا' : 'تلگرام').join(' و ')}`,
             "",
-            `⚡ **سرعت دانلود متوسط:** ~25 مگابایت/ثانیه`,
-            `🕒 **زمان کل:** ${formatETA(elapsedTime)}`
+            `🕒 **زمان کل پردازش:** ${formatETA(elapsedTime)}`
         ];
-
         return messageParts.filter(Boolean).join("\n");
     }
 
     async notifyCompletion(fileId, data) {
         if (!config.cloudflare.webhookUrl) return;
-
         try {
             await fetch(config.cloudflare.webhookUrl, {
                 method: 'POST',
@@ -1336,19 +939,13 @@ class FileTransferBot {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${config.cloudflare.apiToken}`
                 },
-                body: JSON.stringify({
-                    event: 'transfer_complete',
-                    ...data
-                })
+                body: JSON.stringify({ event: 'transfer_completed', ...data })
             });
-        } catch (error) {
-            console.error("Error notifying completion:", error);
-        }
+        } catch (error) { console.error("Error notifying completion:", error); }
     }
 
     async notifyError(error) {
         if (!config.cloudflare.webhookUrl) return;
-
         try {
             await fetch(config.cloudflare.webhookUrl, {
                 method: 'POST',
@@ -1356,29 +953,16 @@ class FileTransferBot {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${config.cloudflare.apiToken}`
                 },
-                body: JSON.stringify({
-                    event: 'transfer_error',
-                    error,
-                    timestamp: new Date().toISOString()
-                })
+                body: JSON.stringify({ event: 'transfer_error', error, timestamp: new Date().toISOString() })
             });
-        } catch (err) {
-            console.error("Error notifying error:", err);
-        }
+        } catch (err) { console.error("Error notifying error:", err); }
     }
 }
 
 // Main execution
 async function main() {
     const bot = new FileTransferBot();
-
-    try {
-        await bot.start();
-    } catch (error) {
-        console.error("Fatal error:", error);
-        process.exit(1);
-    }
+    await bot.start();
 }
 
-// Start the application
 main();

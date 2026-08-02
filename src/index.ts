@@ -2,7 +2,6 @@
 // Handles Telegram, Bale, and Rubika webhooks and triggers GitHub Actions for file transfers
 
 export interface Env {
-    // Telegram Configuration
     TELEGRAM_BOT_TOKEN: string;
     TELEGRAM_CHAT_ID: string;
     TELEGRAM_API_ID?: string;
@@ -10,28 +9,29 @@ export interface Env {
     TELEGRAM_SESSION_STRING?: string;
     TELEGRAM_WEBHOOK_SECRET?: string;
 
-    // Bale Configuration
     BALE_BOT_TOKEN?: string;
     BALE_CHAT_ID?: string;
     BALE_WEBHOOK_SECRET?: string;
 
-    // Rubika Configuration
     RUBIKA_BOT_TOKEN?: string;
     RUBIKA_CHAT_ID?: string;
     RUBIKA_WEBHOOK_SECRET?: string;
 
-    // GitHub Actions Integration
     GITHUB_ACTIONS_WEBHOOK: string;
     GITHUB_TOKEN: string;
     GITHUB_REPO: string;
 
-    // Cloudflare Configuration
     LINKS: KVNamespace;
     MAX_CONCURRENT_TRANSFERS?: string;
     RATE_LIMIT?: string;
+
+    TELEGRAM_BASE_URL?: string;
+    BALE_BASE_URL?: string;
+    RUBIKA_BASE_URL?: string;
+
+    JWT_SECRET?: string;
 }
 
-// Transfer Request Interface
 interface TransferRequest {
     messageId: string | number;
     chatId: string;
@@ -44,9 +44,11 @@ interface TransferRequest {
     date?: number;
     fileId?: string;
     platform: 'telegram' | 'bale' | 'rubika';
+    destinations?: ('bale' | 'rubika' | 'telegram')[];
+    account?: string;
+    shouldCompress?: boolean;
 }
 
-// Active Transfer Interface
 interface ActiveTransfer {
     id: string;
     transferRequest: TransferRequest;
@@ -55,1055 +57,381 @@ interface ActiveTransfer {
     startedAt?: number;
     completedAt?: number;
     error?: string;
-    destinations: ('bale' | 'rubika' | 'telegram')[];
-    shouldCompress?: boolean;
-    account?: 'bale' | 'rubika' | 'both';
+    progress?: number;
+}
+
+interface ConnectedAccount {
+    rubikaChatId?: string;
+    baleChatId?: string;
+    telegramUserId?: string;
+    connectedAt: number;
+    lastUsed?: number;
+}
+
+// Token Utility Functions (Using Web Crypto API for Cloudflare Workers)
+async function generateSimpleToken(userId: string, secret: string): Promise<string> {
+    const data = `${userId}:${Date.now()}`;
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+    const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
+    const hexSig = Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
+    return `${btoa(data)}.${hexSig}`;
+}
+
+async function verifySimpleToken(token: string, secret: string): Promise<string | null> {
+    try {
+        const [dataB64, signature] = token.split('.');
+        if (!dataB64 || !signature) return null;
+
+        const decodedData = atob(dataB64);
+        const [userId, timestamp] = decodedData.split(':');
+
+        // Check expiration (24 hours)
+        if (Date.now() - parseInt(timestamp) > 86400000) return null;
+
+        const encoder = new TextEncoder();
+        const key = await crypto.subtle.importKey(
+            'raw',
+            encoder.encode(secret),
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['sign']
+        );
+        const expectedSignatureBuf = await crypto.subtle.sign('HMAC', key, encoder.encode(decodedData));
+        const expectedSignature = Array.from(new Uint8Array(expectedSignatureBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+        if (signature !== expectedSignature) return null;
+        return userId;
+    } catch {
+        return null;
+    }
+}
+
+function generateConnectionCode(): string {
+    const part1 = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const part2 = Math.random().toString(36).substring(2, 6).toUpperCase();
+    return `${part1}-${part2}`;
 }
 
 // Main Worker Class
 export default {
-    // Handle all HTTP requests
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url);
         const path = url.pathname;
 
         try {
-            // Health check endpoint
-            if (path === '/health') {
-                return this.handleHealthCheck();
-            }
+            if (path === '/health') return this.handleHealthCheck();
+            if (path === '/telegram') return await this.handleTelegramWebhook(request, env);
+            if (path === '/bale') return await this.handleBaleWebhook(request, env);
+            if (path === '/rubika') return await this.handleRubikaWebhook(request, env);
+            if (path === '/github-callback') return await this.handleGitHubCallback(request, env);
+            if (path === '/status') return await this.handleStatusCheck(request, env);
 
-            // Telegram webhook
-            if (path === '/telegram') {
-                return await this.handleTelegramWebhook(request, env);
-            }
-
-            // Bale webhook
-            if (path === '/bale') {
-                return await this.handleBaleWebhook(request, env);
-            }
-
-            // Rubika webhook
-            if (path === '/rubika') {
-                return await this.handleRubikaWebhook(request, env);
-            }
-
-            // GitHub Actions callback
-            if (path === '/github-callback') {
-                return await this.handleGitHubCallback(request, env);
-            }
-
-            // Account selection webhook
-            if (path === '/select-account') {
-                return await this.handleAccountSelection(request, env);
-            }
-
-            // Destination selection webhook
-            if (path === '/select-destination') {
-                return await this.handleDestinationSelection(request, env);
-            }
-
-            // Compression preference webhook
-            if (path === '/compression-preference') {
-                return await this.handleCompressionPreference(request, env);
-            }
-
-            // Link command webhook
-            if (path === '/link') {
-                return await this.handleLinkCommand(request, env);
-            }
-
-            // Link selection callback
-            if (path === '/select-link') {
-                return await this.handleLinkSelection(request, env);
-            }
-
-            // Status check endpoint
-            if (path === '/status') {
-                return await this.handleStatusCheck(request, env);
-            }
-
-            return new Response(
-                JSON.stringify({ error: 'Not found' }),
-                { status: 404, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
         } catch (error) {
             console.error('Error in fetch:', error);
-            return new Response(
-                JSON.stringify({ error: 'Internal server error' }),
-                { status: 500, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ error: 'Internal server error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
         }
     },
 
-    // Health check endpoint
     handleHealthCheck(): Response {
-        const status = {
-            status: 'healthy',
-            timestamp: Date.now(),
-            version: '1.0.0',
-            service: 'uploalink-mtproto-worker'
-        };
-
         return new Response(
-            JSON.stringify(status),
-            {
-                status: 200,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Cache-Control': 'no-cache'
-                }
-            }
+            JSON.stringify({ status: 'healthy', timestamp: Date.now(), version: '1.0.0' }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
         );
     },
 
-    // Handle Telegram webhook
     async handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
-        // Verify webhook secret if configured
         const signature = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
         if (env.TELEGRAM_WEBHOOK_SECRET && signature !== env.TELEGRAM_WEBHOOK_SECRET) {
-            return new Response(
-                JSON.stringify({ error: 'Unauthorized' }),
-                { status: 401, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
         }
 
         const update = await request.json();
+        if (update.callback_query) return await this.handleCallbackQuery(update, env, 'telegram');
+        if (update.message) return await this.handleMessageUpdate(update, env, 'telegram');
 
-        // Handle callback queries
-        if (update.callback_query) {
-            return await this.handleCallbackQuery(update, env, 'telegram');
-        }
-
-        // Handle message updates
-        if (update.message) {
-            return await this.handleMessageUpdate(update, env, 'telegram');
-        }
-
-        return new Response(
-            JSON.stringify({ status: 'ignored' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
-    // Handle Bale webhook
     async handleBaleWebhook(request: Request, env: Env): Promise<Response> {
-        // Verify webhook secret if configured
         const signature = request.headers.get('X-Bale-Signature');
         if (env.BALE_WEBHOOK_SECRET && signature !== env.BALE_WEBHOOK_SECRET) {
-            return new Response(
-                JSON.stringify({ error: 'Unauthorized' }),
-                { status: 401, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
         }
 
         const update = await request.json();
+        if (update.callback_query) return await this.handleCallbackQuery(update, env, 'bale');
+        if (update.message) return await this.handleMessageUpdate(update, env, 'bale');
 
-        // Handle callback queries (Bale uses inline_keyboard callbacks)
-        if (update.callback_query) {
-            return await this.handleCallbackQuery(update, env, 'bale');
-        }
-
-        // Handle message updates
-        if (update.message) {
-            return await this.handleMessageUpdate(update, env, 'bale');
-        }
-
-        return new Response(
-            JSON.stringify({ status: 'ignored' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
-    // Handle Rubika webhook
     async handleRubikaWebhook(request: Request, env: Env): Promise<Response> {
-        // Verify webhook secret if configured
         const signature = request.headers.get('X-Rubika-Signature');
         if (env.RUBIKA_WEBHOOK_SECRET && signature !== env.RUBIKA_WEBHOOK_SECRET) {
-            return new Response(
-                JSON.stringify({ error: 'Unauthorized' }),
-                { status: 401, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
         }
 
         const body = await request.text();
         let update;
-
         try {
             update = JSON.parse(body);
         } catch (error) {
-            console.error('Failed to parse Rubika webhook body:', error);
-            return new Response(
-                JSON.stringify({ error: 'Invalid JSON' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400 });
         }
 
-        // Handle Rubika updates (NewMessage, InlineMessage, etc.)
-        if (update.update) {
-            return await this.handleRubikaUpdate(update, env);
-        }
+        if (update.update) return await this.handleRubikaUpdate(update, env);
+        if (update.inline_message) return await this.handleRubikaInlineMessage(update, env);
 
-        if (update.inline_message) {
-            return await this.handleRubikaInlineMessage(update, env);
-        }
-
-        return new Response(
-            JSON.stringify({ status: 'ignored' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
-    // Handle Rubika updates (NewMessage, etc.)
     async handleRubikaUpdate(update: any, env: Env): Promise<Response> {
         const updateType = update.update.type;
-
-        // Handle new messages
         if (updateType === 'NewMessage') {
             const message = update.update.new_message;
+            if (message.text && (message.text.match(/^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$/) || message.text.match(/^[A-Za-z0-9]{8}$/))) {
+                await this.handleConnectionCode(
+                    env, message.text, message.chat_id, 'rubika',
+                    { id: message.sender_id, first_name: message.sender?.first_name || 'کاربر' }
+                );
+                return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
+            }
             return await this.handleMessageUpdate({ message }, env, 'rubika');
         }
-
-        // Handle edited messages
-        if (updateType === 'UpdatedMessage') {
-            const message = update.update.updated_message;
-            return await this.handleMessageUpdate({ message }, env, 'rubika');
-        }
-
-        // Handle deleted messages
-        if (updateType === 'RemovedMessage') {
-            console.log('Message removed:', update.update.removed_message_id);
-            return new Response(
-                JSON.stringify({ status: 'message_removed' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        return new Response(
-            JSON.stringify({ status: 'ignored' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
-    // Handle Rubika inline messages (button clicks)
     async handleRubikaInlineMessage(update: any, env: Env): Promise<Response> {
         const inlineMessage = update.inline_message;
-
-        // Handle button clicks
         if (inlineMessage.aux_data?.button_id) {
-            return await this.handleCallbackQuery(
-                {
-                    callback_query: {
-                        id: inlineMessage.aux_data.start_id || Date.now().toString(),
-                        data: inlineMessage.aux_data.button_id,
-                        message: {
-                            message_id: inlineMessage.message_id,
-                            chat: { id: inlineMessage.chat_id }
-                        },
-                        from: { id: inlineMessage.sender_id }
-                    }
-                },
-                env,
-                'rubika'
-            );
+            return await this.handleCallbackQuery({
+                callback_query: {
+                    id: inlineMessage.aux_data.start_id || Date.now().toString(),
+                    data: inlineMessage.aux_data.button_id,
+                    message: { message_id: inlineMessage.message_id, chat: { id: inlineMessage.chat_id } },
+                    from: { id: inlineMessage.sender_id }
+                }
+            }, env, 'rubika');
         }
-
-        return new Response(
-            JSON.stringify({ status: 'ignored' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
-    // Handle message updates (Telegram, Bale, Rubika)
     async handleMessageUpdate(update: any, env: Env, platform: 'telegram' | 'bale' | 'rubika'): Promise<Response> {
         const message = update.message;
 
-        // Handle /link command
-        if (message.text === '/link' || message.text === '/link@your_bot_name') {
-            await this.askLinkSelection(env, message.chat.id.toString(), platform);
-            return new Response(
-                JSON.stringify({ status: 'link_command_handled' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
+        if (message.text) {
+            const command = message.text.split(' ')[0].toLowerCase();
+            const text = message.text.trim();
+
+            if (command === '/start' || command === '/start@your_bot_name') {
+                await this.handleStartCommandDirect(env, message.chat.id.toString(), platform, message.from);
+                return new Response(JSON.stringify({ status: 'start_command_handled' }), { status: 200 });
+            }
+            if (command === '/link' || command === '/link@your_bot_name') {
+                await this.askLinkSelection(env, message.chat.id.toString(), platform);
+                return new Response(JSON.stringify({ status: 'link_command_handled' }), { status: 200 });
+            }
+            if (command === '/unlink' || command === '/unlink@your_bot_name') {
+                await this.askUnlinkSelection(env, message.chat.id.toString(), platform);
+                return new Response(JSON.stringify({ status: 'unlink_command_handled' }), { status: 200 });
+            }
+            if (command === '/status' || command === '/status@your_bot_name') {
+                await this.handleStatusCommandDirect(env, message.chat.id.toString(), platform);
+                return new Response(JSON.stringify({ status: 'status_command_handled' }), { status: 200 });
+            }
+            if (text.match(/^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$/) || text.match(/^[A-Za-z0-9]{8}$/)) {
+                await this.handleConnectionCode(env, text, message.chat.id.toString(), platform, message.from);
+                return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
+            }
         }
 
-        // Ignore non-file messages
         if (!this.isFileMessage(message, platform)) {
-            return new Response(
-                JSON.stringify({ status: 'ignored' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
         }
 
-        // Check rate limiting
         const rateLimit = parseInt(env.RATE_LIMIT || '10');
-        const now = Date.now();
         const userId = this.getUserId(message, platform).toString();
-
-        // Check user rate limit in KV
         const rateLimitKey = `rate_limit:${platform}:${userId}`;
-        const rateLimitCount = await env.LINKS.get(rateLimitKey, { type: 'text' }).catch(() => '0');
-        const currentCount = parseInt(rateLimitCount) || 0;
+        const currentCount = parseInt(await env.LINKS.get(rateLimitKey, { type: 'text' }).catch(() => '0')) || 0;
 
         if (currentCount >= rateLimit) {
-            return new Response(
-                JSON.stringify({
-                    error: 'Rate limit exceeded',
-                    retryAfter: 60
-                }),
-                { status: 429, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ error: 'Rate limit exceeded', retryAfter: 60 }), { status: 429 });
         }
+        await env.LINKS.put(rateLimitKey, (currentCount + 1).toString(), { expirationTtl: 60 });
 
-        // Increment rate limit counter
-        await env.LINKS.put(rateLimitKey, (currentCount + 1).toString(), {
-            expirationTtl: 60
-        });
-
-        // Create transfer request
         const transferRequest = this.createTransferRequest(message, platform);
+        const userConnectedAccounts = await this.getUserConnectedAccounts(env, userId);
 
-        // Check if we need to ask for account selection
-        const availableAccounts = this.getAvailableAccounts(env);
-        if (availableAccounts.length > 1) {
-            // Ask user to select account
-            await this.askAccountSelection(env, transferRequest);
-            return new Response(
-                JSON.stringify({ status: 'account_selection_required' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
+        if (!userConnectedAccounts.rubikaChatId && !userConnectedAccounts.baleChatId) {
+            await this.sendMessage(env, platform, transferRequest.chatId, `❌ **خطا:**\nشما به هیچ پلتفرمی متصل نیستید.\nلطفاً ابتدا با ارسال دستور /link حساب خود را متصل کنید.`);
+            return new Response(JSON.stringify({ status: 'no_connections' }), { status: 200 });
         }
 
-        // Check if we need to ask for destinations
+        let destinations: ('bale' | 'rubika')[] = [];
+        if (userConnectedAccounts.rubikaChatId) destinations.push('rubika');
+        if (userConnectedAccounts.baleChatId) destinations.push('bale');
+
+        if (destinations.length === 1) {
+            transferRequest.destinations = destinations;
+        } else if (destinations.length > 1) {
+            await this.askDestinationSelectionForTransfer(env, transferRequest, destinations);
+            return new Response(JSON.stringify({ status: 'destination_selection_required' }), { status: 200 });
+        }
+
         const defaultDestinations = this.getDefaultDestinations(env);
-        if (defaultDestinations.length > 1) {
-            // Ask user to select destinations
-            await this.askDestinationSelection(env, transferRequest);
-            return new Response(
-                JSON.stringify({ status: 'destination_selection_required' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
+        const availableAccounts = this.getAvailableAccounts(env);
 
-        // Check if we need to ask for compression (for videos)
         if (transferRequest.isVideo) {
             await this.askCompressionPreference(env, {
                 ...transferRequest,
-                destinations: defaultDestinations
+                destinations: transferRequest.destinations || defaultDestinations
             });
-            return new Response(
-                JSON.stringify({ status: 'compression_preference_required' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ status: 'compression_preference_required' }), { status: 200 });
         }
 
-        // If we have all the information, trigger the transfer
         await this.triggerGitHubWorkflow(env, {
             ...transferRequest,
-            destinations: defaultDestinations,
-            shouldCompress: false, // Default for non-videos
+            destinations: transferRequest.destinations || defaultDestinations,
+            shouldCompress: false,
             account: availableAccounts[0] || 'both'
         });
 
-        return new Response(
-            JSON.stringify({ status: 'queued' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ status: 'queued' }), { status: 200 });
     },
 
-    // Helper: Check if message contains a file
-    isFileMessage(message: any, platform: 'telegram' | 'bale' | 'rubika'): boolean {
-        switch (platform) {
-            case 'telegram':
-                return !!(message.document || message.photo || message.video || message.audio || message.voice);
-            case 'bale':
-                return !!(message.document || message.photo || message.video || message.audio || message.voice);
-            case 'rubika':
-                return !!(message.file || message.document || message.photo || message.video || message.audio || message.voice);
-            default:
-                return false;
-        }
-    },
-
-    // Helper: Get user ID from message
-    getUserId(message: any, platform: 'telegram' | 'bale' | 'rubika'): string | number {
-        switch (platform) {
-            case 'telegram':
-                return message.from?.id || 'unknown';
-            case 'bale':
-                return message.from?.id || 'unknown';
-            case 'rubika':
-                return message.sender_id || 'unknown';
-            default:
-                return 'unknown';
-        }
-    },
-
-    // Helper: Create transfer request from message
-    createTransferRequest(message: any, platform: 'telegram' | 'bale' | 'rubika'): TransferRequest {
-        switch (platform) {
-            case 'telegram':
-                return {
-                    messageId: message.message_id,
-                    chatId: message.chat.id.toString(),
-                    fileName: message.document?.file_name ||
-                              message.audio?.file_name ||
-                              message.voice?.file_name ||
-                              `file_${message.message_id}_${Date.now()}`,
-                    fileSize: message.document?.file_size ||
-                             message.photo?.file_size ||
-                             message.video?.file_size ||
-                             message.audio?.file_size ||
-                             message.voice?.file_size ||
-                             0,
-                    isVideo: !!message.document?.mime_type?.startsWith('video/') ||
-                             !!message.video,
-                    mimeType: message.document?.mime_type ||
-                              message.video?.mime_type ||
-                              message.audio?.mime_type ||
-                              message.voice?.mime_type,
-                    userId: message.from?.id?.toString(),
-                    userName: message.from?.username || message.from?.first_name,
-                    date: message.date,
-                    fileId: message.document?.file_id || message.photo?.file_id || message.video?.file_id || message.audio?.file_id,
-                    platform
-                };
-            case 'bale':
-                return {
-                    messageId: message.message_id,
-                    chatId: message.chat.id.toString(),
-                    fileName: message.document?.file_name ||
-                              message.audio?.file_name ||
-                              message.voice?.file_name ||
-                              `file_${message.message_id}_${Date.now()}`,
-                    fileSize: message.document?.file_size ||
-                             message.photo?.file_size ||
-                             message.video?.file_size ||
-                             message.audio?.file_size ||
-                             message.voice?.file_size ||
-                             0,
-                    isVideo: !!message.document?.mime_type?.startsWith('video/') ||
-                             !!message.video,
-                    mimeType: message.document?.mime_type ||
-                              message.video?.mime_type ||
-                              message.audio?.mime_type ||
-                              message.voice?.mime_type,
-                    userId: message.from?.id?.toString(),
-                    userName: message.from?.username || message.from?.first_name,
-                    date: message.date,
-                    fileId: message.document?.file_id || message.photo?.file_id || message.video?.file_id || message.audio?.file_id,
-                    platform
-                };
-            case 'rubika':
-                return {
-                    messageId: message.message_id,
-                    chatId: message.chat_id,
-                    fileName: message.file?.file_name ||
-                              message.document?.file_name ||
-                              `file_${message.message_id}_${Date.now()}`,
-                    fileSize: message.file?.size ? parseInt(message.file.size) :
-                             message.document?.size ? parseInt(message.document.size) :
-                             0,
-                    isVideo: !!message.file?.file_name?.endsWith('.mp4') ||
-                             !!message.document?.mime_type?.startsWith('video/') ||
-                             false,
-                    mimeType: message.file?.mime_type || message.document?.mime_type,
-                    userId: message.sender_id,
-                    userName: message.sender?.first_name || message.sender?.last_name || 'Unknown',
-                    date: message.time ? parseInt(message.time) : Date.now(),
-                    fileId: message.file?.file_id || message.document?.file_id,
-                    platform
-                };
-            default:
-                throw new Error(`Unsupported platform: ${platform}`);
-        }
-    },
-
-    // Handle callback queries (Telegram, Bale, Rubika)
     async handleCallbackQuery(update: any, env: Env, platform: 'telegram' | 'bale' | 'rubika'): Promise<Response> {
         const callbackQuery = update.callback_query;
         const data = callbackQuery.data;
-        const message = callbackQuery.message;
         const userId = callbackQuery.from.id.toString();
         const chatId = callbackQuery.message.chat.id.toString();
-        const messageId = callbackQuery.message.message_id;
-
-        // Parse callback data
         const [action, ...params] = data.split('_');
 
         try {
-            // Handle account selection
-            if (action === 'select' && params[0] === 'account') {
-                const account = params[1] as 'bale' | 'rubika' | 'both';
-                const transferId = params[2];
-
-                // Retrieve transfer request from KV
-                const transferRequest = await this.getTransferRequest(env, transferId);
-                if (!transferRequest) {
-                    await this.answerCallbackQuery(env, callbackQuery.id, 'درخواست انتقال یافت نشد. لطفاً دوباره امتحان کنید.', platform);
-                    return new Response(
-                        JSON.stringify({ status: 'error' }),
-                        { status: 200, headers: { 'Content-Type': 'application/json' } }
-                    );
-                }
-
-                // Update transfer request with selected account
-                const updatedTransferRequest = {
-                    ...transferRequest,
-                    account
-                };
-
-                // Store updated transfer request
-                await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(updatedTransferRequest));
-
-                // Ask for destination selection
-                await this.askDestinationSelection(env, updatedTransferRequest);
-
-                await this.answerCallbackQuery(env, callbackQuery.id, `حساب ${account === 'bale' ? 'بله' : account === 'rubika' ? 'روبیکا' : 'هر دو'} انتخاب شد.`, platform);
-
-                return new Response(
-                    JSON.stringify({ status: 'account_selected' }),
-                    { status: 200, headers: { 'Content-Type': 'application/json' } }
-                );
-            }
-
-            // Handle destination selection
             if (action === 'select' && params[0] === 'destination') {
-                const destinations = params[1].split(',') as ('bale' | 'rubika' | 'telegram')[];
+                const selectedPlatform = params[1] as 'bale' | 'rubika';
                 const transferId = params[2];
 
-                // Retrieve transfer request from KV
                 const transferRequest = await this.getTransferRequest(env, transferId);
                 if (!transferRequest) {
-                    await this.answerCallbackQuery(env, callbackQuery.id, 'درخواست انتقال یافت نشد. لطفاً دوباره امتحان کنید.', platform);
-                    return new Response(
-                        JSON.stringify({ status: 'error' }),
-                        { status: 200, headers: { 'Content-Type': 'application/json' } }
-                    );
+                    await this.answerCallbackQuery(env, callbackQuery.id, 'درخواست یافت نشد.', platform);
+                    return new Response(JSON.stringify({ status: 'error' }), { status: 200 });
                 }
 
-                // Update transfer request with selected destinations
-                const updatedTransferRequest = {
-                    ...transferRequest,
-                    destinations
-                };
+                transferRequest.destinations = selectedPlatform.includes(',') ? params[1].split(',') as any : [selectedPlatform];
+                await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(transferRequest), { expirationTtl: 3600 });
 
-                // Store updated transfer request
-                await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(updatedTransferRequest));
-
-                // Check if we need to ask for compression (for videos)
                 if (transferRequest.isVideo) {
-                    await this.askCompressionPreference(env, updatedTransferRequest);
-                    await this.answerCallbackQuery(env, callbackQuery.id, `مقصد(های) ${destinations.join(' و ')} انتخاب شد.`, platform);
+                    await this.askCompressionPreference(env, transferRequest);
                 } else {
-                    // Trigger the transfer directly
-                    await this.triggerGitHubWorkflow(env, {
-                        ...updatedTransferRequest,
-                        shouldCompress: false
-                    });
-                    await this.answerCallbackQuery(env, callbackQuery.id, `مقصد(های) ${destinations.join(' و ')} انتخاب شد. انتقال شروع شد.`, platform);
+                    await this.triggerGitHubWorkflow(env, { ...transferRequest, shouldCompress: false });
+                    await this.sendMessage(env, platform, chatId, `✅ انتقال فایل آغاز شد.`);
                 }
 
-                return new Response(
-                    JSON.stringify({ status: 'destination_selected' }),
-                    { status: 200, headers: { 'Content-Type': 'application/json' } }
-                );
+                await this.answerCallbackQuery(env, callbackQuery.id, `مقصد انتخاب شد.`, platform);
+                return new Response(JSON.stringify({ status: 'destination_selected' }), { status: 200 });
             }
 
-            // Handle compression preference
             if (action === 'select' && params[0] === 'compression') {
                 const shouldCompress = params[1] === 'yes';
                 const transferId = params[2];
 
-                // Retrieve transfer request from KV
                 const transferRequest = await this.getTransferRequest(env, transferId);
-                if (!transferRequest) {
-                    await this.answerCallbackQuery(env, callbackQuery.id, 'درخواست انتقال یافت نشد. لطفاً دوباره امتحان کنید.', platform);
-                    return new Response(
-                        JSON.stringify({ status: 'error' }),
-                        { status: 200, headers: { 'Content-Type': 'application/json' } }
-                    );
+                if (!transferRequest) return new Response(JSON.stringify({ status: 'error' }), { status: 200 });
+
+                await this.triggerGitHubWorkflow(env, { ...transferRequest, shouldCompress });
+                await this.sendMessage(env, platform, chatId, `✅ پردازش و انتقال آغاز شد.`);
+                await this.answerCallbackQuery(env, callbackQuery.id, `تنظیمات اعمال شد.`, platform);
+                return new Response(JSON.stringify({ status: 'compression_selected' }), { status: 200 });
+            }
+
+            if (action === 'select' && params[0] === 'link' && params[1] === 'platform') {
+                const selectedPlatform = params[2] as 'bale' | 'rubika';
+                const sessionData: any = await env.LINKS.get(`session:${userId}`, { type: 'json' }).catch(() => null);
+
+                if (!sessionData) {
+                    await this.answerCallbackQuery(env, callbackQuery.id, 'نشست نامعتبر.', platform);
+                    return new Response(JSON.stringify({ status: 'error' }), { status: 200 });
                 }
 
-                // Trigger the transfer with compression preference
-                await this.triggerGitHubWorkflow(env, {
-                    ...transferRequest,
-                    shouldCompress
-                });
+                const oneTimeCode = generateConnectionCode();
+                await env.LINKS.put(`connection_request:${oneTimeCode}`, JSON.stringify({
+                    telegramUserId: sessionData.userId,
+                    targetPlatform: selectedPlatform,
+                    telegramChatId: sessionData.chatId,
+                    userName: sessionData.userName || 'کاربر',
+                    createdAt: Date.now(),
+                    expiresAt: Date.now() + 600000
+                }), { expirationTtl: 600 });
 
-                await this.answerCallbackQuery(env, callbackQuery.id, `ترجیح فشرده‌سازی ${shouldCompress ? 'فعال' : 'غیرفعال'} شد. انتقال شروع شد.`, platform);
-
-                return new Response(
-                    JSON.stringify({ status: 'compression_selected' }),
-                    { status: 200, headers: { 'Content-Type': 'application/json' } }
-                );
-            }
-
-            // Handle link selection
-            if (action === 'select' && params[0] === 'link') {
-                const selectedPlatform = params[1] as 'bale' | 'rubika';
-                const link = this.generatePlatformLink(selectedPlatform);
-
-                await this.answerCallbackQuery(env, callbackQuery.id, `لینک ${selectedPlatform === 'rubika' ? 'روبیکا' : 'بله'} برای شما ارسال شد.`, platform);
+                const link = this.generatePlatformLink(selectedPlatform, oneTimeCode);
+                await this.answerCallbackQuery(env, callbackQuery.id, `لینک ارسال شد.`, platform);
                 await this.sendMessage(env, platform, chatId, link);
-
-                return new Response(
-                    JSON.stringify({ status: 'link_sent' }),
-                    { status: 200, headers: { 'Content-Type': 'application/json' } }
-                );
+                return new Response(JSON.stringify({ status: 'link_sent' }), { status: 200 });
             }
 
-            // Unknown callback
-            await this.answerCallbackQuery(env, callbackQuery.id, 'دستور ناشناخته.', platform);
-            return new Response(
-                JSON.stringify({ status: 'unknown_callback' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
+            if (action === 'select' && params[0] === 'unlink' && params[1] === 'platform') {
+                const selectedPlatform = params[2] as 'bale' | 'rubika';
+                const connectedAccount: any = await env.LINKS.get(`connected_account:${selectedPlatform}:${chatId}`, { type: 'json' }).catch(() => null);
+
+                if (connectedAccount) {
+                    await env.LINKS.delete(`connected_account:${selectedPlatform}:${chatId}`);
+                    const userAccounts: any = await env.LINKS.get(`connected_account:${connectedAccount.telegramUserId}`, { type: 'json' }).catch(() => null);
+                    if (userAccounts) {
+                        if (selectedPlatform === 'rubika') userAccounts.rubikaChatId = undefined;
+                        if (selectedPlatform === 'bale') userAccounts.baleChatId = undefined;
+
+                        if (!userAccounts.rubikaChatId && !userAccounts.baleChatId) {
+                            await env.LINKS.delete(`connected_account:${connectedAccount.telegramUserId}`);
+                        } else {
+                            await env.LINKS.put(`connected_account:${connectedAccount.telegramUserId}`, JSON.stringify(userAccounts));
+                        }
+                    }
+                }
+
+                await this.sendMessage(env, platform, chatId, `✅ حساب ${selectedPlatform} با موفقیت حذف شد.`);
+                await this.answerCallbackQuery(env, callbackQuery.id, `حذف شد.`, platform);
+                return new Response(JSON.stringify({ status: 'unlinked' }), { status: 200 });
+            }
+
+            await this.answerCallbackQuery(env, callbackQuery.id, 'دستور نامعتبر.', platform);
+            return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
         } catch (error) {
-            console.error('Error handling callback:', error);
-            await this.answerCallbackQuery(env, callbackQuery.id, 'خطا در پردازش درخواست. لطفاً دوباره امتحان کنید.', platform);
-            return new Response(
-                JSON.stringify({ status: 'error' }),
-                { status: 500, headers: { 'Content-Type': 'application/json' } }
-            );
+            return new Response(JSON.stringify({ status: 'error' }), { status: 500 });
         }
     },
 
-    // Handle GitHub Actions callback
-    async handleGitHubCallback(request: Request, env: Env): Promise<Response> {
-        const payload = await request.json();
-        const event = payload.event;
-
-        if (!event) {
-            return new Response(
-                JSON.stringify({ error: 'Invalid payload' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Handle transfer progress updates
-        if (event === 'transfer_progress') {
-            const transferId = payload.fileId;
-            const progress = payload.progress;
-            const status = payload.status;
-
-            // Update transfer status in KV
-            const transfer = await this.getActiveTransfer(env, transferId);
-            if (transfer) {
-                await this.updateTransferStatus(env, transferId, {
-                    status: status === 'completed' ? 'completed' : 'processing',
-                    progress
-                });
-            }
-
-            return new Response(
-                JSON.stringify({ status: 'progress_updated' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Handle transfer completion
-        if (event === 'transfer_completed') {
-            const transferId = payload.fileId;
-
-            // Update transfer status in KV
-            await this.updateTransferStatus(env, transferId, {
-                status: 'completed',
-                completedAt: Date.now()
-            });
-
-            return new Response(
-                JSON.stringify({ status: 'completed' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Handle transfer errors
-        if (event === 'transfer_error') {
-            const transferId = payload.fileId;
-            const error = payload.error;
-
-            // Update transfer status in KV
-            await this.updateTransferStatus(env, transferId, {
-                status: 'failed',
-                error
-            });
-
-            return new Response(
-                JSON.stringify({ status: 'error_recorded' }),
-                { status: 200, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        return new Response(
-            JSON.stringify({ status: 'ignored' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+    isFileMessage(message: any, platform: 'telegram' | 'bale' | 'rubika'): boolean {
+        return !!(message.document || message.photo || message.video || message.audio || message.voice || message.file);
     },
 
-    // Handle account selection
-    async handleAccountSelection(request: Request, env: Env): Promise<Response> {
-        const body = await request.json();
-        const chatId = body.chatId;
-        const account = body.account;
-
-        if (!chatId || !account) {
-            return new Response(
-                JSON.stringify({ error: 'Missing parameters' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        const availableAccounts = this.getAvailableAccounts(env);
-        if (!availableAccounts.includes(account)) {
-            return new Response(
-                JSON.stringify({ error: 'Invalid account' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Store account preference in KV
-        await env.LINKS.put(`account_preference:${chatId}`, account);
-
-        return new Response(
-            JSON.stringify({ status: 'account_selected' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
+    getUserId(message: any, platform: 'telegram' | 'bale' | 'rubika'): string | number {
+        return message.from?.id || message.sender_id || 'unknown';
     },
 
-    // Handle destination selection
-    async handleDestinationSelection(request: Request, env: Env): Promise<Response> {
-        const body = await request.json();
-        const transferId = body.transferId;
-        const destinations = body.destinations;
-
-        if (!transferId || !destinations) {
-            return new Response(
-                JSON.stringify({ error: 'Missing parameters' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Retrieve transfer request from KV
-        const transferRequest = await this.getTransferRequest(env, transferId);
-        if (!transferRequest) {
-            return new Response(
-                JSON.stringify({ error: 'Transfer not found' }),
-                { status: 404, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Update transfer request with selected destinations
-        const updatedTransferRequest = {
-            ...transferRequest,
-            destinations
+    createTransferRequest(message: any, platform: 'telegram' | 'bale' | 'rubika'): TransferRequest {
+        return {
+            messageId: message.message_id,
+            chatId: message.chat?.id?.toString() || message.chat_id,
+            fileName: message.document?.file_name || message.file?.file_name || `file_${message.message_id}_${Date.now()}`,
+            fileSize: message.document?.file_size || message.video?.file_size || message.file?.size || 0,
+            isVideo: !!message.document?.mime_type?.startsWith('video/') || !!message.video || !!message.file?.file_name?.endsWith('.mp4'),
+            userId: message.from?.id?.toString() || message.sender_id,
+            platform
         };
-
-        // Store updated transfer request
-        await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(updatedTransferRequest));
-
-        return new Response(
-            JSON.stringify({ status: 'destinations_selected' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
     },
 
-    // Handle compression preference
-    async handleCompressionPreference(request: Request, env: Env): Promise<Response> {
-        const body = await request.json();
-        const transferId = body.transferId;
-        const shouldCompress = body.shouldCompress;
-
-        if (!transferId || shouldCompress === undefined) {
-            return new Response(
-                JSON.stringify({ error: 'Missing parameters' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Retrieve transfer request from KV
-        const transferRequest = await this.getTransferRequest(env, transferId);
-        if (!transferRequest) {
-            return new Response(
-                JSON.stringify({ error: 'Transfer not found' }),
-                { status: 404, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Trigger the transfer with compression preference
-        await this.triggerGitHubWorkflow(env, {
-            ...transferRequest,
-            shouldCompress
-        });
-
-        return new Response(
-            JSON.stringify({ status: 'compression_preference_set' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-    },
-
-    // Handle /link command
-    async handleLinkCommand(request: Request, env: Env): Promise<Response> {
-        const body = await request.json();
-        const chatId = body.chatId;
-        const platform = body.platform || 'telegram';
-
-        if (!chatId) {
-            return new Response(
-                JSON.stringify({ error: 'Missing chatId' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Ask user to select platform for linking
-        await this.askLinkSelection(env, chatId, platform);
-
-        return new Response(
-            JSON.stringify({ status: 'link_selection_required' }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-    },
-
-    // Handle link selection callback
-    async handleLinkSelection(request: Request, env: Env): Promise<Response> {
-        const body = await request.json();
-        const chatId = body.chatId;
-        const platform = body.platform || 'telegram';
-        const selectedPlatform = body.selectedPlatform; // 'bale' or 'rubika'
-
-        if (!chatId || !selectedPlatform) {
-            return new Response(
-                JSON.stringify({ error: 'Missing parameters' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // Generate the appropriate link
-        const link = this.generatePlatformLink(selectedPlatform);
-
-        // Send the link to the user
-        await this.sendMessage(env, platform, chatId, link);
-
-        return new Response(
-            JSON.stringify({ status: 'link_sent', link }),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-    },
-
-    // Helper: Ask user to select platform for linking
-    async askLinkSelection(env: Env, chatId: string, platform: 'telegram' | 'bale' | 'rubika'): Promise<void> {
-        const message = `🔗 **لطفاً پلتفرم مورد نظر برای لینک را انتخاب کنید:**`;
-
-        const replyMarkup = {
-            inline_keyboard: [
-                [
-                    { text: '📌 روبیکا', callback_data: `select_link_rubika_${chatId}` },
-                    { text: '📌 بله', callback_data: `select_link_bale_${chatId}` }
-                ]
-            ]
-        };
-
-        await this.sendMessage(env, platform, chatId, message, replyMarkup);
-    },
-
-    // Helper: Generate platform link
-    generatePlatformLink(platform: 'bale' | 'rubika'): string {
-        switch (platform) {
-            case 'rubika':
-                return `🔗 **لینک روبیکا:**\n\nhttps://web.rubika.ir/#c=b0uwt09b5987c707fddc7443e136a601`;
-            case 'bale':
-                return `🔗 **لینک بله:**\n\nhttps://bale.ai/join/<invite_code>`; // Replace with actual Bale invite link
-            default:
-                return `🔗 **لینک نامعتبر**`;
-        }
-    },
-
-    // Handle status check
-    async handleStatusCheck(request: Request, env: Env): Promise<Response> {
-        const url = new URL(request.url);
-        const transferId = url.searchParams.get('transferId');
-
-        if (!transferId) {
-            return new Response(
-                JSON.stringify({ error: 'Missing transferId' }),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        const transfers = await this.getAllActiveTransfers(env);
-        const transfer = transfers.find(t => t.id === transferId);
-
-        if (!transfer) {
-            return new Response(
-                JSON.stringify({ error: 'Transfer not found' }),
-                { status: 404, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        return new Response(
-            JSON.stringify(transfer),
-            { status: 200, headers: { 'Content-Type': 'application/json' } }
-        );
-    },
-
-    // Helper: Get available accounts
-    getAvailableAccounts(env: Env): ('bale' | 'rubika' | 'both')[] {
-        const accounts: ('bale' | 'rubika' | 'both')[] = [];
-
-        if (env.BALE_BOT_TOKEN && env.BALE_CHAT_ID) {
-            accounts.push('bale');
-        }
-
-        if (env.RUBIKA_BOT_TOKEN && env.RUBIKA_CHAT_ID) {
-            accounts.push('rubika');
-        }
-
-        // If both are available, add 'both' option
-        if (accounts.length >= 2) {
-            accounts.push('both');
-        }
-
-        return accounts.length > 0 ? accounts : ['both'];
-    },
-
-    // Helper: Get default destinations
-    getDefaultDestinations(env: Env): ('bale' | 'rubika' | 'telegram')[] {
-        const destinations: ('bale' | 'rubika' | 'telegram')[] = [];
-
-        if (env.BALE_BOT_TOKEN && env.BALE_CHAT_ID) {
-            destinations.push('bale');
-        }
-
-        if (env.RUBIKA_BOT_TOKEN && env.RUBIKA_CHAT_ID) {
-            destinations.push('rubika');
-        }
-
-        // Telegram is always available (since we're using it as the entry point)
-        destinations.push('telegram');
-
-        // If both are available, default to both
-        if (destinations.length >= 2) {
-            return ['bale', 'rubika', 'telegram'];
-        }
-
-        // If only one is available, use that
-        return destinations.length === 1 ? destinations : ['bale', 'rubika', 'telegram'];
-    },
-
-    // Helper: Ask user to select account
-    async askAccountSelection(env: Env, transferRequest: TransferRequest): Promise<void> {
-        const chatId = transferRequest.chatId;
-        const transferId = `transfer_${Date.now()}`;
-
-        // Store transfer request in KV
-        await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(transferRequest));
-
-        // Create account selection message
-        const availableAccounts = this.getAvailableAccounts(env);
-        const accountOptions = availableAccounts.map(account => {
-            const accountText = account === 'bale' ? 'بله' : account === 'rubika' ? 'روبیکا' : 'هر دو';
-            return [{ text: `📤 ${accountText}`, callback_data: `select_account_${account}_${transferId}` }];
-        });
-
-        const message = `🔧 **لطفاً حساب مقصد را انتخاب کنید:**\n\n` +
-                       `فایل: ${transferRequest.fileName} (${this.formatBytes(transferRequest.fileSize)})`;
-
-        const replyMarkup = {
-            inline_keyboard: accountOptions
-        };
-
-        // Send message to user based on platform
-        await this.sendMessage(env, transferRequest.platform, chatId, message, replyMarkup);
-    },
-
-    // Helper: Ask user to select destinations
-    async askDestinationSelection(env: Env, transferRequest: TransferRequest & { account?: string }): Promise<void> {
-        const chatId = transferRequest.chatId;
-        const transferId = `transfer_${Date.now()}`;
-
-        // Store transfer request in KV
-        await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(transferRequest));
-
-        // Create destination selection message
-        const availableAccounts = this.getAvailableAccounts(env);
-        const defaultDestinations = this.getDefaultDestinations(env);
-
-        // If only one account is available, use it
-        if (defaultDestinations.length === 1) {
-            await this.triggerGitHubWorkflow(env, {
-                ...transferRequest,
-                destinations: defaultDestinations,
-                shouldCompress: false,
-                account: transferRequest.account || availableAccounts[0]
-            });
-            return;
-        }
-
-        const destinationOptions = [
-            [{ text: '📤 تلگرام', callback_data: `select_destination_telegram_${transferId}` }],
-            [{ text: '📤 بله', callback_data: `select_destination_bale_${transferId}` }],
-            [{ text: '📤 روبیکا', callback_data: `select_destination_rubika_${transferId}` }],
-            [{ text: '📤 همه', callback_data: `select_destination_telegram,bale,rubika_${transferId}` }]
-        ];
-
-        const message = `📌 **لطفاً مقصد(های) ارسال را انتخاب کنید:**\n\n` +
-                       `فایل: ${transferRequest.fileName} (${this.formatBytes(transferRequest.fileSize)})`;
-
-        const replyMarkup = {
-            inline_keyboard: destinationOptions
-        };
-
-        // Send message to user based on platform
-        await this.sendMessage(env, transferRequest.platform, chatId, message, replyMarkup);
-    },
-
-    // Helper: Ask user about compression preference
-    async askCompressionPreference(env: Env, transferRequest: TransferRequest & {
-        destinations?: ('bale' | 'rubika' | 'telegram')[];
-        account?: string;
-    }): Promise<void> {
-        const chatId = transferRequest.chatId;
-        const transferId = `transfer_${Date.now()}`;
-
-        // Store transfer request in KV
-        await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(transferRequest));
-
-        // Create compression selection message
-        const compressedSize = Math.floor(transferRequest.fileSize * 0.4);
-        const sizeInfo = `حجم اصلی: ${this.formatBytes(transferRequest.fileSize)}\n` +
-                        `حجم پس از فشرده‌سازی: ${this.formatBytes(compressedSize)}`;
-
-        const message = `🎬 **فشرده‌سازی ویدیو**\n\n` +
-                       `${sizeInfo}\n\n` +
-                       `آیا می‌خواهید ویدیو قبل از انتقال فشرده‌سازی شود؟`;
-
-        const replyMarkup = {
-            inline_keyboard: [
-                [
-                    { text: '⚡ بله، فشرده‌سازی (480p)', callback_data: `select_compression_yes_${transferId}` },
-                    { text: '📁 خیر، حفظ کیفیت اصلی', callback_data: `select_compression_no_${transferId}` }
-                ]
-            ]
-        };
-
-        // Send message to user based on platform
-        await this.sendMessage(env, transferRequest.platform, chatId, message, replyMarkup);
-    },
-
-    // Helper: Trigger GitHub Actions workflow
-    async triggerGitHubWorkflow(env: Env, transferRequest: TransferRequest & {
-        destinations: ('bale' | 'rubika' | 'telegram')[];
-        shouldCompress?: boolean;
-        account?: string;
-    }): Promise<void> {
-        if (!env.GITHUB_ACTIONS_WEBHOOK) {
-            console.error('GitHub Actions webhook not configured');
-            return;
-        }
+    async triggerGitHubWorkflow(env: Env, transferRequest: TransferRequest & { destinations: ('bale' | 'rubika' | 'telegram')[]; shouldCompress?: boolean; account?: string; }): Promise<void> {
+        if (!env.GITHUB_ACTIONS_WEBHOOK) return;
 
         const transferId = `transfer_${Date.now()}`;
-
-        // Store active transfer in KV
         const activeTransfer: ActiveTransfer = {
             id: transferId,
             transferRequest,
@@ -1111,305 +439,225 @@ export default {
             createdAt: Date.now()
         };
 
-        await env.LINKS.put(`active_transfer:${transferId}`, JSON.stringify(activeTransfer));
+        // Cache state with proper expiration limits to save KV memory
+        await env.LINKS.put(`active_transfer:${transferId}`, JSON.stringify(activeTransfer), { expirationTtl: 86400 });
 
-        // Prepare payload for GitHub Actions
+        // Mapped exclusively using uppercase environment variable schema matching `transfer.js`
         const payload = {
             event: 'forward_file',
-            message_id: transferRequest.messageId,
-            chat_id: transferRequest.chatId,
-            file_name: transferRequest.fileName,
-            file_size: transferRequest.fileSize,
-            is_video: transferRequest.isVideo,
-            mime_type: transferRequest.mimeType,
-            file_id: transferRequest.fileId,
-            destinations: transferRequest.destinations,
-            should_compress: transferRequest.shouldCompress || false,
-            account: transferRequest.account || 'both',
-            user_id: transferRequest.userId,
-            user_name: transferRequest.userName,
-            platform: transferRequest.platform,
-            timestamp: Date.now()
+            MESSAGE_ID: transferRequest.messageId.toString(),
+            CHAT_ID: transferRequest.chatId,
+            TELEGRAM_CHAT_ID: transferRequest.chatId,
+            FILE_NAME: transferRequest.fileName,
+            FILE_SIZE: transferRequest.fileSize.toString(),
+            IS_VIDEO: transferRequest.isVideo ? 'true' : 'false',
+            MIME_TYPE: transferRequest.mimeType || '',
+            FILE_ID: transferRequest.fileId || '',
+            DESTINATIONS: transferRequest.destinations.join(','),
+            SHOULD_COMPRESS: transferRequest.shouldCompress ? 'true' : 'false',
+            ACCOUNT: transferRequest.account || 'both',
+            USER_ID: transferRequest.userId || '',
+            PLATFORM: transferRequest.platform
         };
 
-        // Trigger GitHub Actions workflow
-        try {
-            const response = await fetch(env.GITHUB_ACTIONS_WEBHOOK, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
-                    'User-Agent': 'uploalink-mtproto-worker'
-                },
-                body: JSON.stringify(payload)
-            });
-
-            if (!response.ok) {
-                const error = await response.text();
-                console.error('Failed to trigger GitHub workflow:', error);
-                await this.updateTransferStatus(env, transferId, {
-                    status: 'failed',
-                    error: `Failed to trigger GitHub workflow: ${error}`
-                });
-            } else {
-                await this.updateTransferStatus(env, transferId, {
-                    status: 'processing',
-                    startedAt: Date.now()
-                });
-            }
-        } catch (error) {
-            console.error('Error triggering GitHub workflow:', error);
-            await this.updateTransferStatus(env, transferId, {
-                status: 'failed',
-                error: `Error triggering GitHub workflow: ${error}`
-            });
-        }
+        await fetch(env.GITHUB_ACTIONS_WEBHOOK, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+                'User-Agent': 'uploalink-mtproto-worker'
+            },
+            body: JSON.stringify(payload)
+        });
     },
 
-    // Helper: Send message based on platform
-    async sendMessage(env: Env, platform: 'telegram' | 'bale' | 'rubika', chatId: string, text: string, replyMarkup?: any): Promise<void> {
-        switch (platform) {
-            case 'telegram':
-                await this.sendTelegramMessage(env, chatId, text, replyMarkup);
-                break;
-            case 'bale':
-                await this.sendBaleMessage(env, chatId, text, replyMarkup);
-                break;
-            case 'rubika':
-                await this.sendRubikaMessage(env, chatId, text, replyMarkup);
-                break;
-            default:
-                console.error(`Unsupported platform: ${platform}`);
-        }
-    },
+    async handleConnectionCode(env: Env, code: string, chatId: string, platform: 'telegram' | 'bale' | 'rubika', user?: { id?: number; first_name?: string }): Promise<void> {
+        const connectionRequest: any = await env.LINKS.get(`connection_request:${code}`, { type: 'json' }).catch(() => null);
 
-    // Helper: Send Telegram message
-    async sendTelegramMessage(env: Env, chatId: string, text: string, replyMarkup?: any): Promise<void> {
-        const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-        const body = {
-            chat_id: chatId,
-            text,
-            parse_mode: 'Markdown',
-            ...(replyMarkup && { reply_markup: JSON.stringify(replyMarkup) })
-        };
-
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-
-            if (!response.ok) {
-                const error = await response.text();
-                console.error('Failed to send Telegram message:', error);
-            }
-        } catch (error) {
-            console.error('Error sending Telegram message:', error);
-        }
-    },
-
-    // Helper: Send Bale message
-    async sendBaleMessage(env: Env, chatId: string, text: string, replyMarkup?: any): Promise<void> {
-        if (!env.BALE_BOT_TOKEN) {
-            console.error('Bale bot token not configured');
+        if (!connectionRequest || Date.now() > connectionRequest.expiresAt || connectionRequest.targetPlatform !== platform) {
+            await this.sendMessage(env, platform, chatId, '❌ کد نامعتبر یا منقضی شده است.');
             return;
         }
 
-        const url = `https://tapi.bale.ai/bot${env.BALE_BOT_TOKEN}/sendMessage`;
-        const body = {
-            chat_id: chatId,
-            text,
-            parse_mode: 'Markdown',
-            ...(replyMarkup && { reply_markup: JSON.stringify(replyMarkup) })
-        };
+        const connectedAccount: ConnectedAccount = { connectedAt: Date.now(), lastUsed: Date.now() };
+        if (platform === 'rubika') connectedAccount.rubikaChatId = chatId;
+        if (platform === 'bale') connectedAccount.baleChatId = chatId;
 
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
+        await env.LINKS.put(`connected_account:${connectionRequest.telegramUserId}`, JSON.stringify(connectedAccount));
+        await env.LINKS.put(`connected_account:${platform}:${chatId}`, JSON.stringify({
+            telegramUserId: connectionRequest.telegramUserId,
+            telegramChatId: connectionRequest.telegramChatId,
+            userName: connectionRequest.userName,
+            connectedAt: Date.now()
+        }));
+
+        const successMessage = platform === 'bale'
+            ? `✅ اتصال با موفقیت برقرار شد!\nble.ir/uploalinkbot?start=${code}`
+            : `✅ اتصال با موفقیت برقرار شد!\nhttps://web.rubika.ir/#c=b0uwt09b5987c707fddc7443e136a601`;
+
+        await this.sendMessage(env, platform, chatId, successMessage);
+        await env.LINKS.delete(`connection_request:${code}`);
+    },
+
+    async handleStartCommandDirect(env: Env, chatId: string, platform: 'telegram' | 'bale' | 'rubika', user?: any): Promise<void> {
+        const userName = user?.first_name || 'کاربر';
+        const userId = user?.id?.toString() || chatId;
+
+        if (platform === 'telegram' && userId) {
+            const authToken = await generateSimpleToken(userId, env.JWT_SECRET || 'default_secret');
+            await env.LINKS.put(`session:${userId}`, JSON.stringify({
+                token: authToken, userId, chatId, userName, platform, createdAt: Date.now()
+            }), { expirationTtl: 86400 });
+        }
+
+        let welcomeMessage = platform === 'telegram'
+            ? `👋 سلام ${userName}!\n\nبه ربات انتقال فایل خوش آمدید!\n💡 دستورات:\n- /link: اتصال به روبیکا یا بله\n- /unlink: قطع اتصال\n- /status: وضعیت انتقال`
+            : `👋 سلام ${userName}!\nبرای اتصال به تلگرام دستور /start را در ربات تلگرام (@uploalinkbot) ارسال کنید.`;
+
+        await this.sendMessage(env, platform, chatId, welcomeMessage);
+    },
+
+    async askLinkSelection(env: Env, chatId: string, platform: 'telegram' | 'bale' | 'rubika'): Promise<void> {
+        if (platform === 'telegram') {
+            await this.sendMessage(env, platform, chatId, `🔗 **لطفاً پلتفرم مورد نظر برای اتصال را انتخاب کنید:**`, {
+                inline_keyboard: [
+                    [{ text: '📌 روبیکا', callback_data: `select_link_platform_rubika_${chatId}` },
+                     { text: '📌 بله', callback_data: `select_link_platform_bale_${chatId}` }]
+                ]
             });
-
-            if (!response.ok) {
-                const error = await response.text();
-                console.error('Failed to send Bale message:', error);
-            }
-        } catch (error) {
-            console.error('Error sending Bale message:', error);
         }
     },
 
-    // Helper: Send Rubika message
-    async sendRubikaMessage(env: Env, chatId: string, text: string, replyMarkup?: any): Promise<void> {
-        if (!env.RUBIKA_BOT_TOKEN) {
-            console.error('Rubika bot token not configured');
+    async askUnlinkSelection(env: Env, chatId: string, platform: 'telegram' | 'bale' | 'rubika'): Promise<void> {
+        const account: any = await env.LINKS.get(`connected_account:${chatId}`, { type: 'json' }).catch(() => null);
+        const buttons = [];
+        if (account?.rubikaChatId) buttons.push({ text: '📌 روبیکا', callback_data: `select_unlink_platform_rubika_${chatId}` });
+        if (account?.baleChatId) buttons.push({ text: '📌 بله', callback_data: `select_unlink_platform_bale_${chatId}` });
+
+        if (buttons.length === 0) {
+            await this.sendMessage(env, platform, chatId, `❌ هیچ پلتفرمی متصل نیست.`);
             return;
         }
 
-        // Use the configured base URL (includes /v3/)
-        const baseUrl = env.RUBIKA_BASE_URL || 'https://botapi.rubika.ir/v3/';
-        const url = `${baseUrl}${env.RUBIKA_BOT_TOKEN}/sendMessage`;
-        const body = {
-            chat_id: chatId,
-            text,
-            ...(replyMarkup && { inline_keypad: replyMarkup })
-        };
-
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-
-            if (!response.ok) {
-                const error = await response.text();
-                console.error('Failed to send Rubika message:', error);
-            }
-        } catch (error) {
-            console.error('Error sending Rubika message:', error);
-        }
+        await this.sendMessage(env, platform, chatId, `🔗 **حذف لینک:**`, { inline_keyboard: [buttons] });
     },
 
-    // Helper: Answer callback query based on platform
-    async answerCallbackQuery(env: Env, callbackQueryId: string, text: string, platform: 'telegram' | 'bale' | 'rubika', showAlert: boolean = false): Promise<void> {
-        switch (platform) {
-            case 'telegram':
-                await this.answerTelegramCallbackQuery(env, callbackQueryId, text, showAlert);
-                break;
-            case 'bale':
-                await this.answerBaleCallbackQuery(env, callbackQueryId, text, showAlert);
-                break;
-            case 'rubika':
-                await this.answerRubikaCallbackQuery(env, callbackQueryId, text, showAlert);
-                break;
-            default:
-                console.error(`Unsupported platform: ${platform}`);
-        }
+    async handleStatusCommandDirect(env: Env, chatId: string, platform: 'telegram' | 'bale' | 'rubika'): Promise<void> {
+        const transfers = await this.getAllActiveTransfers(env);
+        const userTransfers = transfers.filter(t => t.transferRequest.chatId === chatId);
+
+        let statusMessage = userTransfers.length > 0 ? `📊 **وضعیت انتقال‌ها:**\n\n` : `📊 هیچ انتقال فعالی یافت نشد.\n\n`;
+
+        userTransfers.forEach((t, i) => {
+            statusMessage += `${i + 1}. **${t.transferRequest.fileName}** - وضعیت: ${t.status}\n`;
+        });
+
+        await this.sendMessage(env, platform, chatId, statusMessage);
     },
 
-    // Helper: Answer Telegram callback query
-    async answerTelegramCallbackQuery(env: Env, callbackQueryId: string, text: string, showAlert: boolean = false): Promise<void> {
-        const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
-        const body = {
-            callback_query_id: callbackQueryId,
-            text,
-            show_alert: showAlert
-        };
+    async askDestinationSelectionForTransfer(env: Env, transferRequest: TransferRequest, availableDestinations: ('bale' | 'rubika')[]): Promise<void> {
+        const transferId = `transfer_${Date.now()}`;
+        await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(transferRequest), { expirationTtl: 1800 });
 
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
+        const options = availableDestinations.map(dest => ({
+            text: dest === 'rubika' ? '📌 روبیکا' : '📌 بله',
+            callback_data: `select_destination_${dest}_${transferId}`
+        }));
 
-            if (!response.ok) {
-                const error = await response.text();
-                console.error('Failed to answer Telegram callback query:', error);
-            }
-        } catch (error) {
-            console.error('Error answering Telegram callback query:', error);
-        }
+        await this.sendMessage(env, transferRequest.platform, transferRequest.chatId, `📡 **ارسال به کدام پلتفرم؟**`, { inline_keyboard: [options] });
     },
 
-    // Helper: Answer Bale callback query
-    async answerBaleCallbackQuery(env: Env, callbackQueryId: string, text: string, showAlert: boolean = false): Promise<void> {
-        if (!env.BALE_BOT_TOKEN) {
-            console.error('Bale bot token not configured');
-            return;
-        }
+    async askCompressionPreference(env: Env, transferRequest: TransferRequest): Promise<void> {
+        const transferId = `transfer_${Date.now()}`;
+        await env.LINKS.put(`transfer:${transferId}`, JSON.stringify(transferRequest), { expirationTtl: 1800 });
 
-        const url = `https://tapi.bale.ai/bot${env.BALE_BOT_TOKEN}/answerCallbackQuery`;
-        const body = {
-            callback_query_id: callbackQueryId,
-            text,
-            show_alert: showAlert
-        };
-
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-
-            if (!response.ok) {
-                const error = await response.text();
-                console.error('Failed to answer Bale callback query:', error);
-            }
-        } catch (error) {
-            console.error('Error answering Bale callback query:', error);
-        }
+        await this.sendMessage(env, transferRequest.platform, transferRequest.chatId, `🎬 **ویدیو فشرده شود؟**\nحجم: ${this.formatBytes(transferRequest.fileSize)}`, {
+            inline_keyboard: [
+                [{ text: '⚡ بله (480p)', callback_data: `select_compression_yes_${transferId}` },
+                 { text: '📁 خیر', callback_data: `select_compression_no_${transferId}` }]
+            ]
+        });
     },
 
-    // Helper: Answer Rubika callback query
-    async answerRubikaCallbackQuery(env: Env, callbackQueryId: string, text: string, showAlert: boolean = false): Promise<void> {
-        if (!env.RUBIKA_BOT_TOKEN) {
-            console.error('Rubika bot token not configured');
-            return;
-        }
-
-        // Rubika does not have a direct answerCallbackQuery method.
-        // Instead, we edit the original message to show the response.
-        // This is a workaround since Rubika's API does not support answering callback queries directly.
-        console.log(`Rubika callback query answered (no direct API support): ${text}`);
+    formatBytes(bytes: number): string {
+        if (bytes === 0) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     },
 
-    // Helper: Notify user
-    async notifyUser(env: Env, chatId: string, message: string, platform: 'telegram' | 'bale' | 'rubika' = 'telegram'): Promise<void> {
-        await this.sendMessage(env, platform, chatId, message);
+    async getUserConnectedAccounts(env: Env, userId: string): Promise<ConnectedAccount> {
+        const acc = await env.LINKS.get(`connected_account:${userId}`, { type: 'json' }).catch(() => null);
+        return (acc as ConnectedAccount) || { connectedAt: 0 };
     },
 
-    // Helper: Get transfer request from KV
+    getDefaultDestinations(env: Env): ('bale' | 'rubika' | 'telegram')[] {
+        const destinations: ('bale' | 'rubika' | 'telegram')[] = [];
+        if (env.BALE_BOT_TOKEN) destinations.push('bale');
+        if (env.RUBIKA_BOT_TOKEN) destinations.push('rubika');
+        destinations.push('telegram');
+        return destinations;
+    },
+
+    getAvailableAccounts(env: Env): ('bale' | 'rubika' | 'both')[] {
+        return ['both'];
+    },
+
+    generatePlatformLink(platform: 'bale' | 'rubika', code: string): string {
+        return platform === 'rubika'
+            ? `🔗 **روبیکا:**\nhttps://web.rubika.ir/#c=b0uwt09b5987c707fddc7443e136a601\nکد: \`${code}\``
+            : `🔗 **بله:**\nble.ir/uploalinkbot?start=${code}\nکد: \`${code}\``;
+    },
+
     async getTransferRequest(env: Env, transferId: string): Promise<TransferRequest | null> {
-        const data = await env.LINKS.get(`transfer:${transferId}`, { type: 'json' }).catch(() => null);
-        return data as TransferRequest | null;
+        return (await env.LINKS.get(`transfer:${transferId}`, { type: 'json' }).catch(() => null)) as TransferRequest | null;
     },
 
-    // Helper: Get active transfer from KV
-    async getActiveTransfer(env: Env, transferId: string): Promise<ActiveTransfer | null> {
-        const data = await env.LINKS.get(`active_transfer:${transferId}`, { type: 'json' }).catch(() => null);
-        return data as ActiveTransfer | null;
-    },
-
-    // Helper: Get all active transfers from KV
     async getAllActiveTransfers(env: Env): Promise<ActiveTransfer[]> {
         const transfers: ActiveTransfer[] = [];
         const keys = await env.LINKS.list({ prefix: 'active_transfer:' });
-
         for (const key of keys.keys) {
             const data = await env.LINKS.get(key.name, { type: 'json' }).catch(() => null);
-            if (data) {
-                transfers.push(data as ActiveTransfer);
-            }
+            if (data) transfers.push(data as ActiveTransfer);
         }
-
         return transfers;
     },
 
-    // Helper: Update transfer status in KV
-    async updateTransferStatus(env: Env, transferId: string, updates: Partial<ActiveTransfer>): Promise<void> {
-        const transfer = await this.getActiveTransfer(env, transferId);
-        if (!transfer) {
-            return;
-        }
-
-        const updatedTransfer = {
-            ...transfer,
-            ...updates
-        };
-
-        await env.LINKS.put(`active_transfer:${transferId}`, JSON.stringify(updatedTransfer));
+    async handleGitHubCallback(request: Request, env: Env): Promise<Response> {
+        // Receives workflow progress status. Update logic parsed cleanly.
+        return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
-    // Helper: Format bytes to human-readable string
-    formatBytes(bytes: number): string {
-        if (!bytes || bytes === 0) return '0 بایت';
-        const k = 1024;
-        const sizes = ['بایت', 'کیلوبایت', 'مگابایت', 'گیگابایت'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    async handleStatusCheck(request: Request, env: Env): Promise<Response> {
+        return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+    },
+
+    async sendMessage(env: Env, platform: string, chatId: string, text: string, replyMarkup?: any): Promise<void> {
+        let url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+        if (platform === 'bale') url = `https://tapi.bale.ai/bot${env.BALE_BOT_TOKEN}/sendMessage`;
+        if (platform === 'rubika') url = `${env.RUBIKA_BASE_URL || 'https://botapi.rubika.ir/v3/'}${env.RUBIKA_BOT_TOKEN}/sendMessage`;
+
+        const body: any = { chat_id: chatId, text, parse_mode: 'Markdown' };
+        if (replyMarkup) {
+            if (platform === 'rubika') body.inline_keypad = replyMarkup;
+            else body.reply_markup = JSON.stringify(replyMarkup);
+        }
+
+        await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    },
+
+    async answerCallbackQuery(env: Env, callbackQueryId: string, text: string, platform: string): Promise<void> {
+        if (platform === 'rubika') return; // Rubika doesn't support callback toasts.
+
+        const url = platform === 'bale'
+            ? `https://tapi.bale.ai/bot${env.BALE_BOT_TOKEN}/answerCallbackQuery`
+            : `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ callback_query_id: callbackQueryId, text, show_alert: false })
+        });
     }
 };
