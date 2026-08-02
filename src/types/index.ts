@@ -43,7 +43,7 @@ export interface TransferRequest {
     date?: number;
     fileId?: string;
     platform: Platform;
-    destinations?: ('bale' | 'rubika' | 'telegram')[];
+    destinations?: ('bale' | 'rubika')[];
     account?: string;
     shouldCompress?: boolean;
 }
@@ -63,6 +63,7 @@ export interface ConnectedAccount {
     rubikaChatId?: string;
     baleChatId?: string;
     telegramUserId?: string;
+    telegramChatId?: string;
     connectedAt: number;
     lastUsed?: number;
 }
@@ -73,5 +74,6 @@ export interface NormalizedMessage {
     userName: string;
     text: string;
     isFile: boolean;
+    isCallback: boolean;
     raw: any;
 }

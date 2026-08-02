@@ -7,8 +7,8 @@ import { RubikaPlatform, parseRubikaUpdate } from './platforms/rubika';
 import { Messenger } from './platforms/messenger';
 import { handleStartCommand, handleConnectionCode, askLinkSelection, askUnlinkSelection, handleStatusCommand } from './handlers/commands';
 import { createTransferRequest, processFileTransfer } from './handlers/transfers';
-import { generateConnectionCode, generatePlatformLink } from './utils/helpers';
 import { triggerGitHubWorkflow } from './services/github';
+import { generateConnectionCode, generatePlatformLink } from './utils/helpers';
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -56,20 +56,62 @@ export default {
         const messenger = this.getMessenger(env, 'rubika');
         const normalized = parseRubikaUpdate(update);
 
-        if (!normalized) return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
+        if (!normalized) return new Response(JSON.stringify({ status: 'ignored_unparsed' }), { status: 200 });
 
-        if (normalized.text) {
-            const rawText = normalized.text;
-            const textWithoutStart = rawText.startsWith('/start ') ? rawText.replace('/start ', '').trim() : rawText;
+        const rawText = normalized.text;
+        const chatId = normalized.chatId;
+        const userId = normalized.userId;
+        const messageId = normalized.raw.message_id || Date.now().toString();
 
-            if (textWithoutStart.match(CONSTANTS.CODE_REGEX)) {
-                await handleConnectionCode(env, kv, messenger, textWithoutStart, normalized.chatId, 'rubika');
+        if (normalized.isCallback) {
+            const simulatedQuery = {
+                data: rawText,
+                message: { chat: { id: chatId } },
+                from: { id: userId },
+                id: messageId
+            };
+            return await this.handleCallbackQuery(simulatedQuery, env, kv, messenger, 'rubika');
+        }
+
+        if (rawText) {
+            const cleanText = rawText.trim().toLowerCase();
+
+            if (cleanText.startsWith('/start')) {
+                const parts = rawText.split(' ');
+                const possibleCode = parts[1] ? parts[1].trim() : '';
+
+                if (possibleCode.match(CONSTANTS.CODE_REGEX)) {
+                    await handleConnectionCode(env, kv, messenger, possibleCode, chatId, 'rubika');
+                    return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
+                }
+
+                await handleStartCommand(env, kv, messenger, chatId, 'rubika', { id: userId, first_name: normalized.userName });
+                return new Response(JSON.stringify({ status: 'start_handled' }), { status: 200 });
+            }
+
+            if (cleanText.startsWith('/link')) {
+                await askLinkSelection(messenger, chatId, 'rubika');
+                return new Response(JSON.stringify({ status: 'link_handled' }), { status: 200 });
+            }
+
+            if (cleanText.startsWith('/unlink')) {
+                await askUnlinkSelection(kv, messenger, chatId);
+                return new Response(JSON.stringify({ status: 'unlink_handled' }), { status: 200 });
+            }
+
+            if (cleanText.startsWith('/status')) {
+                await handleStatusCommand(kv, messenger, chatId);
+                return new Response(JSON.stringify({ status: 'status_handled' }), { status: 200 });
+            }
+
+            if (rawText.match(CONSTANTS.CODE_REGEX)) {
+                await handleConnectionCode(env, kv, messenger, rawText, chatId, 'rubika');
                 return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
             }
         }
 
         if (normalized.isFile) {
-            const transferReq = createTransferRequest(normalized.raw, 'rubika');
+            const transferReq = createTransferRequest(messageId, chatId, userId, normalized.raw, 'rubika');
             await processFileTransfer(env, kv, messenger, transferReq);
             return new Response(JSON.stringify({ status: 'file_processed' }), { status: 200 });
         }
@@ -78,11 +120,15 @@ export default {
     },
 
     async processMessage(message: any, env: Env, kv: KVService, messenger: Messenger, platform: Platform): Promise<Response> {
-        const rawText = (message.text || '').trim();
+        const rawText = (message.text || message.caption || '').trim();
         const chatId = (message.chat?.id || message.chat_id || message.from?.id).toString();
+        const userId = (message.from?.id || message.sender_id || 'unknown').toString();
+        const messageId = (message.message_id).toString();
 
         if (rawText) {
-            if (rawText.toLowerCase().startsWith('/start')) {
+            const cleanText = rawText.toLowerCase();
+
+            if (cleanText.startsWith('/start')) {
                 const parts = rawText.split(' ');
                 const possibleCode = parts[1] ? parts[1].trim() : '';
 
@@ -95,17 +141,17 @@ export default {
                 return new Response(JSON.stringify({ status: 'start_handled' }), { status: 200 });
             }
 
-            if (rawText.toLowerCase().startsWith('/link')) {
+            if (cleanText.startsWith('/link')) {
                 await askLinkSelection(messenger, chatId, platform);
                 return new Response(JSON.stringify({ status: 'link_handled' }), { status: 200 });
             }
 
-            if (rawText.toLowerCase().startsWith('/unlink')) {
+            if (cleanText.startsWith('/unlink')) {
                 await askUnlinkSelection(kv, messenger, chatId);
                 return new Response(JSON.stringify({ status: 'unlink_handled' }), { status: 200 });
             }
 
-            if (rawText.toLowerCase().startsWith('/status')) {
+            if (cleanText.startsWith('/status')) {
                 await handleStatusCommand(kv, messenger, chatId);
                 return new Response(JSON.stringify({ status: 'status_handled' }), { status: 200 });
             }
@@ -118,7 +164,7 @@ export default {
 
         const isFile = !!(message.document || message.photo || message.video || message.audio || message.voice || message.file);
         if (isFile) {
-            const transferReq = createTransferRequest(message, platform);
+            const transferReq = createTransferRequest(messageId, chatId, userId, message, platform);
             await processFileTransfer(env, kv, messenger, transferReq);
             return new Response(JSON.stringify({ status: 'file_processed' }), { status: 200 });
         }
@@ -130,76 +176,74 @@ export default {
         const data = query.data;
         const chatId = query.message.chat.id.toString();
         const userId = query.from.id.toString();
-        const [action, ...params] = data.split('_');
+        const parts = data.split(':');
+        const action = parts[0];
 
-        if (action === 'select' && params[0] === 'destination') {
-            const selectedPlatform = params[1] as Platform;
-            const transferId = params[2];
+        // 1. Destination Selection Handlers
+        if (action === 'dest') {
+            const destChoice = parts[1]; // 'bale' | 'rubika' | 'both'
+            const transferId = parts[2];
             const transferReq = await kv.getTransferRequest(transferId);
 
             if (transferReq) {
-                transferReq.destinations = [selectedPlatform];
+                transferReq.destinations = destChoice === 'both' ? ['bale', 'rubika'] : [destChoice as any];
                 await kv.saveTransferRequest(transferId, transferReq);
 
-                if (transferReq.isVideo) {
-                    await messenger.sendMessage(chatId, `🎬 **ویدیو فشرده شود؟**`, {
-                        inline_keyboard: [
-                            [{ text: '⚡ بله (480p)', callback_data: `select_compression_yes_${transferId}` },
-                             { text: '📁 خیر', callback_data: `select_compression_no_${transferId}` }]
-                        ]
-                    });
-                } else {
-                    await triggerGitHubWorkflow(env, kv, { ...transferReq, shouldCompress: false });
-                    await messenger.sendMessage(chatId, `✅ انتقال فایل آغاز شد.`);
-                }
+                // Resume processing
+                await processFileTransfer(env, kv, messenger, transferReq);
             }
-            await messenger.answerCallbackQuery(query.id, 'مقصد انتخاب شد.');
+            await messenger.answerCallbackQuery(query.id, 'مقصد ثبت شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        if (action === 'select' && params[0] === 'compression') {
-            const shouldCompress = params[1] === 'yes';
-            const transferId = params[2];
+        // 2. Compression Handlers
+        if (action === 'comp') {
+            const shouldCompress = parts[1] === 'yes';
+            const transferId = parts[2];
             const transferReq = await kv.getTransferRequest(transferId);
 
             if (transferReq) {
                 await triggerGitHubWorkflow(env, kv, { ...transferReq, shouldCompress });
-                await messenger.sendMessage(chatId, `✅ پردازش و انتقال آغاز شد.`);
+                await messenger.sendMessage(chatId, `🚀 **پردازش و ارسال شروع شد.**`);
             }
             await messenger.answerCallbackQuery(query.id, 'تنظیمات اعمال شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        if (action === 'select' && params[0] === 'link' && params[1] === 'platform') {
-            const selectedPlatform = params[2] as Platform;
+        // 3. Link Requests
+        if (action === 'link') {
+            const targetPlatform = parts[1] as Platform;
             const session = await kv.getSession(userId);
 
-            if (session) {
-                const code = generateConnectionCode();
-                await kv.saveConnectionRequest(code, {
-                    telegramUserId: session.userId,
-                    targetPlatform: selectedPlatform,
-                    telegramChatId: session.chatId,
-                    userName: session.userName,
-                    expiresAt: Date.now() + CONSTANTS.EXPIRATION.CONNECTION_REQUEST * 1000
-                });
+            const code = generateConnectionCode();
+            await kv.saveConnectionRequest(code, {
+                telegramUserId: userId,
+                targetPlatform,
+                telegramChatId: chatId,
+                userName: session?.userName || 'کاربر',
+                expiresAt: Date.now() + CONSTANTS.EXPIRATION.CONNECTION_REQUEST * 1000
+            });
 
-                const link = generatePlatformLink(selectedPlatform, code);
-                await messenger.sendMessage(chatId, link);
-            }
-            await messenger.answerCallbackQuery(query.id, 'لینک ارسال شد.');
+            const linkMsg = generatePlatformLink(targetPlatform, code);
+            await messenger.sendMessage(chatId, linkMsg);
+            await messenger.answerCallbackQuery(query.id, 'کد ارسال شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        if (action === 'select' && params[0] === 'unlink' && params[1] === 'platform') {
-            const selectedPlatform = params[2] as Platform;
-            const connectedAccount = await kv.getPlatformReverseAccount(selectedPlatform, chatId);
-
-            if (connectedAccount) {
-                await kv.deletePlatformReverseAccount(selectedPlatform, chatId);
-                await messenger.sendMessage(chatId, `✅ حساب ${selectedPlatform} با موفقیت حذف شد.`);
+        // 4. Unlink Requests
+        if (action === 'unlink') {
+            const targetPlatform = parts[1] as Platform;
+            await kv.deletePlatformReverseAccount(targetPlatform, chatId);
+            
+            const connectedAcc = await kv.getConnectedAccount(userId);
+            if (connectedAcc) {
+                if (targetPlatform === 'rubika') connectedAcc.rubikaChatId = undefined;
+                if (targetPlatform === 'bale') connectedAcc.baleChatId = undefined;
+                await kv.saveConnectedAccount(userId, connectedAcc);
             }
-            await messenger.answerCallbackQuery(query.id, 'حذف شد.');
+
+            await messenger.sendMessage(chatId, `✅ **اتصال ${targetPlatform === 'bale' ? 'بله' : 'روبیکا'} قطع شد.**`);
+            await messenger.answerCallbackQuery(query.id, 'حساب قطع شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 

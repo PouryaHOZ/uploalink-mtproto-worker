@@ -4,15 +4,6 @@ import { CONSTANTS } from '../config/constants';
 export class KVService {
     constructor(private env: Env) {}
 
-    async getRateLimit(key: string): Promise<number> {
-        const val = await this.env.LINKS.get(key, { type: 'text' }).catch(() => '0');
-        return parseInt(val || '0');
-    }
-
-    async incrementRateLimit(key: string, current: number): Promise<void> {
-        await this.env.LINKS.put(key, (current + 1).toString(), { expirationTtl: CONSTANTS.EXPIRATION.RATE_LIMIT });
-    }
-
     async saveSession(userId: string, data: object): Promise<void> {
         await this.env.LINKS.put(`session:${userId}`, JSON.stringify(data), { expirationTtl: CONSTANTS.EXPIRATION.SESSION });
     }
@@ -51,10 +42,6 @@ export class KVService {
 
     async deletePlatformReverseAccount(platform: string, chatId: string): Promise<void> {
         await this.env.LINKS.delete(`connected_account:${platform}:${chatId}`);
-    }
-
-    async deleteConnectedAccount(userId: string): Promise<void> {
-        await this.env.LINKS.delete(`connected_account:${userId}`);
     }
 
     async saveTransferRequest(transferId: string, data: TransferRequest): Promise<void> {
