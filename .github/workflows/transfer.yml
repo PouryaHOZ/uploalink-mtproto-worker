@@ -59,7 +59,7 @@ on:
 jobs:
   transfer:
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # Increased for large files
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -79,46 +79,46 @@ jobs:
       - name: Install Node Dependencies
         run: npm install
 
-      - name: Create temp directory
-        run: mkdir -p temp_transfers
+      - name: Create RAM temp directory
+        run: mkdir -p /dev/shm/temp_transfers
 
       - name: Execute Transfer Script
-        run: node src/transfer.js
+        run: node transfer.js
         env:
-          # Telegram Configuration
+          # Telegram Secrets
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.chat_id || inputs.chat_id }}
+          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.TELEGRAM_CHAT_ID || github.event.client_payload.CHAT_ID || inputs.chat_id }}
 
           # Destination Accounts
           BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          BALE_CHAT_ID: ${{ github.event.client_payload.bale_chat_id || secrets.BALE_CHAT_ID }}
+          BALE_CHAT_ID: ${{ github.event.client_payload.BALE_CHAT_ID || secrets.BALE_CHAT_ID }}
           RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
-          RUBIKA_CHAT_ID: ${{ github.event.client_payload.rubika_chat_id || secrets.RUBIKA_CHAT_ID }}
+          RUBIKA_CHAT_ID: ${{ github.event.client_payload.RUBIKA_CHAT_ID || secrets.RUBIKA_CHAT_ID }}
 
-          # Transfer Parameters
-          MESSAGE_ID: ${{ github.event.client_payload.message_id || inputs.message_id }}
-          FILE_NAME: ${{ github.event.client_payload.file_name || inputs.file_name }}
-          FILE_SIZE: ${{ github.event.client_payload.file_size || inputs.file_size }}
-          IS_VIDEO: ${{ github.event.client_payload.is_video || inputs.is_video }}
-          MIME_TYPE: ${{ github.event.client_payload.mime_type || inputs.mime_type }}
-          FILE_ID: ${{ github.event.client_payload.file_id || inputs.file_id }}
-          DESTINATIONS: ${{ github.event.client_payload.destinations || inputs.destinations }}
-          SHOULD_COMPRESS: ${{ github.event.client_payload.should_compress || inputs.should_compress }}
-          ACCOUNT: ${{ github.event.client_payload.account || inputs.account }}
-          USER_ID: ${{ github.event.client_payload.user_id || inputs.user_id }}
-          USER_NAME: ${{ github.event.client_payload.user_name || inputs.user_name }}
+          # Payload Parameters (Matched strictly with UPPERCASE payloads from index.ts)
+          MESSAGE_ID: ${{ github.event.client_payload.MESSAGE_ID || inputs.message_id }}
+          FILE_NAME: ${{ github.event.client_payload.FILE_NAME || inputs.file_name }}
+          FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE || inputs.file_size }}
+          IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO || inputs.is_video }}
+          MIME_TYPE: ${{ github.event.client_payload.MIME_TYPE || inputs.mime_type }}
+          FILE_ID: ${{ github.event.client_payload.FILE_ID || inputs.file_id }}
+          DESTINATIONS: ${{ github.event.client_payload.DESTINATIONS || inputs.destinations }}
+          SHOULD_COMPRESS: ${{ github.event.client_payload.SHOULD_COMPRESS || inputs.should_compress }}
+          ACCOUNT: ${{ github.event.client_payload.ACCOUNT || inputs.account }}
+          USER_ID: ${{ github.event.client_payload.USER_ID || inputs.user_id }}
+          USER_NAME: ${{ github.event.client_payload.USER_NAME || inputs.user_name }}
+          PLATFORM: ${{ github.event.client_payload.PLATFORM || 'telegram' }}
 
-          # Cloudflare Callback (for KV updates)
-          CLOUDFLARE_WEBHOOK_URL: ${{ github.event.client_payload.cloudflare_webhook || inputs.cloudflare_webhook || secrets.CLOUDFLARE_WEBHOOK_URL }}
+          # Cloudflare Callbacks
+          CLOUDFLARE_WEBHOOK_URL: ${{ github.event.client_payload.CLOUDFLARE_WEBHOOK || inputs.cloudflare_webhook || secrets.CLOUDFLARE_WEBHOOK_URL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
-          # Performance Settings
-          DOWNLOAD_WORKERS: 32
-          DOWNLOAD_CHUNK_SIZE: 16777216
+          # Performance & RAM Disk Settings
+          DOWNLOAD_WORKERS: 14
+          DOWNLOAD_CHUNK_SIZE: 67108864
           UPLOAD_CHUNK_SIZE: 16777216
           MAX_RETRIES: 5
-          TEMP_DIR: ./temp_transfers
-          MAX_CONCURRENT_TRANSFERS: 5
+          TEMP_DIR: /dev/shm/temp_transfers
