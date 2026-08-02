@@ -23,14 +23,6 @@ on:
         description: 'Is Video File (true/false)'
         required: false
         default: 'false'
-      mime_type:
-        description: 'File MIME Type'
-        required: false
-        default: ''
-      file_id:
-        description: 'Telegram File ID'
-        required: false
-        default: ''
       destinations:
         description: 'Destinations (bale,rubika,both)'
         required: false
@@ -79,8 +71,6 @@ jobs:
           FILE_NAME: ${{ github.event.client_payload.FILE_NAME || inputs.file_name }}
           FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE || inputs.file_size }}
           IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO || inputs.is_video }}
-          MIME_TYPE: ${{ github.event.client_payload.MIME_TYPE || inputs.mime_type }}
-          FILE_ID: ${{ github.event.client_payload.FILE_ID || inputs.file_id }}
           DESTINATIONS: ${{ github.event.client_payload.DESTINATIONS || inputs.destinations }}
           SHOULD_COMPRESS: ${{ github.event.client_payload.SHOULD_COMPRESS || inputs.should_compress }}
 

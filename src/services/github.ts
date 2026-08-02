@@ -17,6 +17,7 @@ export async function triggerGitHubWorkflow(env: Env, kv: KVService, transferReq
         createdAt: Date.now()
     });
 
+    // Bundled payload: Exactly 9 properties inside client_payload (Strictly < 10)
     const payload = {
         event_type: 'forward_file',
         client_payload: {
@@ -25,8 +26,6 @@ export async function triggerGitHubWorkflow(env: Env, kv: KVService, transferReq
             FILE_NAME: transferRequest.fileName,
             FILE_SIZE: transferRequest.fileSize.toString(),
             IS_VIDEO: transferRequest.isVideo ? 'true' : 'false',
-            MIME_TYPE: transferRequest.mimeType || '',
-            FILE_ID: transferRequest.fileId || '',
             DESTINATIONS: (transferRequest.destinations || []).join(','),
             SHOULD_COMPRESS: transferRequest.shouldCompress ? 'true' : 'false',
             BALE_CHAT_ID: connectedAccounts?.baleChatId || '',
