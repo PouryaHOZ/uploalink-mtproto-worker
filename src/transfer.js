@@ -83,7 +83,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '0.5.3';
+const SYSTEM_VERSION = '0.5.2';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
