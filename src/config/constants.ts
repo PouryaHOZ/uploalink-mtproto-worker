@@ -1,6 +1,6 @@
-// نسخه جدید (v0.3.4): اصلاح کامل خروجی‌های فایل transfers.ts جهت برطرف ساختن خطای ساخت Cloudflare Wrangler
-export const SYSTEM_VERSION = '0.3.4';
-export const LAST_UPDATE_PERSIAN = 'اصلاح کامل خروجی‌های توابع createTransferRequest و processFileTransfer جهت رفع خطای کامپایل ورکر.';
+// نسخه جدید (v0.3.5): بازسازی فایل handlers/transfers.ts و صادرات توابع درخواست فایل
+export const SYSTEM_VERSION = '0.3.5';
+export const LAST_UPDATE_PERSIAN = 'بازسازی کامل توابع پردازش درخواست فایل و رفع خطای ناشناخته فایل‌های تعویض‌شده.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,

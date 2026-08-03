@@ -1,369 +1,44 @@
-const { TelegramClient } = require("telegram");
-const { StringSession } = require("telegram/sessions");
-const fs = require("fs");
-const path = require("path");
-const { spawn } = require("child_process");
-const Minio = require("minio");
+import { Env, TransferRequest, Platform } from '../types';
+import { KVService } from '../services/kv';
+import { Messenger } from '../platforms/messenger';
+import { formatBytes } from '../utils/helpers';
 
-const TEMP_DIR = fs.existsSync("/dev/shm") ? "/dev/shm/temp_transfers" : "./temp_transfers";
-const rawEndpoint = (process.env.MINIO_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-
-const config = {
-    telegram: {
-        apiId: parseInt(process.env.TELEGRAM_API_ID || '0'),
-        apiHash: process.env.TELEGRAM_API_HASH || '',
-        sessionString: process.env.TELEGRAM_SESSION_STRING || '',
-        botToken: process.env.TELEGRAM_BOT_TOKEN || '',
-        chatId: process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '',
-        baseUrl: process.env.TELEGRAM_BASE_URL || 'https://api.telegram.org'
-    },
-    minio: {
-        endPoint: rawEndpoint,
-        port: parseInt(process.env.MINIO_PORT || '443'),
-        useSSL: process.env.MINIO_USE_SSL !== 'false',
-        accessKey: process.env.MINIO_ACCESS_KEY || '',
-        secretKey: process.env.MINIO_SECRET_KEY || '',
-        bucketName: process.env.MINIO_BUCKET_NAME || 'transfers',
-        region: process.env.MINIO_REGION || 'us-east-1'
-    },
-    performance: { downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'), tempDir: TEMP_DIR },
-    cloudflare: { webhookUrl: process.env.CLOUDFLARE_WEBHOOK_URL || '', apiToken: process.env.CLOUDFLARE_API_TOKEN || '' },
-    transferId: process.env.TRANSFER_ID || ''
-};
-
-if (!fs.existsSync(config.performance.tempDir)) fs.mkdirSync(config.performance.tempDir, { recursive: true });
-
-const minioClient = new Minio.Client({
-    endPoint: config.minio.endPoint, port: config.minio.port, useSSL: config.minio.useSSL,
-    accessKey: config.minio.accessKey, secretKey: config.minio.secretKey, region: config.minio.region
-});
-
-class CancellationError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = "CancellationError";
-    }
+export function createTransferRequest(messageId: string, chatId: string, userId: string, rawMessage: any, platform: Platform): TransferRequest {
+    return {
+        messageId,
+        chatId,
+        fileName: rawMessage.document?.file_name || rawMessage.file?.file_name || `file_${messageId}_${Date.now()}`,
+        fileSize: rawMessage.document?.file_size || rawMessage.video?.file_size || rawMessage.file?.size || 0,
+        isVideo: !!rawMessage.document?.mime_type?.startsWith('video/') || !!rawMessage.video || !!rawMessage.file?.file_name?.endsWith('.mp4'),
+        mimeType: rawMessage.document?.mime_type || rawMessage.video?.mime_type || rawMessage.file?.mime_type,
+        userId,
+        platform
+    };
 }
 
-function formatBytes(bytes) {
-    if (!bytes || bytes === 0) return "۰ بایت";
-    const k = 1024, sizes = ["بایت", "کیلوبایت", "مگابایت", "گیگابایت"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
-}
+export async function processFileTransfer(env: Env, kv: KVService, messenger: Messenger, transferRequest: TransferRequest): Promise<void> {
+    const transferId = `TR${Date.now()}`;
+    await kv.saveTransferRequest(transferId, transferRequest);
 
-function escapeHtml(str) {
-    if (!str) return '';
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+    const inline_keyboard: any[][] = [];
 
-function drawProgressBar(percent, length = 12) {
-    const filled = Math.min(length, Math.max(0, Math.round((percent / 100) * length)));
-    return "█".repeat(filled) + "░".repeat(length - filled);
-}
+    if (transferRequest.isVideo) {
+        const messageText = `🎬 **دریافت ویدیو:** ${transferRequest.fileName}\n` +
+                            `📏 **حجم فایل:** ${formatBytes(transferRequest.fileSize)}\n\n` +
+                            `لطفاً کیفیت خروجی را انتخاب کنید:\n` +
+                            `🔹 **استاندارد:** حفظ ابعاد اصلی (تا سقف 720p) + بهینه‌سازی حجم\n` +
+                            `🔸 **سبک:** فشرده‌سازی بسیار بالا (تا سقف 480p) جهت دانلود سریع`;
 
-async function withRetry(operationName, operation, retries = 3, delay = 5000) {
-    for (let i = 1; i <= retries; i++) {
-        try {
-            return await operation();
-        } catch (err) {
-            if (i === retries) throw err;
-            console.warn(`[Retry] ${operationName} failed. Retrying (${i}/${retries}) in ${delay/1000}s... Error: ${err.message}`);
-            await new Promise(r => setTimeout(r, delay));
-        }
+        inline_keyboard.push([{ text: '🔹 ساخت لینک (استاندارد / 720p)', callback_data: `link_gen:no:${transferId}` }]);
+        inline_keyboard.push([{ text: '🔸 ساخت لینک (سبک / 480p)', callback_data: `link_gen:yes:${transferId}` }]);
+
+        await messenger.sendMessage(transferRequest.chatId, messageText, { inline_keyboard });
+    } else {
+        const messageText = `📁 **دریافت فایل:** ${transferRequest.fileName}\n` +
+                            `⚖️ **حجم:** ${formatBytes(transferRequest.fileSize)}\n\n` +
+                            `لطفاً عملیات مورد نظر را انتخاب کنید:`;
+
+        inline_keyboard.push([{ text: '🔗 ساخت لینک دانلود مستقیم', callback_data: `link_gen:no:${transferId}` }]);
+        await messenger.sendMessage(transferRequest.chatId, messageText, { inline_keyboard });
     }
 }
-
-class TelegramClientManager {
-    constructor() {
-        this.client = new TelegramClient(new StringSession(config.telegram.sessionString), config.telegram.apiId, config.telegram.apiHash, { connectionRetries: 5, useWSS: false });
-        this.isConnected = false;
-    }
-    async connect() { if (!this.isConnected) { await this.client.connect(); this.isConnected = true; } }
-    async disconnect() { if (this.isConnected) { await this.client.disconnect(); this.isConnected = false; } }
-}
-
-class FileTransferBot {
-    constructor() {
-        this.telegramClient = new TelegramClientManager();
-        this.statusMessageId = null;
-        this.isUpdatingStatus = false;
-        this.activeFFmpegProcess = null;
-        this.isCriticalSection = false;
-    }
-
-    async checkCancel() {
-        if (!config.cloudflare.webhookUrl || !config.transferId) return false;
-        try {
-            const baseUrl = config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '');
-            const res = await fetch(`${baseUrl}/check-cancel?transferId=${config.transferId}`, {
-                headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }
-            }).then(r => r.json());
-            return res.cancelled === true;
-        } catch {
-            return false;
-        }
-    }
-
-    async updateStatus(chatId, text, force = false, showCancelButton = true) {
-        if (!config.telegram.botToken || !chatId) return;
-        if (this.isUpdatingStatus && !force) return;
-        while (this.isUpdatingStatus) await new Promise(r => setTimeout(r, 100));
-        
-        this.isUpdatingStatus = true;
-        try {
-            const endpoint = this.statusMessageId ? 'editMessageText' : 'sendMessage';
-            const body = { 
-                chat_id: chatId, 
-                text: text, 
-                parse_mode: 'HTML', 
-                disable_web_page_preview: true 
-            };
-
-            // Attach Cancel button if not in critical section and operation is active
-            if (showCancelButton && !this.isCriticalSection && config.transferId) {
-                body.reply_markup = {
-                    inline_keyboard: [[{ text: '🛑 لغو انتقال', callback_data: `cancel_transfer:${config.transferId}` }]]
-                };
-            }
-
-            if (this.statusMessageId) body.message_id = this.statusMessageId;
-
-            const res = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/${endpoint}`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-            }).then(r => r.json());
-
-            if (res.ok && res.result) {
-                if (!this.statusMessageId) this.statusMessageId = res.result.message_id;
-            } else if (endpoint === 'editMessageText') {
-                delete body.message_id;
-                const fallbackRes = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/sendMessage`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-                }).then(r => r.json());
-                if (fallbackRes.ok && fallbackRes.result) this.statusMessageId = fallbackRes.result.message_id;
-            }
-        } catch (e) {
-            console.error("Failed to update status message:", e);
-        } finally {
-            this.isUpdatingStatus = false;
-        }
-    }
-
-    async manageStorage(requiredBytes) {
-        const bucket = config.minio.bucketName;
-        const MAX_STORAGE = 9.5 * 1024 * 1024 * 1024;
-        const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-        const now = Date.now();
-
-        await withRetry('Bucket Verification', async () => {
-            const exists = await minioClient.bucketExists(bucket).catch(() => false);
-            if (!exists) await minioClient.makeBucket(bucket, config.minio.region);
-        });
-
-        const objects = await withRetry('List Bucket Objects', () => {
-            return new Promise((resolve, reject) => {
-                const objs = [];
-                const stream = minioClient.listObjectsV2(bucket, '', true);
-                stream.on('data', obj => objs.push(obj));
-                stream.on('error', reject);
-                stream.on('end', () => resolve(objs));
-            });
-        });
-
-        let currentSize = 0;
-        const toDelete = [], keptObjects = [];
-
-        for (const obj of objects) {
-            if (now - new Date(obj.lastModified).getTime() > TWO_HOURS_MS) toDelete.push(obj.name);
-            else { currentSize += obj.size; keptObjects.push(obj); }
-        }
-
-        if (currentSize + requiredBytes > MAX_STORAGE) {
-            keptObjects.sort((a, b) => new Date(a.lastModified) - new Date(b.lastModified));
-            for (const obj of keptObjects) {
-                toDelete.push(obj.name);
-                currentSize -= obj.size;
-                if (currentSize + requiredBytes <= MAX_STORAGE) break;
-            }
-        }
-
-        if (toDelete.length > 0) {
-            await withRetry('Delete Old Objects', async () => {
-                await minioClient.removeObjects(bucket, toDelete);
-            });
-        }
-    }
-
-    runFFmpeg(args) {
-        return new Promise((resolve, reject) => {
-            this.activeFFmpegProcess = spawn('ffmpeg', args);
-            let errorLog = '';
-            this.activeFFmpegProcess.stderr.on('data', data => errorLog += data.toString());
-            this.activeFFmpegProcess.on('close', code => {
-                this.activeFFmpegProcess = null;
-                if (code === 0) resolve();
-                else reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/\n/g, ' ').trim()}`));
-            });
-            this.activeFFmpegProcess.on('error', err => {
-                this.activeFFmpegProcess = null;
-                reject(err);
-            });
-        });
-    }
-
-    async uploadToMinIO(filePath, fileName) {
-        const bucket = config.minio.bucketName;
-        const metaData = { 'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream' };
-        
-        await withRetry('MinIO File Upload', async () => {
-            await minioClient.fPutObject(bucket, fileName, filePath, metaData);
-        }, 3, 5000);
-
-        return await minioClient.presignedGetObject(bucket, fileName, 7200);
-    }
-
-    async start() {
-        const startTime = Date.now();
-        let downloadedFilePath = '', targetPath = '';
-        const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
-        const messageId = process.env.MESSAGE_ID || '0';
-        let fileName = process.env.FILE_NAME || `file_${Date.now()}`;
-        const fileSize = parseInt(process.env.FILE_SIZE || '0');
-        const isVideo = process.env.IS_VIDEO === 'true';
-        const shouldCompress = process.env.SHOULD_COMPRESS === 'true';
-
-        try {
-            await this.telegramClient.connect();
-            downloadedFilePath = path.join(config.performance.tempDir, fileName);
-            const client = this.telegramClient.client;
-
-            await this.updateStatus(chatId, `🚀 <b>عملیات آغاز شد</b>\n\n<code>[████░░░░░░] 40%</code>\n🔄 <b>سرور پردازش ابری متصل شد. در حال آزادسازی فضا...</b>`, true);
-            await this.manageStorage(fileSize);
-
-            const messages = await client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
-            if (!messages || !messages[0] || !messages[0].media) throw new Error("پیام یا فایل در تلگرام یافت نشد.");
-
-            const writeStream = fs.createWriteStream(downloadedFilePath, { highWaterMark: 4 * 1024 * 1024 });
-            let lastProgressUpdate = 0;
-            let lastCancelCheck = 0;
-
-            await client.downloadMedia(messages[0].media, {
-                outputFile: writeStream,
-                workers: config.performance.downloadWorkers,
-                progressCallback: async (downloaded, total) => {
-                    const now = Date.now();
-
-                    // Check cancellation every 3 seconds during download
-                    if (now - lastCancelCheck >= 3000) {
-                        lastCancelCheck = now;
-                        if (await this.checkCancel()) {
-                            writeStream.destroy();
-                            throw new CancellationError("انتقال توسط کاربر لغو شد.");
-                        }
-                    }
-
-                    if (now - lastProgressUpdate >= 4000 || downloaded === total) {
-                        lastProgressUpdate = now;
-                        const percent = total ? Math.floor((downloaded / total) * 100) : 0;
-                        this.updateStatus(chatId, `📥 <b>در حال دانلود از تلگرام...</b>\n\n<code>[██████░░░░] 60%</code>\n${drawProgressBar(percent)} <b>${percent}%</b>\n📊 <b>حجم:</b> ${formatBytes(downloaded)} / ${formatBytes(total)}`, false).catch(() => {});
-                    }
-                }
-            });
-
-            targetPath = downloadedFilePath;
-
-            if (isVideo) {
-                if (await this.checkCancel()) throw new CancellationError("انتقال توسط کاربر لغو شد.");
-
-                await this.updateStatus(chatId, `⚙️ <b>در حال پردازش و بهینه‌سازی ویدیو...</b>\n\n<code>[████████░░] 80%</code>\n(این مرحله بسته به حجم ویدیو ممکن است طول بکشد)`, true);
-                
-                fileName = `${path.parse(fileName).name}.mp4`;
-                const processedPath = path.join(config.performance.tempDir, `processed_${Date.now()}.mp4`);
-                
-                // Monitor cancellation during FFmpeg execution
-                const cancelCheckInterval = setInterval(async () => {
-                    if (await this.checkCancel()) {
-                        if (this.activeFFmpegProcess) {
-                            console.log("Killing FFmpeg due to cancellation request...");
-                            this.activeFFmpegProcess.kill('SIGKILL');
-                        }
-                    }
-                }, 2000);
-
-                try {
-                    const maxDim = shouldCompress ? 854 : 1280;
-                    const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
-                    const crfValue = shouldCompress ? '28' : '23';
-                    const audioBitrate = shouldCompress ? '64k' : '128k';
-
-                    await this.runFFmpeg([
-                        '-i', downloadedFilePath,
-                        '-threads', '0',
-                        '-c:v', 'libx264',
-                        '-crf', crfValue,
-                        '-preset', 'veryfast',
-                        '-vf', scaleFilter,
-                        '-c:a', 'aac',
-                        '-b:a', audioBitrate,
-                        '-movflags', '+faststart',
-                        '-y', processedPath
-                    ]);
-                    targetPath = processedPath;
-                } catch (ffmpegErr) {
-                    if (await this.checkCancel()) throw new CancellationError("انتقال توسط کاربر لغو شد.");
-                    throw new Error(`مشکل در ساختار فایل ویدیو.\n\nجزئیات فنی: ${ffmpegErr.message}`);
-                } finally {
-                    clearInterval(cancelCheckInterval);
-                }
-            }
-
-            // CRITICAL SECTION ENTRANCE
-            if (await this.checkCancel()) throw new CancellationError("انتقال توسط کاربر لغو شد.");
-            this.isCriticalSection = true;
-
-            const actualSize = (await fs.promises.stat(targetPath)).size;
-            await this.updateStatus(chatId, `☁️ <b>در حال ذخیره در فضای ابری...</b>\n\n<code>[█████████░] 90%</code>\n📤 <b>آپلود در حال انجام است (غیرقابل لغو).</b>`, true, false);
-            
-            const downloadLink = await this.uploadToMinIO(targetPath, fileName);
-            const elapsedTime = Math.round((Date.now() - startTime) / 1000);
-            
-            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n📏 <b>حجم:</b> ${formatBytes(actualSize)}\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت منقضی و فایل به صورت خودکار حذف می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
-
-            await this.updateStatus(chatId, successMsg, true, false);
-            await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'completed' });
-
-        } catch (err) {
-            if (err instanceof CancellationError) {
-                console.log("🛑 Transfer Cancelled By User.");
-                await this.updateStatus(chatId, `🛑 <b>فرآیند انتقال بنا به درخواست شما لغو گردید.</b>`, true, false);
-                await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'cancelled', retryable: false });
-            } else {
-                console.error("❌ Transfer Execution Error:", err);
-                const isNetworkError = err.message.includes('TCPFull') || err.message.includes('fetch') || err.message.includes('ECONNRESET') || err.message.includes('Timeout');
-                await this.updateStatus(chatId, `❌ <b>خطا در انجام عملیات:</b>\n<code>${escapeHtml(err.message)}</code>${isNetworkError ? '\n\n🔄 در حال بازگشت به صف برای تلاش مجدد...' : ''}`, true, false);
-                await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'failed', error: err.message, retryable: isNetworkError });
-            }
-        } finally {
-            if (downloadedFilePath) await this.cleanupFile(downloadedFilePath);
-            if (targetPath && targetPath !== downloadedFilePath) await this.cleanupFile(targetPath);
-            await this.telegramClient.disconnect();
-            process.exit(0);
-        }
-    }
-
-    async cleanupFile(filePath) {
-        try { if (fs.existsSync(filePath)) await fs.promises.unlink(filePath); } catch (e) { }
-    }
-
-    async notifyCloudflare(payload) {
-        if (!config.cloudflare.webhookUrl) return;
-        try {
-            await fetch(config.cloudflare.webhookUrl, {
-                method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.cloudflare.apiToken}` },
-                body: JSON.stringify(payload)
-            });
-        } catch (error) { }
-    }
-}
-
-new FileTransferBot().start();
