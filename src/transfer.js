@@ -74,6 +74,9 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
+// نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
+const SYSTEM_VERSION = '0.3.6';
+
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
     const stageBar = drawProgressBar(stagePercent, 10);

@@ -1,6 +1,6 @@
-// نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION در transfer.js
+// نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
 export const SYSTEM_VERSION = '0.3.6';
-export const LAST_UPDATE_PERSIAN = 'حذف تعریف تکراری متغیر نسخه سیستم در فایل اجرای اکپش‌های گیت‌هاب.';
+export const LAST_UPDATE_PERSIAN = 'رفع خطای SyntaxError ناشی از تعریف تکراری نسخه سیستم و پاک‌سازی فایل transfer.js.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
