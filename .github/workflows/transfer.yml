@@ -19,10 +19,24 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install FFmpeg via APT
+      - name: Cache FFmpeg Binary
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/ffmpeg
+          key: ffmpeg-binary-v1
+
+      - name: Download FFmpeg (if cache miss)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          mkdir -p ~/.local/bin
+          curl -sL https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-linux-64.zip -o /tmp/ffmpeg.zip
+          unzip -q /tmp/ffmpeg.zip -d ~/.local/bin
+          chmod +x ~/.local/bin/ffmpeg
+          rm /tmp/ffmpeg.zip
+
+      - name: Add FFmpeg to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Install Node Dependencies
         run: npm ci --prefer-offline --no-audit
