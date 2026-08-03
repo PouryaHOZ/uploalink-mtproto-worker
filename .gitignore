@@ -165,3 +165,7 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# utilities and dumps
+dump_code.py
+src_code_dump.txt

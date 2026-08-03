@@ -181,55 +181,28 @@ export default {
         const parts = data.split(':');
         const action = parts[0];
 
-        if (action === 'dest') {
-            const destChoice = parts[1];
-            const transferId = parts[2];
-            const transferReq = await kv.getTransferRequest(transferId);
-
-            if (transferReq) {
-                transferReq.destinations = destChoice === 'both' ? ['bale', 'rubika'] : [destChoice as any];
-                await kv.saveTransferRequest(transferId, transferReq);
-
-                if (transferReq.isVideo) {
-                    const est = calculateEstimates(transferReq.fileSize, true, transferReq.destinations);
-                    const promptText = `🎬 **تنظیمات ویدیو پیش از ارسال:**\n\n` +
-                                       `📁 **نام فایل:** ${transferReq.fileName}\n` +
-                                       `📏 **حجم اصلی:** ${est.originalSizeFormatted}\n` +
-                                       `⚡ **حجم تقریبی فشرده (480p):** ${est.compressedSizeFormatted} (${est.reductionPercentage} کاهش)\n\n` +
-                                       `لطفاً وضعیت فشرده‌سازی را انتخاب کنید:`;
-                    
-                    // Replace the message and inject the new compression options
-                    await messenger.editMessageText(chatId, messageId, promptText, {
-                        inline_keyboard: [
-                            [{ text: `⚡ فشرده‌سازی [~${est.compressedTimeFormatted}]`, callback_data: `comp:yes:${transferId}` }],
-                            [{ text: `📁 کیفیت اصلی [~${est.uncompressedTimeFormatted}]`, callback_data: `comp:no:${transferId}` }]
-                        ]
-                    });
-                } else {
-                    await triggerGitHubWorkflow(env, kv, { ...transferReq, shouldCompress: false });
-                    // Edit message to strictly text, which deletes the inline keyboard
-                    await messenger.editMessageText(chatId, messageId, `✅ **مقصد ثبت شد. پردازش و انتقال فایل آغاز شد.**`);
-                }
-            } else {
-                await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست انتقال یافت نشد یا منقضی شده است.`);
-            }
-            await messenger.answerCallbackQuery(query.id, 'مقصد ثبت شد.');
+        // 1. Handle Disabled Buttons
+        if (action === 'disabled') {
+            // Sends a popup alert instead of sending a message
+            await messenger.answerCallbackQuery(query.id, '❌ این بخش فعلاً غیرفعال است و فایل‌ها فقط در فضای ابری آپلود می‌شوند.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        if (action === 'comp') {
+        // 2. Handle New Link Generation Logic
+        if (action === 'link_gen') {
             const shouldCompress = parts[1] === 'yes';
             const transferId = parts[2];
             const transferReq = await kv.getTransferRequest(transferId);
 
             if (transferReq) {
+                transferReq.destinations = []; // Empty destinations
                 await triggerGitHubWorkflow(env, kv, { ...transferReq, shouldCompress });
-                // Replace message and clear inline keyboard
-                await messenger.editMessageText(chatId, messageId, `🚀 **تنظیمات اعمال شد. پردازش و انتقال آغاز شد.**`);
+                
+                await messenger.editMessageText(chatId, messageId, `✅ **درخواست آپلود ثبت شد.**\n🚀 پردازش فایل آغاز شد. لینک دانلود به‌زودی ارسال می‌شود...`);
             } else {
                 await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست انتقال یافت نشد یا منقضی شده است.`);
             }
-            await messenger.answerCallbackQuery(query.id, 'تنظیمات اعمال شد.');
+            await messenger.answerCallbackQuery(query.id, 'در حال پردازش...');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 

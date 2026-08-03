@@ -18,73 +18,37 @@ export function createTransferRequest(messageId: string, chatId: string, userId:
 }
 
 export async function processFileTransfer(env: Env, kv: KVService, messenger: Messenger, transferRequest: TransferRequest): Promise<void> {
-    const userConnectedAccounts = await kv.getConnectedAccount(transferRequest.userId || '');
+    const transferId = `TR${Date.now()}`;
+    await kv.saveTransferRequest(transferId, transferRequest);
 
-    // Verify connections
-    const availableDestinations: ('bale' | 'rubika')[] = [];
-    if (userConnectedAccounts?.rubikaChatId) availableDestinations.push('rubika');
-    if (userConnectedAccounts?.baleChatId) availableDestinations.push('bale');
+    // Create the base inline keyboard with disabled Bale and Rubika buttons
+    const inline_keyboard: any[][] = [
+        [
+            { text: '📌 بله (غیرفعال)', callback_data: `disabled:bale` },
+            { text: '📌 روبیکا (غیرفعال)', callback_data: `disabled:rubika` }
+        ]
+    ];
 
-    if (availableDestinations.length === 0) {
-        await messenger.sendMessage(
-            transferRequest.chatId,
-            `❌ **خطای عدم اتصال:**\nشما به هیچ پلتفرمی (روبیکا یا بله) متصل نیستید.\nلطفاً ابتدا با ارسال دستور /link حساب خود را متصل کنید.`
-        );
-        return;
-    }
-
-    // STEP 1: Destination Selection
-    if (!transferRequest.destinations || transferRequest.destinations.length === 0) {
-        if (availableDestinations.length === 1) {
-            // Auto-select single destination
-            transferRequest.destinations = availableDestinations;
-            const destName = availableDestinations[0] === 'rubika' ? 'روبیکا' : 'بله';
-            await messenger.sendMessage(transferRequest.chatId, `📡 **ارسال خودکار به ${destName}...**`);
-        } else {
-            // Prompt for multi-destination pick
-            const transferId = `TR${Date.now()}`;
-            await kv.saveTransferRequest(transferId, transferRequest);
-
-            await messenger.sendMessage(
-                transferRequest.chatId,
-                `📡 **فایل دریافتی:** ${transferRequest.fileName}\n` +
-                `⚖️ **حجم:** ${formatBytes(transferRequest.fileSize)}\n\n` +
-                `لطفاً مقصد ارسال فایل را انتخاب کنید:`,
-                {
-                    inline_keyboard: [
-                        [{ text: '📌 بله', callback_data: `dest:bale:${transferId}` },
-                         { text: '📌 روبیکا', callback_data: `dest:rubika:${transferId}` }],
-                        [{ text: '🌐 ارسال به هر دو پلتفرم', callback_data: `dest:both:${transferId}` }]
-                    ]
-                }
-            );
-            return;
-        }
-    }
-
-    // STEP 2: Compression Check for Videos
     if (transferRequest.isVideo) {
-        const transferId = `TR${Date.now()}`;
-        await kv.saveTransferRequest(transferId, transferRequest);
+        // Empty array [] because we aren't uploading to Bale/Rubika anymore, just MinIO
+        const est = calculateEstimates(transferRequest.fileSize, true, []);
 
-        const est = calculateEstimates(transferRequest.fileSize, true, transferRequest.destinations);
-
-        const messageText = `🎬 **تنظیمات ویدیو پیش از ارسال:**\n\n` +
-                            `📁 **نام فایل:** ${transferRequest.fileName}\n` +
+        const messageText = `🎬 **دریافت ویدیو:** ${transferRequest.fileName}\n` +
                             `📏 **حجم اصلی:** ${est.originalSizeFormatted}\n` +
-                            `⚡ **حجم تقریبی فشرده (480p):** ${est.compressedSizeFormatted} (${est.reductionPercentage} کاهش)\n\n` +
-                            `لطفاً وضعیت فشرده‌سازی را انتخاب کنید:`;
+                            `⚡ **حجم فشرده (تخمینی 480p):** ${est.compressedSizeFormatted} (${est.reductionPercentage} کاهش)\n\n` +
+                            `لطفاً عملیات مورد نظر را انتخاب کنید:`;
 
-        await messenger.sendMessage(transferRequest.chatId, messageText, {
-            inline_keyboard: [
-                [{ text: `⚡ فشرده‌سازی [~${est.compressedTimeFormatted}]`, callback_data: `comp:yes:${transferId}` }],
-                [{ text: `📁 کیفیت اصلی [~${est.uncompressedTimeFormatted}]`, callback_data: `comp:no:${transferId}` }]
-            ]
-        });
-        return;
+        inline_keyboard.push([{ text: '🔗 ساخت لینک دانلود مستقیم', callback_data: `link_gen:no:${transferId}` }]);
+        inline_keyboard.push([{ text: '🗜 ساخت لینک دانلود + فشرده‌سازی 480p', callback_data: `link_gen:yes:${transferId}` }]);
+
+        await messenger.sendMessage(transferRequest.chatId, messageText, { inline_keyboard });
+    } else {
+        const messageText = `📁 **دریافت فایل:** ${transferRequest.fileName}\n` +
+                            `⚖️ **حجم:** ${formatBytes(transferRequest.fileSize)}\n\n` +
+                            `لطفاً عملیات مورد نظر را انتخاب کنید:`;
+
+        inline_keyboard.push([{ text: '🔗 ساخت لینک دانلود مستقیم', callback_data: `link_gen:no:${transferId}` }]);
+
+        await messenger.sendMessage(transferRequest.chatId, messageText, { inline_keyboard });
     }
-
-    // For Non-Video files, trigger workflow immediately
-    await triggerGitHubWorkflow(env, kv, { ...transferRequest, shouldCompress: false });
-    await messenger.sendMessage(transferRequest.chatId, `🚀 **پردازش و انتقال فایل آغاز شد.**`);
 }
