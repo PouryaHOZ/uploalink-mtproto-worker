@@ -23,10 +23,6 @@ on:
         description: 'Is Video File (true/false)'
         required: false
         default: 'false'
-      destinations:
-        description: 'Destinations (bale,rubika,both)'
-        required: false
-        default: 'both'
       should_compress:
         description: 'Should Compress Video (true/false)'
         required: false
@@ -67,22 +63,21 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ github.event.client_payload.CHAT_ID || inputs.chat_id }}
 
-          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          BALE_CHAT_ID: ${{ github.event.client_payload.BALE_CHAT_ID || secrets.BALE_CHAT_ID }}
-          RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
-          RUBIKA_CHAT_ID: ${{ github.event.client_payload.RUBIKA_CHAT_ID || secrets.RUBIKA_CHAT_ID }}
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          MINIO_BUCKET_NAME: ${{ secrets.MINIO_BUCKET_NAME }}
+          MINIO_PORT: ${{ secrets.MINIO_PORT }}
+          MINIO_USE_SSL: ${{ secrets.MINIO_USE_SSL }}
 
           MESSAGE_ID: ${{ github.event.client_payload.MESSAGE_ID || inputs.message_id }}
           FILE_NAME: ${{ github.event.client_payload.FILE_NAME || inputs.file_name }}
           FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE || inputs.file_size }}
           IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO || inputs.is_video }}
-          DESTINATIONS: ${{ github.event.client_payload.DESTINATIONS || inputs.destinations }}
           SHOULD_COMPRESS: ${{ github.event.client_payload.SHOULD_COMPRESS || inputs.should_compress }}
 
           CLOUDFLARE_WEBHOOK_URL: ${{ secrets.CLOUDFLARE_WEBHOOK_URL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
-          DOWNLOAD_WORKERS: 14
-          DOWNLOAD_CHUNK_SIZE: 67108864
-          UPLOAD_CHUNK_SIZE: 16777216
+          DOWNLOAD_WORKERS: 8
           TEMP_DIR: /dev/shm/temp_transfers

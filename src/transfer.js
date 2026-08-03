@@ -2,11 +2,13 @@ const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const fs = require("fs");
 const path = require("path");
-const https = require("https");
 const { spawn } = require("child_process");
-const FormData = require("form-data");
+const Minio = require("minio");
 
 const TEMP_DIR = fs.existsSync("/dev/shm") ? "/dev/shm/temp_transfers" : "./temp_transfers";
+
+// Clean endpoint formatting in case https:// was pasted
+const rawEndpoint = (process.env.MINIO_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
 
 const config = {
     telegram: {
@@ -17,20 +19,17 @@ const config = {
         chatId: process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '',
         baseUrl: process.env.TELEGRAM_BASE_URL || 'https://api.telegram.org'
     },
-    bale: process.env.BALE_BOT_TOKEN && process.env.BALE_CHAT_ID ? {
-        botToken: process.env.BALE_BOT_TOKEN,
-        chatId: process.env.BALE_CHAT_ID,
-        baseUrl: process.env.BALE_BASE_URL || 'https://tapi.bale.ai'
-    } : null,
-    rubika: process.env.RUBIKA_BOT_TOKEN && process.env.RUBIKA_CHAT_ID ? {
-        botToken: process.env.RUBIKA_BOT_TOKEN,
-        chatId: process.env.RUBIKA_CHAT_ID,
-        baseUrl: process.env.RUBIKA_BASE_URL || "https://botapi.rubika.ir/v3/"
-    } : null,
+    minio: {
+        endPoint: rawEndpoint,
+        port: parseInt(process.env.MINIO_PORT || '443'),
+        useSSL: process.env.MINIO_USE_SSL !== 'false',
+        accessKey: process.env.MINIO_ACCESS_KEY || '',
+        secretKey: process.env.MINIO_SECRET_KEY || '',
+        bucketName: process.env.MINIO_BUCKET_NAME || 'transfers',
+        region: process.env.MINIO_REGION || 'us-east-1'
+    },
     performance: {
-        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '14'),
-        downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '67108864'),
-        uploadChunkSize: parseInt(process.env.UPLOAD_CHUNK_SIZE || '16777216'),
+        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'),
         tempDir: TEMP_DIR
     },
     cloudflare: {
@@ -42,6 +41,16 @@ const config = {
 if (!fs.existsSync(config.performance.tempDir)) {
     fs.mkdirSync(config.performance.tempDir, { recursive: true });
 }
+
+// Initialize MinIO Client
+const minioClient = new Minio.Client({
+    endPoint: config.minio.endPoint,
+    port: config.minio.port,
+    useSSL: config.minio.useSSL,
+    accessKey: config.minio.accessKey,
+    secretKey: config.minio.secretKey,
+    region: config.minio.region
+});
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return "۰ بایت";
@@ -59,23 +68,9 @@ function formatSpeed(bytesPerSecond) {
     return parseFloat((bytesPerSecond / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
 
-function drawProgressBar(percent, length = 10) {
+function drawProgressBar(percent, length = 12) {
     const filled = Math.min(length, Math.max(0, Math.round((percent / 100) * length)));
     return "█".repeat(filled) + "░".repeat(length - filled);
-}
-
-async function updateTelegramStatus(chatId, text) {
-    if (!config.telegram.botToken || !chatId) return;
-    try {
-        const url = `https://api.telegram.org/bot${config.telegram.botToken}/sendMessage`;
-        await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
-        });
-    } catch (e) {
-        console.error("Failed to update status message:", e);
-    }
 }
 
 class TelegramClientManager {
@@ -86,7 +81,6 @@ class TelegramClientManager {
             config.telegram.apiHash,
             {
                 connectionRetries: 5,
-                downloadWorkers: config.performance.downloadWorkers,
                 useWSS: false
             }
         );
@@ -111,6 +105,40 @@ class TelegramClientManager {
 class FileTransferBot {
     constructor() {
         this.telegramClient = new TelegramClientManager();
+        this.statusMessageId = null;
+        this.isUpdatingStatus = false;
+    }
+
+    async updateStatus(chatId, text) {
+        if (!config.telegram.botToken || !chatId || this.isUpdatingStatus) return;
+        this.isUpdatingStatus = true;
+        
+        try {
+            const endpoint = this.statusMessageId ? 'editMessageText' : 'sendMessage';
+            const body = {
+                chat_id: chatId,
+                text: text,
+                parse_mode: 'Markdown'
+            };
+
+            if (this.statusMessageId) {
+                body.message_id = this.statusMessageId;
+            }
+
+            const res = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/${endpoint}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            }).then(r => r.json());
+
+            if (res.ok && !this.statusMessageId) {
+                this.statusMessageId = res.result.message_id;
+            }
+        } catch (e) {
+            console.error("Failed to update status message:", e);
+        } finally {
+            this.isUpdatingStatus = false;
+        }
     }
 
     runFFmpeg(args) {
@@ -135,27 +163,48 @@ class FileTransferBot {
         });
     }
 
+    async uploadToMinIO(filePath, fileName) {
+        const bucket = config.minio.bucketName;
+
+        // Ensure bucket exists
+        const exists = await minioClient.bucketExists(bucket).catch(() => false);
+        if (!exists) {
+            await minioClient.makeBucket(bucket, config.minio.region);
+        }
+
+        const metaData = {
+            'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream'
+        };
+
+        // Stream file directly using MinIO's fPutObject
+        await minioClient.fPutObject(bucket, fileName, filePath, metaData);
+
+        // Generate a Pre-signed Download URL valid for 7 days (604800 seconds)
+        const expirySeconds = 7 * 24 * 60 * 60;
+        const presignedUrl = await minioClient.presignedGetObject(bucket, fileName, expirySeconds);
+
+        return presignedUrl;
+    }
+
     async start() {
         const startTime = Date.now();
         let downloadedFilePath = '';
         let targetPath = '';
+        const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
 
         try {
             await this.telegramClient.connect();
 
             const messageId = process.env.MESSAGE_ID || '0';
-            const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
             let fileName = process.env.FILE_NAME || `file_${Date.now()}`;
             const fileSize = parseInt(process.env.FILE_SIZE || '0');
             const isVideo = process.env.IS_VIDEO === 'true';
-            const rawDestinations = process.env.DESTINATIONS || '';
-            const destinations = rawDestinations ? rawDestinations.split(',') : ['bale', 'rubika'];
             const shouldCompress = process.env.SHOULD_COMPRESS === 'true';
 
             downloadedFilePath = path.join(config.performance.tempDir, fileName);
             const client = this.telegramClient.client;
 
-            await updateTelegramStatus(chatId, `🚀 **انتقال آغاز شد!**\n\n📥 **در حال دریافت فایل از تلگرام...**`);
+            await this.updateStatus(chatId, `🚀 **انتقال آغاز شد!**\n\n📥 **در حال برقراری ارتباط با سرور...**`);
 
             const messages = await client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
             if (!messages || !messages[0] || !messages[0].media) {
@@ -163,8 +212,9 @@ class FileTransferBot {
             }
 
             console.log(`[Start] Downloading message ${messageId} (${fileName})...`);
+            
             const writeStream = fs.createWriteStream(downloadedFilePath, {
-                highWaterMark: config.performance.downloadChunkSize
+                highWaterMark: 4 * 1024 * 1024 
             });
 
             let lastProgressUpdate = 0;
@@ -172,7 +222,7 @@ class FileTransferBot {
             await client.downloadMedia(messages[0].media, {
                 outputFile: writeStream,
                 workers: config.performance.downloadWorkers,
-                progressCallback: async (downloaded, total) => {
+                progressCallback: (downloaded, total) => {
                     const now = Date.now();
                     if (now - lastProgressUpdate >= 4000 || downloaded === total) {
                         lastProgressUpdate = now;
@@ -186,7 +236,7 @@ class FileTransferBot {
                                             `📊 **حجم:** ${formatBytes(downloaded)} / ${formatBytes(total)}\n` +
                                             `⚡ **سرعت:** ${formatSpeed(speed)}`;
 
-                        await updateTelegramStatus(chatId, progressMsg);
+                        this.updateStatus(chatId, progressMsg).catch(() => {});
                     }
                 }
             });
@@ -200,7 +250,7 @@ class FileTransferBot {
 
                 try {
                     if (shouldCompress) {
-                        await updateTelegramStatus(chatId, `⚙️ **در حال فشرده‌سازی ویدیو به کیفیت 480p...**`);
+                        await this.updateStatus(chatId, `⚙️ **در حال فشرده‌سازی ویدیو به کیفیت 480p...**`);
                         await this.runFFmpeg([
                             '-i', downloadedFilePath,
                             '-threads', '0',
@@ -214,7 +264,7 @@ class FileTransferBot {
                             '-y', processedPath
                         ]);
                     } else {
-                        await updateTelegramStatus(chatId, `⚙️ **در حال همگام‌سازی فرمت ویدیو برای پخش مستقیم...**`);
+                        await this.updateStatus(chatId, `⚙️ **در حال همگام‌سازی فرمت ویدیو برای پخش مستقیم...**`);
                         await this.runFFmpeg([
                             '-i', downloadedFilePath,
                             '-c', 'copy',
@@ -224,38 +274,32 @@ class FileTransferBot {
                     }
                     targetPath = processedPath;
                 } catch (ffmpegErr) {
-                    throw new Error(`فرمت این ویدیو پشتیبانی نمی‌شود یا فایل آسیب دیده است.\nلطفاً یک فایل استاندارد انتخاب کنید.\n\nجزئیات فنی: ${ffmpegErr.message}`);
+                    throw new Error(`فرمت این ویدیو پشتیبانی نمی‌شود یا فایل آسیب دیده است.\n\nجزئیات فنی: ${ffmpegErr.message}`);
                 }
             }
 
             const stats = await fs.promises.stat(targetPath);
             const actualSize = stats.size;
-            const caption = messages[0].text || messages[0].caption || "";
 
-            if (destinations.includes('bale') && config.bale) {
-                await updateTelegramStatus(chatId, `📤 **در حال ارسال به بله...**`);
-                await this.uploadToBale(targetPath, isVideo, fileName, caption, actualSize);
-            }
-
-            if (destinations.includes('rubika') && config.rubika) {
-                await updateTelegramStatus(chatId, `📤 **در حال ارسال به روبیکا...**`);
-                await this.uploadToRubikaAsDocument(targetPath, fileName, caption, actualSize);
-            }
+            // Upload to MinIO Host
+            await this.updateStatus(chatId, `☁️ **در حال آپلود فایل در هاست MinIO...**`);
+            const downloadLink = await this.uploadToMinIO(targetPath, fileName);
 
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
             const successMsg = `✅ **انتقال با موفقیت کامل شد!**\n\n` +
-                               `📁 **فایل:** ${fileName}\n` +
+                               `📁 **نام فایل:** \`${fileName}\`\n` +
                                `📏 **حجم نهایی:** ${formatBytes(actualSize)}\n` +
-                               `⏱️ **زمان کل:** ${elapsedTime} ثانیه`;
+                               `⏱️ **زمان کل:** ${elapsedTime} ثانیه\n\n` +
+                               `🔗 **لینک دانلود مستقیم (اعتبار ۷ روز):**\n${downloadLink}`;
 
-            await updateTelegramStatus(chatId, successMsg);
+            await this.updateStatus(chatId, successMsg);
 
             await this.notifyCloudflare({
                 event: 'transfer_completed',
                 fileId: messageId,
+                downloadLink,
                 originalSize: fileSize || actualSize,
                 compressed: shouldCompress,
-                destinations,
                 elapsedTime
             });
 
@@ -266,9 +310,7 @@ class FileTransferBot {
 
         } catch (err) {
             console.error("❌ Transfer Execution Error:", err);
-
-            const processChatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
-            await updateTelegramStatus(processChatId, `❌ **خطا در انجام انتقال:**\n\`${err.message || String(err)}\``);
+            await this.updateStatus(chatId, `❌ **خطا در انجام انتقال:**\n\`${err.message || String(err)}\``);
 
             await this.notifyCloudflare({
                 event: 'transfer_error',
@@ -281,190 +323,6 @@ class FileTransferBot {
             await this.telegramClient.disconnect();
             process.exit(1);
         }
-    }
-
-    async uploadToBale(filePath, isVideo, fileName, caption, fileSize) {
-        const BALE_MAX_BYTES = 19.5 * 1024 * 1024;
-
-        if (fileSize > BALE_MAX_BYTES && isVideo) {
-            const parts = await this.splitVideoPlayableSegments(filePath, BALE_MAX_BYTES);
-
-            for (let i = 0; i < parts.length; i++) {
-                const partPath = parts[i];
-                const partFileName = `part_${i + 1}_${fileName}`;
-                const partCaption = `پارت ${i + 1} از ${parts.length}\n${caption}`;
-
-                await this.sendBaleSingle(partPath, true, partFileName, partCaption);
-                await this.cleanupFile(partPath);
-            }
-        } else {
-            await this.sendBaleSingle(filePath, isVideo, fileName, caption);
-        }
-    }
-
-    sendBaleSingle(filePath, isVideo, fileName, caption) {
-        return new Promise(async (resolve, reject) => {
-            try {
-                const stats = await fs.promises.stat(filePath);
-                const formData = new FormData();
-                formData.append('chat_id', config.bale.chatId);
-                if (caption) formData.append('caption', caption);
-
-                const fileStream = fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize });
-                formData.append(isVideo ? 'video' : 'document', fileStream, {
-                    filename: fileName,
-                    knownLength: stats.size
-                });
-
-                const endpoint = isVideo ? 'sendVideo' : 'sendDocument';
-                const req = https.request({
-                    hostname: 'tapi.bale.ai',
-                    path: `/bot${config.bale.botToken}/${endpoint}`,
-                    method: 'POST',
-                    headers: formData.getHeaders()
-                }, (res) => {
-                    let resData = '';
-                    res.on('data', chunk => resData += chunk);
-                    res.on('end', () => {
-                        if (res.statusCode >= 200 && res.statusCode < 300) {
-                            resolve();
-                        } else {
-                            reject(new Error(`Bale HTTP ${res.statusCode}: ${resData}`));
-                        }
-                    });
-                });
-
-                req.on('error', err => reject(err));
-                formData.pipe(req);
-            } catch (e) { reject(e); }
-        });
-    }
-
-    async uploadToRubikaAsDocument(filePath, fileName, caption, fileSize) {
-        const rubikaBaseUrl = config.rubika.baseUrl || 'https://botapi.rubika.ir/v3/';
-
-        const uploadInfo = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/requestSendFile`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'File' })
-        }).then(r => r.json());
-
-        const uploadUrl = uploadInfo?.data?.upload_url || uploadInfo?.upload_url;
-
-        if (!uploadUrl) {
-            throw new Error(`Rubika requestSendFile failed: ${JSON.stringify(uploadInfo)}`);
-        }
-
-        const formData = new FormData();
-        formData.append('file', fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize }), {
-            filename: fileName,
-            knownLength: fileSize
-        });
-
-        const uploadResult = await new Promise((resolve, reject) => {
-            const parsedUrl = new URL(uploadUrl);
-            const req = https.request({
-                hostname: parsedUrl.hostname,
-                port: parsedUrl.port || 443,
-                path: parsedUrl.pathname + parsedUrl.search,
-                method: 'POST',
-                headers: formData.getHeaders(),
-                timeout: 300000 
-            }, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`Failed to parse Rubika response: ${data}`)); }
-                });
-            });
-
-            req.on('timeout', () => {
-                req.destroy();
-                reject(new Error("زمان آپلود در سرور روبیکا به پایان رسید. (Timeout)"));
-            });
-
-            req.on('error', err => reject(err));
-            formData.pipe(req);
-        });
-
-        const fileId = uploadResult?.data?.file_id || uploadResult?.file_id;
-
-        if (!fileId) {
-            throw new Error(`Rubika binary upload failed: ${JSON.stringify(uploadResult)}`);
-        }
-
-        const sendResponse = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/sendFile`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: config.rubika.chatId,
-                file_id: fileId,
-                text: caption || `📥 فایل ${fileName}`
-            })
-        }).then(r => r.json());
-
-        const messageId = sendResponse?.data?.message_id || sendResponse?.message_id;
-
-        if (!messageId) {
-            throw new Error(`Rubika sendFile failed: ${JSON.stringify(sendResponse)}`);
-        }
-    }
-
-    splitVideoPlayableSegments(filePath, targetMaxBytes) {
-        return new Promise((resolve, reject) => {
-            const ffprobe = spawn('ffprobe', [
-                '-v', 'error',
-                '-show_entries', 'format=duration,size',
-                '-of', 'json',
-                filePath
-            ]);
-
-            let output = '';
-            ffprobe.stdout.on('data', data => output += data.toString());
-
-            ffprobe.on('close', async (code) => {
-                if (code !== 0) return reject(new Error('ffprobe failed to analyze video chunks'));
-
-                try {
-                    const metadata = JSON.parse(output);
-                    const duration = parseFloat(metadata.format.duration);
-                    const totalSize = parseInt(metadata.format.size);
-
-                    if (!duration || !totalSize) return reject(new Error("متادیتا ویدیو نامعتبر است."));
-
-                    const bytesPerSecond = totalSize / duration;
-                    const targetSegmentDuration = Math.floor((targetMaxBytes * 0.92) / bytesPerSecond);
-
-                    const parts = [];
-                    const baseName = path.basename(filePath, '.mp4');
-                    const dir = path.dirname(filePath);
-
-                    let currentTime = 0;
-                    let partIndex = 1;
-
-                    while (currentTime < duration) {
-                        const partPath = path.join(dir, `${baseName}_part${partIndex.toString().padStart(3, '0')}.mp4`);
-                        const isLastPart = (currentTime + targetSegmentDuration) >= duration;
-                        const currentDuration = isLastPart ? (duration - currentTime) : targetSegmentDuration;
-
-                        await this.runFFmpeg([
-                            '-i', filePath,
-                            '-ss', currentTime.toString(),
-                            '-t', currentDuration.toString(),
-                            '-c', 'copy',
-                            '-avoid_negative_ts', 'make_zero',
-                            '-movflags', '+faststart',
-                            '-y', partPath
-                        ]);
-
-                        parts.push(partPath);
-                        currentTime += targetSegmentDuration;
-                        partIndex++;
-                    }
-                    resolve(parts);
-                } catch (e) { reject(e); }
-            });
-        });
     }
 
     async cleanupFile(filePath) {
