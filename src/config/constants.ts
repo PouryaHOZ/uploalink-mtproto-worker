@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.5.5';
-export const LAST_UPDATE_PERSIAN = 'ذخیره‌سازی و کش دستی فایل باینری FFmpeg جهت کاهش زمان اجرا به زیر ۱ ثانیه.';
+export const SYSTEM_VERSION = '0.5.6';
+export const LAST_UPDATE_PERSIAN = 'اصلاح ترتیب نصب pnpm پیش از setup-node جهت رفع خطای کش و ذخیره‌سازی فایل باینری FFmpeg.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
