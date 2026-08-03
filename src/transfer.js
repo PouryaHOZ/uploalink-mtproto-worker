@@ -27,7 +27,7 @@ const config = {
         region: process.env.MINIO_REGION || 'us-east-1'
     },
     performance: {
-        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '16'),
+        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '24'),
         tempDir: TEMP_DIR
     },
     cloudflare: {
@@ -83,7 +83,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '0.6.5';
+const SYSTEM_VERSION = '0.6.7';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -333,7 +333,7 @@ class FileTransferBot {
             let lastProgressUpdate = 0;
             let lastCancelCheck = 0;
 
-            const adaptiveWorkers = Math.max(config.performance.downloadWorkers, 16);
+            const adaptiveWorkers = Math.max(config.performance.downloadWorkers, 24);
 
             await client.downloadMedia(messages[0].media, {
                 partSize: 512 * 1024,

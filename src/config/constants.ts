@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.6.4';
-export const LAST_UPDATE_PERSIAN = 'اصلاح خطای ساختاری YAML در فایل ورک‌فلو گیت‌هاب اکشنز.';
+export const SYSTEM_VERSION = '0.6.7';
+export const LAST_UPDATE_PERSIAN = 'ارتقای سرعت دانلود MTProto به بالاترین حد با افزایش ورکرهای همزمان به ۲۴ و لایه‌بندی بهینه چانک‌ها.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
