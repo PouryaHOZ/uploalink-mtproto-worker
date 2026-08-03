@@ -14,46 +14,52 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (Shallow)
         uses: actions/checkout@v4
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
         with:
-          version: 9
+          fetch-depth: 1
 
-      - name: Setup Node.js & pnpm Cache
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'pnpm'
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Cache node_modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node22-modules-${{ hashFiles('**/pnpm-lock.yaml') }}
 
-      - name: Cache FFmpeg binary
+      - name: Install pnpm & Production Dependencies (On Cache Miss)
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        run: |
+          corepack enable
+          pnpm install --prod --frozen-lockfile
+
+      - name: Cache FFmpeg static binary
         id: cache-ffmpeg
         uses: actions/cache@v4
         with:
           path: ~/.local/bin/ffmpeg
           key: ${{ runner.os }}-ffmpeg-static-v1
 
-      - name: Install FFmpeg static binary (on cache miss)
+      - name: Download FFmpeg static binary (On Cache Miss)
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.local/bin
           curl -sL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ --strip-components=1 -C ~/.local/bin --wildcards '*/ffmpeg'
           chmod +x ~/.local/bin/ffmpeg
 
-      - name: Add FFmpeg to PATH
-        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Create RAM temp directory
-        run: mkdir -p /dev/shm/temp_transfers
+      - name: Export PATH & System Config
+        run: |
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          mkdir -p /dev/shm/temp_transfers
 
       - name: Execute Transfer Script
-        run: node src/transfer.js
+        run: node --max-old-space-size=4096 src/transfer.js
         env:
+          NODE_ENV: production
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
