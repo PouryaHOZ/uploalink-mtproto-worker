@@ -2,6 +2,10 @@
 export const SYSTEM_VERSION = '0.2.2';
 export const LAST_UPDATE_PERSIAN = 'اضافه کردن خروجی توابع پردازش فایل و حذف کامل عملیات فایل‌سیستم در محیط ورکر.';
 
+// نسخه جدید (v0.3.0): افزودن پیشرفت کل، نوار پیشرفت مرحله‌ای، سرعت‌سنج زنده و تخمین زمان باقی‌مانده
+export const SYSTEM_VERSION = '0.3.0';
+export const LAST_UPDATE_PERSIAN = 'افزودن نوار پیشرفت دوگانه (پیشرفت کل + پیشرفت مرحله)، سرعت‌سنج زنده و تخمین زمان باقی‌مانده در تمامی مراحل دانلود، فشرده‌سازی و آپلود.';
+
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
     EXPIRATION: {
