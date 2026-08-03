@@ -22,7 +22,7 @@ jobs:
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Cache node_modules
         id: cache-node-modules
@@ -60,6 +60,7 @@ jobs:
       - name: Execute Transfer Script
         run: node --max-old-space-size=4096 src/transfer.js
         env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
           NODE_ENV: production
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
