@@ -89,24 +89,14 @@ function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, 
     const masterBar = drawProgressBar(masterPercent, 12);
     const stageBar = drawProgressBar(stagePercent, 10);
 
-    let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (v${SYSTEM_VERSION})
+    let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (v${SYSTEM_VERSION})\n\n`;
+    card += `📊 <b>پیشرفت کل:</b>\n<code>[${masterBar}] ${masterPercent}%</code>\n\n`;
+    card += `🔄 <b>مرحله جاری:</b> ${stageName}\n`;
+    card += `<code>[${stageBar}] ${stagePercent}%</code>\n`;
 
-`;
-    card += `📊 <b>پیشرفت کل:</b>
-<code>[${masterBar}] ${masterPercent}%</code>
-
-`;
-    card += `🔄 <b>مرحله جاری:</b> ${stageName}
-`;
-    card += `<code>[${stageBar}] ${stagePercent}%</code>
-`;
-
-    if (detailsText) card += `⚖️ <b>حجم:</b> ${detailsText}
-`;
-    if (speedText) card += `⚡ <b>سرعت:</b> ${speedText}
-`;
-    if (etaText) card += `⏱️ <b>زمان تقریبی باقی‌مانده:</b> ${etaText}
-`;
+    if (detailsText) card += `⚖️ <b>حجم:</b> ${detailsText}\n`;
+    if (speedText) card += `⚡ <b>سرعت:</b> ${speedText}\n`;
+    if (etaText) card += `⏱️ <b>زمان تقریبی باقی‌مانده:</b> ${etaText}\n`;
 
     return card;
 }
@@ -253,10 +243,7 @@ class FileTransferBot {
             let speedStr = '1.0x';
 
             this.activeFFmpegProcess.stdout.on('data', data => {
-                const lines = data.toString().split('
-');
-');
-');
+                const lines = data.toString().split('\n');
                 for (const line of lines) {
                     const [key, val] = line.split('=').map(s => s ? s.trim() : '');
                     if (key === 'out_time') {
@@ -279,8 +266,7 @@ class FileTransferBot {
             this.activeFFmpegProcess.on('close', code => {
                 this.activeFFmpegProcess = null;
                 if (code === 0) resolve();
-                else reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/
-/g, ' ').trim()}`));
+                else reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/\n/g, ' ').trim()}`));
             });
 
             this.activeFFmpegProcess.on('error', err => {
@@ -450,9 +436,7 @@ class FileTransferBot {
                     targetPath = processedPath;
                 } catch (ffmpegErr) {
                     if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
-                    throw new Error(`مشکل در ساختار فایل ویدیو.
-
-جزئیات فنی: ${ffmpegErr.message}`);
+                    throw new Error(`مشکل در ساختار فایل ویدیو.\n\nجزئیات فنی: ${ffmpegErr.message}`);
                 } finally {
                     clearInterval(cancelCheckInterval);
                 }
@@ -486,15 +470,7 @@ class FileTransferBot {
             const actualSize = (await fs.promises.stat(targetPath)).size;
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
             
-            const successMsg = `✅ <b>انتقال کامل شد!</b>
-
-<code>[██████████] 100%</code>
-📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>
-📏 <b>حجم:</b> ${formatBytes(actualSize)}
-⏱️ <b>زمان:</b> ${elapsedTime} ثانیه
-⚠️ <b>لینک پس از ۲ ساعت منقضی و فایل به صورت خودکار حذف می‌شود.</b>
-
-🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
+            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n📏 <b>حجم:</b> ${formatBytes(actualSize)}\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت منقضی و فایل به صورت خودکار حذف می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
 
             await this.updateStatus(chatId, successMsg, true);
             await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'completed' });
@@ -502,10 +478,7 @@ class FileTransferBot {
         } catch (err) {
             console.error("❌ Transfer Execution Error:", err);
             const isNetworkError = err.message.includes('TCPFull') || err.message.includes('fetch') || err.message.includes('ECONNRESET') || err.message.includes('Timeout');
-            await this.updateStatus(chatId, `❌ <b>خطا در انجام عملیات:</b>
-<code>${escapeHtml(err.message)}</code>${isNetworkError ? '
-
-🔄 در حال بازگشت به صف برای تلاش مجدد...' : ''}`, true);
+            await this.updateStatus(chatId, `❌ <b>خطا در انجام عملیات:</b>\n<code>${escapeHtml(err.message)}</code>${isNetworkError ? '\n\n🔄 در حال بازگشت به صف برای تلاش مجدد...' : ''}`, true);
             await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'failed', error: err.message, retryable: isNetworkError });
         } finally {
             if (downloadedFilePath) await this.cleanupFile(downloadedFilePath);
