@@ -255,6 +255,7 @@ class FileTransferBot {
             this.activeFFmpegProcess.stdout.on('data', data => {
                 const lines = data.toString().split('
 ');
+');
                 for (const line of lines) {
                     const [key, val] = line.split('=').map(s => s ? s.trim() : '');
                     if (key === 'out_time') {
