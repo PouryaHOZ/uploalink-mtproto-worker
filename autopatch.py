@@ -45,7 +45,7 @@ def apply_patch():
             continue
 
         with open(filepath, 'r', encoding='utf-8') as f:
-            file_text = f.read().replace('\r\n', '\n')
+            file_text = f.read().replace('\r\n', '\n').replace('\xa0', ' ').replace('\r\n', '\n')
 
         file_lines = file_text.splitlines(keepends=True)
         changes_made = False
