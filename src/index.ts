@@ -10,7 +10,7 @@ import { createTransferRequest, processFileTransfer } from './handlers/transfers
 import { triggerGitHubWorkflow } from './services/github';
 import { generateConnectionCode, generatePlatformLink } from './utils/helpers';
 
-// Helper to push queue items to active
+// Helper to push queue items to active execution when slots open up
 async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
     const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
     const activeCount = await kv.getActiveTransfersCount();
@@ -25,18 +25,23 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
 
     const req = await kv.getTransferRequest(transferId);
     if (!req) {
-        await processQueue(env, kv, messenger); 
+        await processQueue(env, kv, messenger); // Recurse on invalid item
         return;
     }
 
     const success = await triggerGitHubWorkflow(env, transferId, req);
     if (success) {
         await kv.saveActiveTransfer(transferId, {
-            id: transferId, transferRequest: req, status: 'processing', createdAt: Date.now()
+            id: transferId,
+            transferRequest: req,
+            status: 'processing',
+            createdAt: Date.now()
         });
         
-        // Phase 1: Startup Progress Bar injection
-        await messenger.sendMessage(req.chatId, `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری... (این مرحله چند ثانیه زمان می‌برد)**`);
+        await messenger.sendMessage(
+            req.chatId, 
+            `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری... (این مرحله چند ثانیه زمان می‌برد)**`
+        );
     } else {
         await messenger.sendMessage(req.chatId, `❌ متاسفانه در ارتباط با سرور پردازش مشکلی رخ داد.`);
         await processQueue(env, kv, messenger);
@@ -52,7 +57,7 @@ export default {
         try {
             if (path === '/health') return new Response(JSON.stringify({ status: 'healthy' }), { status: 200 });
 
-            // The Action Webhook Endpoint
+            // Action Webhook Endpoint
             if (path === '/action-webhook' && request.method === 'POST') {
                 const payload = await request.json() as any;
                 if (payload.action === 'action_update') {
@@ -66,12 +71,13 @@ export default {
                         if (status === 'failed' && retryable) {
                             await kv.enqueueTransfer(transferId);
                             const pos = await kv.getQueuePosition(transferId);
-                            await messenger.sendMessage(activeReq.transferRequest.chatId, `⚠️ **یک خطای شبکه‌ای موقت رخ داد.**\nدرخواست شما مجدداً به صف بازگشت (موقعیت: ${pos}).`, {
-                                inline_keyboard: [[{ text: '❌ لغو درخواست', callback_data: `queue_cancel:${transferId}` }]]
-                            });
+                            await messenger.sendMessage(
+                                activeReq.transferRequest.chatId, 
+                                `⚠️ **یک خطای شبکه‌ای موقت رخ داد.**\nدرخواست شما مجدداً به صف بازگشت (موقعیت: ${pos}).`, 
+                                { inline_keyboard: [[{ text: '❌ لغو درخواست', callback_data: `queue_cancel:${transferId}` }]] }
+                            );
                         }
                     }
-                    // Process next in line
                     await processQueue(env, kv, new TelegramPlatform(env));
                     return new Response(JSON.stringify({ ok: true }), { status: 200 });
                 }
@@ -205,15 +211,43 @@ export default {
             if (transferReq) {
                 transferReq.shouldCompress = shouldCompress;
                 await kv.saveTransferRequest(transferId, transferReq);
-                
+
+                const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
+                const activeCount = await kv.getActiveTransfersCount();
+
+                // Direct Execution Route: If capacity exists, start workflow immediately
+                if (activeCount < MAX_CONCURRENT) {
+                    const success = await triggerGitHubWorkflow(env, transferId, transferReq);
+                    if (success) {
+                        await kv.saveActiveTransfer(transferId, {
+                            id: transferId,
+                            transferRequest: transferReq,
+                            status: 'processing',
+                            createdAt: Date.now()
+                        });
+
+                        await messenger.editMessageText(
+                            chatId, 
+                            messageId, 
+                            `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری... (این مرحله چند ثانیه زمان می‌برد)**`
+                        );
+                        await messenger.answerCallbackQuery(query.id, 'پردازش آغاز شد.');
+                        return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+                    }
+                }
+
+                // Fallback Queue Route: Executed only if active slots are occupied or immediate trigger failed
                 await kv.enqueueTransfer(transferId);
                 const position = await kv.getQueuePosition(transferId);
 
-                await messenger.editMessageText(chatId, messageId, `⏳ **شما در صف انتظار قرار گرفتید.**\n\n📍 موقعیت شما در صف: **${position}**\n\nسیستم به محض آزاد شدن منابع، فایل را پردازش می‌کند.`, {
-                    inline_keyboard: [[{ text: '❌ انصراف از صف', callback_data: `queue_cancel:${transferId}` }]]
-                });
-
-                await processQueue(env, kv, messenger);
+                await messenger.editMessageText(
+                    chatId, 
+                    messageId, 
+                    `⏳ **ظرفیت پردازش هم‌زمان پر است؛ شما در صف قرار گرفتید.**\n\n📍 موقعیت شما در صف: **${position}**\n\nسیستم به محض آزاد شدن سرورها، فایل شما را به صورت خودکار پردازش می‌کند.`, 
+                    { inline_keyboard: [[{ text: '❌ انصراف از صف', callback_data: `queue_cancel:${transferId}` }]] }
+                );
+                await messenger.answerCallbackQuery(query.id, 'در صف قرار گرفتید.');
+                return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
             } else {
                 await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست یافت نشد یا منقضی شده است.`);
             }
