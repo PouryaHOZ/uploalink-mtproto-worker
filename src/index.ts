@@ -39,7 +39,8 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
         
         await messenger.sendMessage(
             req.chatId, 
-            `🚀 **نوبت شما فرا رسید!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری...**`
+            `🚀 **نوبت شما فرا رسید!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری...**`,
+            { inline_keyboard: [[{ text: '🛑 لغو انتقال', callback_data: `cancel_transfer:${transferId}` }]] }
         );
     } else {
         await messenger.sendMessage(req.chatId, `❌ **خطا در شروع سرور پردازش:**\n\`${triggerResult.error}\``);
@@ -56,6 +57,14 @@ export default {
         try {
             if (path === '/health') return new Response(JSON.stringify({ status: 'healthy' }), { status: 200 });
 
+            // Cancellation Check Endpoint for transfer.js
+            if (path === '/check-cancel') {
+                const transferId = url.searchParams.get('transferId');
+                if (!transferId) return new Response(JSON.stringify({ cancelled: false }), { status: 400 });
+                const isCancelled = await kv.getCancelFlag(transferId);
+                return new Response(JSON.stringify({ cancelled: isCancelled }), { status: 200 });
+            }
+
             if (path === '/action-webhook' && request.method === 'POST') {
                 const payload = await request.json() as any;
                 if (payload.action === 'action_update') {
@@ -64,6 +73,7 @@ export default {
                     
                     if (activeReq) {
                         await kv.removeActiveTransfer(transferId);
+                        await kv.deleteCancelFlag(transferId);
                         const messenger = new TelegramPlatform(env);
 
                         if (status === 'failed' && retryable) {
@@ -72,7 +82,7 @@ export default {
                             await messenger.sendMessage(
                                 activeReq.transferRequest.chatId, 
                                 `⚠️ **یک خطای شبکه‌ای موقت رخ داد.**\nدرخواست شما مجدداً به صف بازگشت (موقعیت: ${pos}).`, 
-                                { inline_keyboard: [[{ text: '❌ لغو درخواست', callback_data: `queue_cancel:${transferId}` }]] }
+                                { inline_keyboard: [[{ text: '❌ انصراف از صف', callback_data: `queue_cancel:${transferId}` }]] }
                             );
                         }
                     }
@@ -194,6 +204,24 @@ export default {
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
+        if (action === 'cancel_transfer') {
+            const transferId = parts[1];
+            
+            // Check if it's currently active
+            const activeTransfer = await kv.getActiveTransfer(transferId);
+            if (activeTransfer) {
+                await kv.setCancelFlag(transferId);
+                await messenger.answerCallbackQuery(query.id, '⏳ درخواست لغو ثبت شد. در حال متوقف‌سازی فرآیند...');
+            } else {
+                // If it was in queue
+                await kv.dequeueTransfer(transferId);
+                await messenger.editMessageText(chatId, messageId, `🛑 **فرآیند انتقال لغو شد.**`);
+                await messenger.answerCallbackQuery(query.id, 'انتقال لغو شد.');
+                await processQueue(env, kv, messenger);
+            }
+            return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+        }
+
         if (action === 'link_gen') {
             const shouldCompress = parts[1] === 'yes';
             const transferId = parts[2];
@@ -204,11 +232,8 @@ export default {
                 await kv.saveTransferRequest(transferId, transferReq);
 
                 const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
-                
-                // 1. Purge zombie active transfers
                 const activeTransfers = await kv.sweepAndGetActiveTransfers();
 
-                // 2. Direct Execution Path if slots are available
                 if (activeTransfers.length < MAX_CONCURRENT) {
                     const triggerResult = await triggerGitHubWorkflow(env, transferId, transferReq);
                     if (triggerResult.success) {
@@ -222,19 +247,18 @@ export default {
                         await messenger.editMessageText(
                             chatId, 
                             messageId, 
-                            `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری... (این مرحله چند ثانیه زمان می‌برد)**`
+                            `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری...**`,
+                            { inline_keyboard: [[{ text: '🛑 لغو انتقال', callback_data: `cancel_transfer:${transferId}` }]] }
                         );
                         await messenger.answerCallbackQuery(query.id, 'پردازش آغاز شد.');
                         return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
                     } else {
-                        // Display the exact error if dispatch failed
                         await messenger.editMessageText(chatId, messageId, `❌ **خطا در ارسال درخواست به سرور پردازش:**\n\`${triggerResult.error}\``);
                         await messenger.answerCallbackQuery(query.id, 'خطا در اجرای درخواست.');
                         return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
                     }
                 }
 
-                // 3. Fallback Queue Path if all slots are active
                 await kv.enqueueTransfer(transferId);
                 const position = await kv.getQueuePosition(transferId);
 

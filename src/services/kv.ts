@@ -22,6 +22,18 @@ export class KVService {
         return await this.env.LINKS.get(`transfer:${transferId}`, { type: 'json' }).catch(() => null);
     }
     
+    // --- CANCELLATION FLAGS ---
+    async setCancelFlag(transferId: string): Promise<void> {
+        await this.env.LINKS.put(`cancel:${transferId}`, 'true', { expirationTtl: 600 });
+    }
+    async getCancelFlag(transferId: string): Promise<boolean> {
+        const val = await this.env.LINKS.get(`cancel:${transferId}`);
+        return val === 'true';
+    }
+    async deleteCancelFlag(transferId: string): Promise<void> {
+        await this.env.LINKS.delete(`cancel:${transferId}`);
+    }
+
     // --- QUEUE SYSTEM ---
     async getQueue(): Promise<string[]> {
         const q = await this.env.LINKS.get('transfer_queue', { type: 'json' });
@@ -65,18 +77,17 @@ export class KVService {
         await this.env.LINKS.delete(`active_transfer:${transferId}`);
     }
 
-    // Purges active transfers older than 10 minutes (zombie tasks) and returns valid active transfers
     async sweepAndGetActiveTransfers(): Promise<ActiveTransfer[]> {
         const transfers: ActiveTransfer[] = [];
         const keys = await this.env.LINKS.list({ prefix: 'active_transfer:' });
         const now = Date.now();
-        const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+        const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 
         for (const key of keys.keys) {
             const data = await this.env.LINKS.get(key.name, { type: 'json' }).catch(() => null) as ActiveTransfer | null;
             if (data) {
                 if (now - data.createdAt > STALE_THRESHOLD_MS) {
-                    await this.env.LINKS.delete(key.name); // Sweep zombie key
+                    await this.env.LINKS.delete(key.name);
                 } else {
                     transfers.push(data);
                 }
