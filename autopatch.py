@@ -37,7 +37,7 @@ def apply_patch():
 
     for block in file_blocks[1:]:
         lines = block.split("\n", 1)
-        filepath = lines[0].strip()
+        filepath = lines[0].replace("===", "").strip()
         changes_content = lines[1] if len(lines) > 1 else ""
 
         if not os.path.exists(filepath):
