@@ -19,13 +19,8 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Setup FFmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        id: setup-ffmpeg
-        with:
-          ffmpeg-version: release
-          architecture: x64
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify Pre-installed FFmpeg
+        run: ffmpeg -version
 
       - name: Install Node Dependencies
         run: npm ci --prefer-offline --no-audit
