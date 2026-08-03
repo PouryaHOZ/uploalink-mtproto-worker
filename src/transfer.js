@@ -75,7 +75,7 @@ function drawProgressBar(percent, length = 10) {
 }
 
 // نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
-const SYSTEM_VERSION = '0.3.7';
+const SYSTEM_VERSION = '0.3.8';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -116,10 +116,25 @@ class TelegramClientManager {
 }
 
 class FileTransferBot {
+    async checkCancel() {
+        try {
+            const baseUrl = config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '');
+            const res = await fetch(`${baseUrl}/check-cancel?transferId=${config.transferId}`, {
+                headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }
+            }).then(r => r.json());
+            return res.cancelled === true;
+        } catch {
+            return false;
+        }
+    }
+
+
     constructor() {
         this.telegramClient = new TelegramClientManager();
         this.statusMessageId = null;
         this.isUpdatingStatus = false;
+        this.activeFFmpegProcess = null;
+        this.isCriticalSection = false;
     }
 
     async updateStatus(chatId, text, force = false) {
@@ -150,6 +165,8 @@ class FileTransferBot {
             console.error("Failed to update status message:", e);
         } finally {
             this.isUpdatingStatus = false;
+        this.activeFFmpegProcess = null;
+        this.isCriticalSection = false;
         }
     }
 
