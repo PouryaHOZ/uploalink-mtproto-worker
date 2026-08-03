@@ -51,14 +51,43 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
 
+function formatSpeed(bytesPerSecond) {
+    if (!bytesPerSecond || bytesPerSecond <= 0) return "۰ بایت/ثانیه";
+    return formatBytes(bytesPerSecond) + "/ثانیه";
+}
+
+function formatEta(seconds) {
+    if (!seconds || !isFinite(seconds) || seconds <= 0) return "محاسبه...";
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    if (mins > 0) return `${mins} دقیقه و ${secs} ثانیه`;
+    return `${secs} ثانیه`;
+}
+
 function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function drawProgressBar(percent, length = 12) {
+function drawProgressBar(percent, length = 10) {
     const filled = Math.min(length, Math.max(0, Math.round((percent / 100) * length)));
     return "█".repeat(filled) + "░".repeat(length - filled);
+}
+
+function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
+    const masterBar = drawProgressBar(masterPercent, 12);
+    const stageBar = drawProgressBar(stagePercent, 10);
+
+    let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code>\n\n`;
+    card += `📊 <b>پیشرفت کل:</b>\n<code>[${masterBar}] ${masterPercent}%</code>\n\n`;
+    card += `🔄 <b>مرحله جاری:</b> ${stageName}\n`;
+    card += `<code>[${stageBar}] ${stagePercent}%</code>\n`;
+
+    if (detailsText) card += `⚖️ <b>حجم:</b> ${detailsText}\n`;
+    if (speedText) card += `⚡ <b>سرعت:</b> ${speedText}\n`;
+    if (etaText) card += `⏱️ <b>زمان تقریبی باقی‌مانده:</b> ${etaText}\n`;
+
+    return card;
 }
 
 // 🔄 INTERNAL RETRY WRAPPER FOR NETWORK RESILIENCY
