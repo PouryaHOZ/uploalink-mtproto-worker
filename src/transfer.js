@@ -75,7 +75,7 @@ function drawProgressBar(percent, length = 10) {
 }
 
 // نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
-const SYSTEM_VERSION = '0.3.8';
+const SYSTEM_VERSION = '0.3.9';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -120,7 +120,7 @@ class FileTransferBot {
         try {
             const baseUrl = config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '');
             const res = await fetch(`${baseUrl}/check-cancel?transferId=${config.transferId}`, {
-                headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }
+                headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }, signal: AbortSignal.timeout(2000)
             }).then(r => r.json());
             return res.cancelled === true;
         } catch {
