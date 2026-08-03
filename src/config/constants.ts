@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.5.9';
-export const LAST_UPDATE_PERSIAN = 'تایید اسکریپت‌های ساخت pnpm برای پکیج‌های bufferutil و utf-8-validate و رفع خطای ERR_PNPM_IGNORED_BUILDS.';
+export const SYSTEM_VERSION = '0.6.0';
+export const LAST_UPDATE_PERSIAN = 'انتقال تنظیمات only-built-dependencies به فایل .npmrc جهت سازگاری کامل با pnpm v11.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
