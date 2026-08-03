@@ -93,8 +93,8 @@ function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, 
     return card;
 }
 
-// نسخه جدید (v0.3.3): به‌روزرسانی نسخه زنده سیستم
-const SYSTEM_VERSION = '0.3.3';
+// نسخه جدید (v0.3.4): به‌روزرسانی نسخه زنده سیستم
+const SYSTEM_VERSION = '0.3.4';
 
 // 🔄 INTERNAL RETRY WRAPPER FOR NETWORK RESILIENCY
 async function withRetry(operationName, operation, retries = 3, delay = 5000) {
