@@ -10,7 +10,7 @@ def apply_patch():
     print("⌨️  Press Enter, then Ctrl+D (or Ctrl+Z on Windows) when done.")
     print("==================================================\n")
     
-    raw_input_data = sys.stdin.read()
+    raw_input_data = sys.stdin.read().replace('\r\n', '\n')
 
     if not raw_input_data.strip():
         print("❌ Error: No input received. Exiting.")
@@ -45,7 +45,7 @@ def apply_patch():
             continue
 
         with open(filepath, 'r', encoding='utf-8') as f:
-            file_text = f.read()
+            file_text = f.read().replace('\r\n', '\n')
 
         file_lines = file_text.splitlines(keepends=True)
         changes_made = False
