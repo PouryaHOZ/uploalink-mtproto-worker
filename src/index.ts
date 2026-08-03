@@ -1,5 +1,5 @@
 import { Env, Platform } from './types';
-import { CONSTANTS } from './config/constants';
+import { CONSTANTS, SYSTEM_VERSION, LAST_UPDATE_PERSIAN } from './config/constants';
 import { KVService } from './services/kv';
 import { TelegramPlatform } from './platforms/telegram';
 import { BalePlatform } from './platforms/bale';
@@ -163,6 +163,17 @@ export default {
         const chatId = (message.chat?.id || message.chat_id || message.from?.id).toString();
         const userId = (message.from?.id || message.sender_id || 'unknown').toString();
         const messageId = (message.message_id).toString();
+
+        // Check if user needs new deployment notification
+        const userVer = await kv.getUserVersion(userId);
+        if (userVer !== SYSTEM_VERSION) {
+            await kv.saveUserVersion(userId, SYSTEM_VERSION);
+            await messenger.sendMessage(
+                chatId,
+                `🎉 **نسخه جدید سیستم (v${SYSTEM_VERSION}) منتشر شد!**\n\n` +
+                `📝 **تغییرات این آپدیت:**\n${LAST_UPDATE_PERSIAN}`
+            );
+        }
 
         if (rawText) {
             const cleanText = rawText.toLowerCase();

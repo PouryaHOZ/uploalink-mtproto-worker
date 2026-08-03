@@ -15,6 +15,14 @@ export class KVService {
     async getPlatformReverseAccount(platform: string, chatId: string): Promise<any> { return await this.env.LINKS.get(`connected_account:${platform}:${chatId}`, { type: 'json' }).catch(() => null); }
     async deletePlatformReverseAccount(platform: string, chatId: string): Promise<void> { await this.env.LINKS.delete(`connected_account:${platform}:${chatId}`); }
 
+    // --- USER VERSION TRACKING ---
+    async getUserVersion(userId: string): Promise<string | null> {
+        return await this.env.LINKS.get(`user_version:${userId}`);
+    }
+    async saveUserVersion(userId: string, version: string): Promise<void> {
+        await this.env.LINKS.put(`user_version:${userId}`, version);
+    }
+
     async saveTransferRequest(transferId: string, data: TransferRequest): Promise<void> {
         await this.env.LINKS.put(`transfer:${transferId}`, JSON.stringify(data), { expirationTtl: CONSTANTS.EXPIRATION.STATE_TRANSFER });
     }

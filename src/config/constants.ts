@@ -1,3 +1,7 @@
+// نسخه جدید (v0.2.0): سیستم اطلاع‌رسانی خودکار نسخه جدید و اعلان انتشار
+export const SYSTEM_VERSION = '0.2.0';
+export const LAST_UPDATE_PERSIAN = 'سیستم اطلاع‌رسانی خودکار انتشار نسخه جدید و نمایش نسخه زنده سرور اضافه شد.';
+
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
     EXPIRATION: {
