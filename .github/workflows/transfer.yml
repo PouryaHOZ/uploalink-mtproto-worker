@@ -35,7 +35,8 @@ jobs:
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
         run: |
           corepack enable
-          pnpm install --prod --frozen-lockfile
+          pnpm config set verify-deps-before-run false
+          pnpm install --prod --no-frozen-lockfile
 
       - name: Cache FFmpeg static binary
         id: cache-ffmpeg

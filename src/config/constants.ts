@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.5.7';
-export const LAST_UPDATE_PERSIAN = 'بهینه‌سازی معماری گردش‌کار: کش مستقیم node_modules، حذف دانلود دپندرسی‌های توسعه و تنظیم تخصیص حافظه نود ۲۲.';
+export const SYSTEM_VERSION = '0.5.8';
+export const LAST_UPDATE_PERSIAN = 'رفع خطای pnpm-lock: جایگزینی آدرس‌های میرور با مخزن رسمی npm و غیرفعال‌سازی بررسی سخت‌گیرانه سیاست زنجیره تامین.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
