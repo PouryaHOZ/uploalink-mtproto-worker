@@ -37,23 +37,16 @@ const config = {
     transferId: process.env.TRANSFER_ID || ''
 };
 
-if (!fs.existsSync(config.performance.tempDir)) {
-    fs.mkdirSync(config.performance.tempDir, { recursive: true });
-}
+if (!fs.existsSync(config.performance.tempDir)) fs.mkdirSync(config.performance.tempDir, { recursive: true });
 
 const minioClient = new Minio.Client({
-    endPoint: config.minio.endPoint,
-    port: config.minio.port,
-    useSSL: config.minio.useSSL,
-    accessKey: config.minio.accessKey,
-    secretKey: config.minio.secretKey,
-    region: config.minio.region
+    endPoint: config.minio.endPoint, port: config.minio.port, useSSL: config.minio.useSSL,
+    accessKey: config.minio.accessKey, secretKey: config.minio.secretKey, region: config.minio.region
 });
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return "۰ بایت";
-    const k = 1024;
-    const sizes = ["بایت", "کیلوبایت", "مگابایت", "گیگابایت"];
+    const k = 1024, sizes = ["بایت", "کیلوبایت", "مگابایت", "گیگابایت"];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
@@ -61,6 +54,24 @@ function formatBytes(bytes) {
 function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function drawProgressBar(percent, length = 12) {
+    const filled = Math.min(length, Math.max(0, Math.round((percent / 100) * length)));
+    return "█".repeat(filled) + "░".repeat(length - filled);
+}
+
+// 🔄 INTERNAL RETRY WRAPPER FOR NETWORK RESILIENCY
+async function withRetry(operationName, operation, retries = 3, delay = 5000) {
+    for (let i = 1; i <= retries; i++) {
+        try {
+            return await operation();
+        } catch (err) {
+            if (i === retries) throw err;
+            console.warn(`[Retry] ${operationName} failed. Retrying (${i}/${retries}) in ${delay/1000}s... Error: ${err.message}`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
 }
 
 class TelegramClientManager {
@@ -112,40 +123,33 @@ class FileTransferBot {
 
     async manageStorage(requiredBytes) {
         const bucket = config.minio.bucketName;
-        const MAX_STORAGE = 9.5 * 1024 * 1024 * 1024; // 9.5 GB
+        const MAX_STORAGE = 9.5 * 1024 * 1024 * 1024;
         const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
         const now = Date.now();
 
-        const exists = await minioClient.bucketExists(bucket).catch(() => false);
-        if (!exists) {
-            await minioClient.makeBucket(bucket, config.minio.region);
-            return;
-        }
+        await withRetry('Bucket Verification', async () => {
+            const exists = await minioClient.bucketExists(bucket).catch(() => false);
+            if (!exists) await minioClient.makeBucket(bucket, config.minio.region);
+        });
 
-        const objects = await new Promise((resolve, reject) => {
-            const objs = [];
-            const stream = minioClient.listObjectsV2(bucket, '', true);
-            stream.on('data', obj => objs.push(obj));
-            stream.on('error', reject);
-            stream.on('end', () => resolve(objs));
+        const objects = await withRetry('List Bucket Objects', () => {
+            return new Promise((resolve, reject) => {
+                const objs = [];
+                const stream = minioClient.listObjectsV2(bucket, '', true);
+                stream.on('data', obj => objs.push(obj));
+                stream.on('error', reject);
+                stream.on('end', () => resolve(objs));
+            });
         });
 
         let currentSize = 0;
-        const toDelete = [];
-        const keptObjects = [];
+        const toDelete = [], keptObjects = [];
 
-        // 1. Mandatory Expiry: Delete anything older than 2 hours
         for (const obj of objects) {
-            const ageMs = now - new Date(obj.lastModified).getTime();
-            if (ageMs > TWO_HOURS_MS) {
-                toDelete.push(obj.name);
-            } else {
-                currentSize += obj.size;
-                keptObjects.push(obj);
-            }
+            if (now - new Date(obj.lastModified).getTime() > TWO_HOURS_MS) toDelete.push(obj.name);
+            else { currentSize += obj.size; keptObjects.push(obj); }
         }
 
-        // 2. Capacity Constraints: Delete oldest if exceeding 9.5GB limit
         if (currentSize + requiredBytes > MAX_STORAGE) {
             keptObjects.sort((a, b) => new Date(a.lastModified) - new Date(b.lastModified));
             for (const obj of keptObjects) {
@@ -156,8 +160,9 @@ class FileTransferBot {
         }
 
         if (toDelete.length > 0) {
-            await minioClient.removeObjects(bucket, toDelete);
-            console.log(`Storage Manager: Swept ${toDelete.length} objects to free space.`);
+            await withRetry('Delete Old Objects', async () => {
+                await minioClient.removeObjects(bucket, toDelete);
+            });
         }
     }
 
@@ -166,7 +171,7 @@ class FileTransferBot {
             const ffmpeg = spawn('ffmpeg', args);
             let errorLog = '';
             ffmpeg.stderr.on('data', data => errorLog += data.toString());
-            ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg Exit ${code}: ${errorLog.slice(-300).replace(/\n/g, ' ').trim()}`)));
+            ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/\n/g, ' ').trim()}`)));
             ffmpeg.on('error', err => reject(err));
         });
     }
@@ -174,15 +179,18 @@ class FileTransferBot {
     async uploadToMinIO(filePath, fileName) {
         const bucket = config.minio.bucketName;
         const metaData = { 'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream' };
-        await minioClient.fPutObject(bucket, fileName, filePath, metaData);
-        // Expiry strictly set to 2 hours (7200 seconds)
-        return await minioClient.presignedGetObject(bucket, fileName, 7200);
+        
+        // Wrap MinIO upload in fault-tolerant retry loop
+        await withRetry('MinIO File Upload', async () => {
+            await minioClient.fPutObject(bucket, fileName, filePath, metaData);
+        }, 3, 5000); // 3 Retries, 5 seconds apart
+
+        return await minioClient.presignedGetObject(bucket, fileName, 7200); // 2 hour expiry limit
     }
 
     async start() {
         const startTime = Date.now();
-        let downloadedFilePath = '';
-        let targetPath = '';
+        let downloadedFilePath = '', targetPath = '';
         const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
         const messageId = process.env.MESSAGE_ID || '0';
         let fileName = process.env.FILE_NAME || `file_${Date.now()}`;
@@ -195,7 +203,7 @@ class FileTransferBot {
             downloadedFilePath = path.join(config.performance.tempDir, fileName);
             const client = this.telegramClient.client;
 
-            await this.updateStatus(chatId, `🚀 <b>انتقال آغاز شد!</b>\n\n🧹 <b>در حال پاکسازی حافظه و آزادسازی فضا...</b>`, true);
+            await this.updateStatus(chatId, `🚀 <b>عملیات آغاز شد</b>\n\n<code>[████░░░░░░] 40%</code>\n🔄 <b>سرور پردازش ابری متصل شد. در حال آزادسازی فضا...</b>`, true);
             await this.manageStorage(fileSize);
 
             const messages = await client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
@@ -212,7 +220,7 @@ class FileTransferBot {
                     if (now - lastProgressUpdate >= 4000 || downloaded === total) {
                         lastProgressUpdate = now;
                         const percent = total ? Math.floor((downloaded / total) * 100) : 0;
-                        this.updateStatus(chatId, `📥 <b>در حال دریافت:</b>\n${drawProgressBar(percent)} <b>${percent}%</b>\n📊 <b>حجم:</b> ${formatBytes(downloaded)} / ${formatBytes(total)}`, false).catch(() => {});
+                        this.updateStatus(chatId, `📥 <b>در حال دانلود از تلگرام...</b>\n\n<code>[██████░░░░] 60%</code>\n${drawProgressBar(percent)} <b>${percent}%</b>\n📊 <b>حجم:</b> ${formatBytes(downloaded)} / ${formatBytes(total)}`, false).catch(() => {});
                     }
                 }
             });
@@ -220,51 +228,66 @@ class FileTransferBot {
             targetPath = downloadedFilePath;
 
             if (isVideo) {
+                await this.updateStatus(chatId, `⚙️ <b>در حال پردازش و بهینه‌سازی ویدیو...</b>\n\n<code>[████████░░] 80%</code>\n(این مرحله بسته به حجم ویدیو ممکن است طول بکشد)`, true);
+                
                 fileName = `${path.parse(fileName).name}.mp4`;
                 const processedPath = path.join(config.performance.tempDir, `processed_${Date.now()}.mp4`);
+                
                 try {
-                    await this.updateStatus(chatId, `⚙️ <b>در حال ${shouldCompress ? 'فشرده‌سازی ویدیو' : 'همگام‌سازی فرمت'}...</b>`, true);
-                    const ffmpegArgs = shouldCompress 
-                        ? ['-i', downloadedFilePath, '-threads', '0', '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast', '-vf', 'scale=-2:480', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-y', processedPath]
-                        : ['-i', downloadedFilePath, '-c', 'copy', '-movflags', '+faststart', '-y', processedPath];
-                    await this.runFFmpeg(ffmpegArgs);
+                    // DYNAMIC SCALING ENGINE
+                    // 1280px bounds = 720p Max (Standard)
+                    // 854px bounds  = 480p Max (Lightweight)
+                    const maxDim = shouldCompress ? 854 : 1280;
+                    
+                    // Decrease Aspect Ratio ensures it ONLY scales down, NEVER upscales.
+                    // Pad ensures coordinates are even numbers to prevent x264 codec errors.
+                    const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
+                    
+                    // CRF 23 = Standard acceptable compression (visually lossless).
+                    // CRF 28 = High compression (Lightweight mode).
+                    const crfValue = shouldCompress ? '28' : '23';
+                    const audioBitrate = shouldCompress ? '64k' : '128k';
+
+                    await this.runFFmpeg([
+                        '-i', downloadedFilePath,
+                        '-threads', '0',
+                        '-c:v', 'libx264',
+                        '-crf', crfValue,
+                        '-preset', 'veryfast',
+                        '-vf', scaleFilter,
+                        '-c:a', 'aac',
+                        '-b:a', audioBitrate,
+                        '-movflags', '+faststart',
+                        '-y', processedPath
+                    ]);
                     targetPath = processedPath;
                 } catch (ffmpegErr) {
-                    throw new Error(`فرمت این ویدیو پشتیبانی نمی‌شود.\n\nجزئیات فنی: ${ffmpegErr.message}`);
+                    throw new Error(`مشکل در ساختار فایل ویدیو.\n\nجزئیات فنی: ${ffmpegErr.message}`);
                 }
             }
 
             const actualSize = (await fs.promises.stat(targetPath)).size;
-            await this.updateStatus(chatId, `☁️ <b>در حال آپلود در هاست ابری (اعتبار لینک: ۲ ساعت)...</b>`, true);
+            
+            await this.updateStatus(chatId, `☁️ <b>در حال ذخیره در فضای ابری...</b>\n\n<code>[█████████░] 90%</code>\n📤 <b>آپلود به زودی به پایان می‌رسد.</b>`, true);
             const downloadLink = await this.uploadToMinIO(targetPath, fileName);
 
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
-            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n📏 <b>حجم:</b> ${formatBytes(actualSize)}\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت به صورت خودکار منقضی و حذف می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
+            
+            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n📏 <b>حجم:</b> ${formatBytes(actualSize)}\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت منقضی و فایل به صورت خودکار حذف می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
 
             await this.updateStatus(chatId, successMsg, true);
             await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'completed' });
 
         } catch (err) {
             console.error("❌ Transfer Execution Error:", err);
-            
-            // Check if error is transient/network related to decide if it goes back in the queue
-            const isNetworkError = err.message.includes('TCPFull') || err.message.includes('fetch') || err.message.includes('ECONNRESET');
-            
-            await this.updateStatus(chatId, `❌ <b>خطا در انجام انتقال:</b>\n<code>${escapeHtml(err.message)}</code>${isNetworkError ? '\n\n🔄 در حال تلاش مجدد و بازگشت به صف...' : ''}`, true);
-            
-            await this.notifyCloudflare({ 
-                action: 'action_update', 
-                transferId: config.transferId, 
-                status: 'failed', 
-                error: err.message, 
-                retryable: isNetworkError 
-            });
-
+            const isNetworkError = err.message.includes('TCPFull') || err.message.includes('fetch') || err.message.includes('ECONNRESET') || err.message.includes('Timeout');
+            await this.updateStatus(chatId, `❌ <b>خطا در انجام عملیات:</b>\n<code>${escapeHtml(err.message)}</code>${isNetworkError ? '\n\n🔄 در حال بازگشت به صف برای تلاش مجدد...' : ''}`, true);
+            await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'failed', error: err.message, retryable: isNetworkError });
         } finally {
             if (downloadedFilePath) await this.cleanupFile(downloadedFilePath);
             if (targetPath && targetPath !== downloadedFilePath) await this.cleanupFile(targetPath);
             await this.telegramClient.disconnect();
-            process.exit(0); // Exit 0 so GitHub action doesn't mark as failed. The webhook handles logic.
+            process.exit(0);
         }
     }
 
@@ -276,13 +299,10 @@ class FileTransferBot {
         if (!config.cloudflare.webhookUrl) return;
         try {
             await fetch(config.cloudflare.webhookUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.cloudflare.apiToken}` },
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.cloudflare.apiToken}` },
                 body: JSON.stringify(payload)
             });
-        } catch (error) {
-            console.error("Failed to hit Cloudflare Webhook:", error);
-        }
+        } catch (error) { }
     }
 }
 

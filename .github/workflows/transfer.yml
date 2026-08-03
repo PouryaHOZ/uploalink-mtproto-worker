@@ -3,30 +3,6 @@ name: Transfer Large File
 on:
   repository_dispatch:
     types: [forward_file]
-  workflow_dispatch:
-    inputs:
-      message_id:
-        description: 'Telegram Message ID'
-        required: true
-      chat_id:
-        description: 'Telegram Chat ID'
-        required: true
-      file_name:
-        description: 'File Name'
-        required: false
-        default: ''
-      file_size:
-        description: 'File Size in bytes'
-        required: false
-        default: '0'
-      is_video:
-        description: 'Is Video File (true/false)'
-        required: false
-        default: 'false'
-      should_compress:
-        description: 'Should Compress Video (true/false)'
-        required: false
-        default: 'false'
 
 jobs:
   transfer:
@@ -43,10 +19,13 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        id: setup-ffmpeg
+        with:
+          ffmpeg-version: release
+          architecture: x64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Node Dependencies
         run: npm ci --prefer-offline --no-audit
@@ -61,23 +40,20 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.CHAT_ID || inputs.chat_id }}
-
+          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.CHAT_ID }}
           MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
           MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
           MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           MINIO_BUCKET_NAME: ${{ secrets.MINIO_BUCKET_NAME }}
           MINIO_PORT: ${{ secrets.MINIO_PORT }}
           MINIO_USE_SSL: ${{ secrets.MINIO_USE_SSL }}
-
-          MESSAGE_ID: ${{ github.event.client_payload.MESSAGE_ID || inputs.message_id }}
-          FILE_NAME: ${{ github.event.client_payload.FILE_NAME || inputs.file_name }}
-          FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE || inputs.file_size }}
-          IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO || inputs.is_video }}
-          SHOULD_COMPRESS: ${{ github.event.client_payload.SHOULD_COMPRESS || inputs.should_compress }}
-
+          MESSAGE_ID: ${{ github.event.client_payload.MESSAGE_ID }}
+          FILE_NAME: ${{ github.event.client_payload.FILE_NAME }}
+          FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE }}
+          IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO }}
+          SHOULD_COMPRESS: ${{ github.event.client_payload.SHOULD_COMPRESS }}
           CLOUDFLARE_WEBHOOK_URL: ${{ secrets.CLOUDFLARE_WEBHOOK_URL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-
+          TRANSFER_ID: ${{ github.event.client_payload.TRANSFER_ID }}
           DOWNLOAD_WORKERS: 8
           TEMP_DIR: /dev/shm/temp_transfers

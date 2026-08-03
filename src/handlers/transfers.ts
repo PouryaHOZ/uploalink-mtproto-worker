@@ -1,7 +1,7 @@
 import { Env, TransferRequest, Platform } from '../types';
 import { KVService } from '../services/kv';
 import { Messenger } from '../platforms/messenger';
-import { calculateEstimates, formatBytes } from '../utils/helpers';
+import { formatBytes } from '../utils/helpers';
 
 export function createTransferRequest(messageId: string, chatId: string, userId: string, rawMessage: any, platform: Platform): TransferRequest {
     return {
@@ -23,14 +23,17 @@ export async function processFileTransfer(env: Env, kv: KVService, messenger: Me
     const inline_keyboard: any[][] = [];
 
     if (transferRequest.isVideo) {
-        const est = calculateEstimates(transferRequest.fileSize, true, []);
         const messageText = `🎬 **دریافت ویدیو:** ${transferRequest.fileName}\n` +
-                            `📏 **حجم اصلی:** ${est.originalSizeFormatted}\n` +
-                            `⚡ **حجم فشرده (تخمینی 480p):** ${est.compressedSizeFormatted} (${est.reductionPercentage} کاهش)\n\n` +
-                            `لطفاً عملیات مورد نظر را انتخاب کنید:`;
+                            `📏 **حجم فایل:** ${formatBytes(transferRequest.fileSize)}\n\n` +
+                            `لطفاً کیفیت خروجی را انتخاب کنید:\n` +
+                            `🔹 **استاندارد:** حفظ ابعاد اصلی (تا سقف 720p) + بهینه‌سازی حجم\n` +
+                            `🔸 **سبک:** فشرده‌سازی بسیار بالا (تا سقف 480p) جهت دانلود سریع`;
 
-        inline_keyboard.push([{ text: '🔗 ساخت لینک دانلود مستقیم', callback_data: `link_gen:no:${transferId}` }]);
-        inline_keyboard.push([{ text: '🗜 ساخت لینک دانلود + فشرده‌سازی 480p', callback_data: `link_gen:yes:${transferId}` }]);
+        // "no" implies standard (false compression flag, caps at 720p)
+        inline_keyboard.push([{ text: '🔹 ساخت لینک (استاندارد / 720p)', callback_data: `link_gen:no:${transferId}` }]);
+        
+        // "yes" implies lightweight (true compression flag, caps at 480p)
+        inline_keyboard.push([{ text: '🔸 ساخت لینک (سبک / 480p)', callback_data: `link_gen:yes:${transferId}` }]);
 
         await messenger.sendMessage(transferRequest.chatId, messageText, { inline_keyboard });
     } else {

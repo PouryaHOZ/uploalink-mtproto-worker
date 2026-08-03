@@ -25,7 +25,7 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
 
     const req = await kv.getTransferRequest(transferId);
     if (!req) {
-        await processQueue(env, kv, messenger); // Skip invalid, recurse
+        await processQueue(env, kv, messenger); 
         return;
     }
 
@@ -34,7 +34,9 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
         await kv.saveActiveTransfer(transferId, {
             id: transferId, transferRequest: req, status: 'processing', createdAt: Date.now()
         });
-        await messenger.sendMessage(req.chatId, `🚀 **نوبت شما فرا رسید!** پردازش فایل آغاز شد.`);
+        
+        // Phase 1: Startup Progress Bar injection
+        await messenger.sendMessage(req.chatId, `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری... (این مرحله چند ثانیه زمان می‌برد)**`);
     } else {
         await messenger.sendMessage(req.chatId, `❌ متاسفانه در ارتباط با سرور پردازش مشکلی رخ داد.`);
         await processQueue(env, kv, messenger);
@@ -86,14 +88,12 @@ export default {
         }
     },
 
-    // Self-healing cron trigger (If Action dies without firing webhook)
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
         const kv = new KVService(env);
         const actives = await kv.getAllActiveTransfers();
         const now = Date.now();
         
         for (const act of actives) {
-            // If stuck in processing for > 60 mins, clear it
             if (now - act.createdAt > 3600000) {
                 await kv.removeActiveTransfer(act.id);
             }
@@ -213,7 +213,6 @@ export default {
                     inline_keyboard: [[{ text: '❌ انصراف از صف', callback_data: `queue_cancel:${transferId}` }]]
                 });
 
-                // Immediately try to process if resources are free
                 await processQueue(env, kv, messenger);
             } else {
                 await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست یافت نشد یا منقضی شده است.`);
