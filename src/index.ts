@@ -8,7 +8,38 @@ import { Messenger } from './platforms/messenger';
 import { handleStartCommand, handleConnectionCode, askLinkSelection, askUnlinkSelection, handleStatusCommand } from './handlers/commands';
 import { createTransferRequest, processFileTransfer } from './handlers/transfers';
 import { triggerGitHubWorkflow } from './services/github';
-import { generateConnectionCode, generatePlatformLink, calculateEstimates } from './utils/helpers';
+import { generateConnectionCode, generatePlatformLink } from './utils/helpers';
+
+// Helper to push queue items to active
+async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
+    const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
+    const activeCount = await kv.getActiveTransfersCount();
+
+    if (activeCount >= MAX_CONCURRENT) return;
+
+    const queue = await kv.getQueue();
+    if (queue.length === 0) return;
+
+    const transferId = queue[0];
+    await kv.dequeueTransfer(transferId);
+
+    const req = await kv.getTransferRequest(transferId);
+    if (!req) {
+        await processQueue(env, kv, messenger); // Skip invalid, recurse
+        return;
+    }
+
+    const success = await triggerGitHubWorkflow(env, transferId, req);
+    if (success) {
+        await kv.saveActiveTransfer(transferId, {
+            id: transferId, transferRequest: req, status: 'processing', createdAt: Date.now()
+        });
+        await messenger.sendMessage(req.chatId, `🚀 **نوبت شما فرا رسید!** پردازش فایل آغاز شد.`);
+    } else {
+        await messenger.sendMessage(req.chatId, `❌ متاسفانه در ارتباط با سرور پردازش مشکلی رخ داد.`);
+        await processQueue(env, kv, messenger);
+    }
+}
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -17,7 +48,32 @@ export default {
         const kv = new KVService(env);
 
         try {
-            if (path === '/health') return new Response(JSON.stringify({ status: 'healthy', timestamp: Date.now() }), { status: 200 });
+            if (path === '/health') return new Response(JSON.stringify({ status: 'healthy' }), { status: 200 });
+
+            // The Action Webhook Endpoint
+            if (path === '/action-webhook' && request.method === 'POST') {
+                const payload = await request.json() as any;
+                if (payload.action === 'action_update') {
+                    const { transferId, status, retryable } = payload;
+                    const activeReq = await kv.getActiveTransfer(transferId);
+                    
+                    if (activeReq) {
+                        await kv.removeActiveTransfer(transferId);
+                        const messenger = new TelegramPlatform(env);
+
+                        if (status === 'failed' && retryable) {
+                            await kv.enqueueTransfer(transferId);
+                            const pos = await kv.getQueuePosition(transferId);
+                            await messenger.sendMessage(activeReq.transferRequest.chatId, `⚠️ **یک خطای شبکه‌ای موقت رخ داد.**\nدرخواست شما مجدداً به صف بازگشت (موقعیت: ${pos}).`, {
+                                inline_keyboard: [[{ text: '❌ لغو درخواست', callback_data: `queue_cancel:${transferId}` }]]
+                            });
+                        }
+                    }
+                    // Process next in line
+                    await processQueue(env, kv, new TelegramPlatform(env));
+                    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+                }
+            }
 
             if (path === '/telegram') return await this.handleWebhook(request, env, kv, 'telegram');
             if (path === '/bale') return await this.handleWebhook(request, env, kv, 'bale');
@@ -30,6 +86,21 @@ export default {
         }
     },
 
+    // Self-healing cron trigger (If Action dies without firing webhook)
+    async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+        const kv = new KVService(env);
+        const actives = await kv.getAllActiveTransfers();
+        const now = Date.now();
+        
+        for (const act of actives) {
+            // If stuck in processing for > 60 mins, clear it
+            if (now - act.createdAt > 3600000) {
+                await kv.removeActiveTransfer(act.id);
+            }
+        }
+        await processQueue(env, kv, new TelegramPlatform(env));
+    },
+
     getMessenger(env: Env, platform: Platform): Messenger {
         if (platform === 'bale') return new BalePlatform(env);
         if (platform === 'rubika') return new RubikaPlatform(env);
@@ -37,16 +108,11 @@ export default {
     },
 
     async handleWebhook(request: Request, env: Env, kv: KVService, platform: Platform): Promise<Response> {
-        const update = await request.json();
+        const update = await request.json() as any;
         const messenger = this.getMessenger(env, platform);
 
-        if (update.callback_query) {
-            return await this.handleCallbackQuery(update.callback_query, env, kv, messenger, platform);
-        }
-
-        if (update.message) {
-            return await this.processMessage(update.message, env, kv, messenger, platform);
-        }
+        if (update.callback_query) return await this.handleCallbackQuery(update.callback_query, env, kv, messenger, platform);
+        if (update.message) return await this.processMessage(update.message, env, kv, messenger, platform);
 
         return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
@@ -64,49 +130,14 @@ export default {
         const messageId = normalized.raw.message_id || Date.now().toString();
 
         if (normalized.isCallback) {
-            const simulatedQuery = {
-                data: rawText,
-                message: { chat: { id: chatId }, message_id: messageId },
-                from: { id: userId },
-                id: messageId
-            };
-            return await this.handleCallbackQuery(simulatedQuery, env, kv, messenger, 'rubika');
+            return await this.handleCallbackQuery({ data: rawText, message: { chat: { id: chatId }, message_id: messageId }, from: { id: userId }, id: messageId }, env, kv, messenger, 'rubika');
         }
 
         if (rawText) {
             const cleanText = rawText.trim().toLowerCase();
-
             if (cleanText.startsWith('/start')) {
-                const parts = rawText.split(' ');
-                const possibleCode = parts[1] ? parts[1].trim() : '';
-
-                if (possibleCode.match(CONSTANTS.CODE_REGEX)) {
-                    await handleConnectionCode(env, kv, messenger, possibleCode, chatId, 'rubika');
-                    return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
-                }
-
                 await handleStartCommand(env, kv, messenger, chatId, 'rubika', { id: userId, first_name: normalized.userName });
-                return new Response(JSON.stringify({ status: 'start_handled' }), { status: 200 });
-            }
-
-            if (cleanText.startsWith('/link')) {
-                await askLinkSelection(messenger, chatId, 'rubika');
-                return new Response(JSON.stringify({ status: 'link_handled' }), { status: 200 });
-            }
-
-            if (cleanText.startsWith('/unlink')) {
-                await askUnlinkSelection(kv, messenger, chatId);
-                return new Response(JSON.stringify({ status: 'unlink_handled' }), { status: 200 });
-            }
-
-            if (cleanText.startsWith('/status')) {
-                await handleStatusCommand(kv, messenger, chatId);
-                return new Response(JSON.stringify({ status: 'status_handled' }), { status: 200 });
-            }
-
-            if (rawText.match(CONSTANTS.CODE_REGEX)) {
-                await handleConnectionCode(env, kv, messenger, rawText, chatId, 'rubika');
-                return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
+                return new Response(JSON.stringify({ status: 'handled' }), { status: 200 });
             }
         }
 
@@ -115,7 +146,6 @@ export default {
             await processFileTransfer(env, kv, messenger, transferReq);
             return new Response(JSON.stringify({ status: 'file_processed' }), { status: 200 });
         }
-
         return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
@@ -127,38 +157,13 @@ export default {
 
         if (rawText) {
             const cleanText = rawText.toLowerCase();
-
             if (cleanText.startsWith('/start')) {
-                const parts = rawText.split(' ');
-                const possibleCode = parts[1] ? parts[1].trim() : '';
-
-                if (possibleCode.match(CONSTANTS.CODE_REGEX)) {
-                    await handleConnectionCode(env, kv, messenger, possibleCode, chatId, platform, message.from);
-                    return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
-                }
-
                 await handleStartCommand(env, kv, messenger, chatId, platform, message.from);
-                return new Response(JSON.stringify({ status: 'start_handled' }), { status: 200 });
+                return new Response(JSON.stringify({ status: 'handled' }), { status: 200 });
             }
-
-            if (cleanText.startsWith('/link')) {
-                await askLinkSelection(messenger, chatId, platform);
-                return new Response(JSON.stringify({ status: 'link_handled' }), { status: 200 });
-            }
-
-            if (cleanText.startsWith('/unlink')) {
-                await askUnlinkSelection(kv, messenger, chatId);
-                return new Response(JSON.stringify({ status: 'unlink_handled' }), { status: 200 });
-            }
-
             if (cleanText.startsWith('/status')) {
                 await handleStatusCommand(kv, messenger, chatId);
-                return new Response(JSON.stringify({ status: 'status_handled' }), { status: 200 });
-            }
-
-            if (rawText.match(CONSTANTS.CODE_REGEX)) {
-                await handleConnectionCode(env, kv, messenger, rawText, chatId, platform, message.from);
-                return new Response(JSON.stringify({ status: 'code_handled' }), { status: 200 });
+                return new Response(JSON.stringify({ status: 'handled' }), { status: 200 });
             }
         }
 
@@ -168,7 +173,6 @@ export default {
             await processFileTransfer(env, kv, messenger, transferReq);
             return new Response(JSON.stringify({ status: 'file_processed' }), { status: 200 });
         }
-
         return new Response(JSON.stringify({ status: 'ignored' }), { status: 200 });
     },
 
@@ -176,68 +180,45 @@ export default {
         const data = query.data;
         const chatId = query.message?.chat?.id?.toString() || query.chat_id?.toString() || "";
         const messageId = query.message?.message_id?.toString() || query.message_id?.toString() || query.id;
-        const userId = query.from?.id?.toString() || query.sender_id?.toString() || "";
         
         const parts = data.split(':');
         const action = parts[0];
 
-        // 1. Handle Disabled Buttons
         if (action === 'disabled') {
-            // Sends a popup alert instead of sending a message
-            await messenger.answerCallbackQuery(query.id, '❌ این بخش فعلاً غیرفعال است و فایل‌ها فقط در فضای ابری آپلود می‌شوند.');
+            await messenger.answerCallbackQuery(query.id, '❌ این بخش فعلاً غیرفعال است.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
-        // 2. Handle New Link Generation Logic
+        if (action === 'queue_cancel') {
+            const transferId = parts[1];
+            await kv.dequeueTransfer(transferId);
+            await messenger.editMessageText(chatId, messageId, `🛑 **درخواست شما از صف لغو شد.**`);
+            await processQueue(env, kv, messenger);
+            return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+        }
+
         if (action === 'link_gen') {
             const shouldCompress = parts[1] === 'yes';
             const transferId = parts[2];
             const transferReq = await kv.getTransferRequest(transferId);
 
             if (transferReq) {
-                transferReq.destinations = []; // Empty destinations
-                await triggerGitHubWorkflow(env, kv, { ...transferReq, shouldCompress });
+                transferReq.shouldCompress = shouldCompress;
+                await kv.saveTransferRequest(transferId, transferReq);
                 
-                await messenger.editMessageText(chatId, messageId, `✅ **درخواست آپلود ثبت شد.**\n🚀 پردازش فایل آغاز شد. لینک دانلود به‌زودی ارسال می‌شود...`);
+                await kv.enqueueTransfer(transferId);
+                const position = await kv.getQueuePosition(transferId);
+
+                await messenger.editMessageText(chatId, messageId, `⏳ **شما در صف انتظار قرار گرفتید.**\n\n📍 موقعیت شما در صف: **${position}**\n\nسیستم به محض آزاد شدن منابع، فایل را پردازش می‌کند.`, {
+                    inline_keyboard: [[{ text: '❌ انصراف از صف', callback_data: `queue_cancel:${transferId}` }]]
+                });
+
+                // Immediately try to process if resources are free
+                await processQueue(env, kv, messenger);
             } else {
-                await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست انتقال یافت نشد یا منقضی شده است.`);
+                await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست یافت نشد یا منقضی شده است.`);
             }
-            await messenger.answerCallbackQuery(query.id, 'در حال پردازش...');
-            return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
-        }
-
-        if (action === 'link') {
-            const targetPlatform = parts[1] as Platform;
-            const session = await kv.getSession(userId);
-
-            const code = generateConnectionCode();
-            await kv.saveConnectionRequest(code, {
-                telegramUserId: userId,
-                targetPlatform,
-                telegramChatId: chatId,
-                userName: session?.userName || 'کاربر',
-                expiresAt: Date.now() + CONSTANTS.EXPIRATION.CONNECTION_REQUEST * 1000
-            });
-
-            const linkMsg = generatePlatformLink(targetPlatform, code);
-            await messenger.editMessageText(chatId, messageId, linkMsg);
-            await messenger.answerCallbackQuery(query.id, 'کد ایجاد شد.');
-            return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
-        }
-
-        if (action === 'unlink') {
-            const targetPlatform = parts[1] as Platform;
-            await kv.deletePlatformReverseAccount(targetPlatform, chatId);
-            
-            const connectedAcc = await kv.getConnectedAccount(userId);
-            if (connectedAcc) {
-                if (targetPlatform === 'rubika') connectedAcc.rubikaChatId = undefined;
-                if (targetPlatform === 'bale') connectedAcc.baleChatId = undefined;
-                await kv.saveConnectedAccount(userId, connectedAcc);
-            }
-
-            await messenger.editMessageText(chatId, messageId, `✅ **اتصال ${targetPlatform === 'bale' ? 'بله' : 'روبیکا'} قطع شد.**`);
-            await messenger.answerCallbackQuery(query.id, 'حساب قطع شد.');
+            await messenger.answerCallbackQuery(query.id, 'درخواست ثبت شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 
