@@ -1,6 +1,6 @@
-// نسخه جدید (v0.2.0): سیستم اطلاع‌رسانی خودکار نسخه جدید و اعلان انتشار
-export const SYSTEM_VERSION = '0.2.0';
-export const LAST_UPDATE_PERSIAN = 'سیستم اطلاع‌رسانی خودکار انتشار نسخه جدید و نمایش نسخه زنده سرور اضافه شد.';
+// نسخه جدید (v0.2.1): رفع خطای عدم دسترسی به فایل‌سیستم در کلودفلر ورکرز و اصلاح خروجی‌های فایل handler
+export const SYSTEM_VERSION = '0.2.1';
+export const LAST_UPDATE_PERSIAN = 'رفع خطای mkdirSync در محیط کلودفلر ورکرز و اصلاح خروجی‌های توابع پردازش فایل.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
