@@ -1,6 +1,6 @@
-// نسخه جدید (v0.3.5): بازسازی فایل handlers/transfers.ts و صادرات توابع درخواست فایل
-export const SYSTEM_VERSION = '0.3.5';
-export const LAST_UPDATE_PERSIAN = 'بازسازی کامل توابع پردازش درخواست فایل و رفع خطای ناشناخته فایل‌های تعویض‌شده.';
+// نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION در transfer.js
+export const SYSTEM_VERSION = '0.3.6';
+export const LAST_UPDATE_PERSIAN = 'حذف تعریف تکراری متغیر نسخه سیستم در فایل اجرای اکپش‌های گیت‌هاب.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
