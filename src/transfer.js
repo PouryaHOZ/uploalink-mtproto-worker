@@ -313,45 +313,53 @@ class FileTransferBot {
         });
     }
 
-    async uploadToRubikaAsDocument(filePath, fileName, caption, fileSize) {
+        async uploadToRubikaAsDocument(filePath, fileName, caption, fileSize) {
         const rubikaBaseUrl = config.rubika.baseUrl || 'https://botapi.rubika.ir/v3/';
 
-        // 1. Request upload URL
+        // 1. Request Upload URL
         const uploadInfo = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/requestSendFile`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type: 'File' })
         }).then(r => r.json());
 
-        // Rubika wraps response under data object: { status: "OK", data: { upload_url: "..." } }
         const uploadUrl = uploadInfo?.data?.upload_url || uploadInfo?.upload_url;
 
         if (!uploadUrl) {
             throw new Error(`Rubika requestSendFile failed: ${JSON.stringify(uploadInfo)}`);
         }
 
-        // 2. Upload file binary stream
+        // 2. Upload File Stream
+        const formData = new FormData();
+        formData.append('file', fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize }), {
+            filename: fileName,
+            knownLength: fileSize
+        });
+
         const uploadResult = await new Promise((resolve, reject) => {
-            const formData = new FormData();
-            const fileStream = fs.createReadStream(filePath, { highWaterMark: config.performance.uploadChunkSize });
-
-            formData.append('file', fileStream, {
-                filename: fileName,
-                knownLength: fileSize
-            });
-
             const parsedUrl = new URL(uploadUrl);
             const req = https.request({
                 hostname: parsedUrl.hostname,
+                port: parsedUrl.port || 443,
                 path: parsedUrl.pathname + parsedUrl.search,
                 method: 'POST',
-                headers: formData.getHeaders()
+                headers: formData.getHeaders(),
+                timeout: 300000 // 5-minute socket timeout
             }, (res) => {
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
-                    try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+                    try {
+                        resolve(JSON.parse(data));
+                    } catch (e) {
+                        reject(new Error(`Failed to parse Rubika upload response: ${data}`));
+                    }
                 });
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new Error("Rubika file stream upload timed out."));
             });
 
             req.on('error', err => reject(err));
@@ -364,7 +372,7 @@ class FileTransferBot {
             throw new Error(`Rubika binary upload failed: ${JSON.stringify(uploadResult)}`);
         }
 
-        // 3. Finalize message send
+        // 3. Finalize Message Delivery
         const sendResponse = await fetch(`${rubikaBaseUrl}${config.rubika.botToken}/sendFile`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -380,7 +388,7 @@ class FileTransferBot {
         if (!messageId) {
             throw new Error(`Rubika sendFile failed: ${JSON.stringify(sendResponse)}`);
         }
-    }
+	}
 
     splitVideoPlayableSegments(filePath, targetMaxBytes) {
         return new Promise((resolve, reject) => {
