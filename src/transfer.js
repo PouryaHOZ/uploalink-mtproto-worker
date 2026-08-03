@@ -73,6 +73,15 @@ function drawProgressBar(percent, length = 12) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
 class TelegramClientManager {
     constructor() {
         this.client = new TelegramClient(
@@ -109,16 +118,26 @@ class FileTransferBot {
         this.isUpdatingStatus = false;
     }
 
-    async updateStatus(chatId, text) {
-        if (!config.telegram.botToken || !chatId || this.isUpdatingStatus) return;
+    async updateStatus(chatId, text, force = false) {
+        if (!config.telegram.botToken || !chatId) return;
+
+        // Skip non-critical updates if busy
+        if (this.isUpdatingStatus && !force) return;
+
+        // For critical updates (e.g. final link), wait for active lock to release
+        while (this.isUpdatingStatus) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+
         this.isUpdatingStatus = true;
-        
+
         try {
             const endpoint = this.statusMessageId ? 'editMessageText' : 'sendMessage';
             const body = {
                 chat_id: chatId,
                 text: text,
-                parse_mode: 'Markdown'
+                parse_mode: 'HTML',
+                disable_web_page_preview: true
             };
 
             if (this.statusMessageId) {
@@ -131,8 +150,25 @@ class FileTransferBot {
                 body: JSON.stringify(body)
             }).then(r => r.json());
 
-            if (res.ok && !this.statusMessageId) {
-                this.statusMessageId = res.result.message_id;
+            if (res.ok && res.result) {
+                if (!this.statusMessageId) {
+                    this.statusMessageId = res.result.message_id;
+                }
+            } else {
+                console.error(`Telegram API error on ${endpoint}:`, res);
+                // Fallback to sending a new message if editing failed
+                if (endpoint === 'editMessageText') {
+                    delete body.message_id;
+                    const fallbackRes = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    }).then(r => r.json());
+
+                    if (fallbackRes.ok && fallbackRes.result) {
+                        this.statusMessageId = fallbackRes.result.message_id;
+                    }
+                }
             }
         } catch (e) {
             console.error("Failed to update status message:", e);
@@ -166,7 +202,6 @@ class FileTransferBot {
     async uploadToMinIO(filePath, fileName) {
         const bucket = config.minio.bucketName;
 
-        // Ensure bucket exists
         const exists = await minioClient.bucketExists(bucket).catch(() => false);
         if (!exists) {
             await minioClient.makeBucket(bucket, config.minio.region);
@@ -176,10 +211,8 @@ class FileTransferBot {
             'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream'
         };
 
-        // Stream file directly using MinIO's fPutObject
         await minioClient.fPutObject(bucket, fileName, filePath, metaData);
 
-        // Generate a Pre-signed Download URL valid for 7 days (604800 seconds)
         const expirySeconds = 7 * 24 * 60 * 60;
         const presignedUrl = await minioClient.presignedGetObject(bucket, fileName, expirySeconds);
 
@@ -204,7 +237,7 @@ class FileTransferBot {
             downloadedFilePath = path.join(config.performance.tempDir, fileName);
             const client = this.telegramClient.client;
 
-            await this.updateStatus(chatId, `🚀 **انتقال آغاز شد!**\n\n📥 **در حال برقراری ارتباط با سرور...**`);
+            await this.updateStatus(chatId, `🚀 <b>انتقال آغاز شد!</b>\n\n📥 <b>در حال برقراری ارتباط با سرور...</b>`, true);
 
             const messages = await client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
             if (!messages || !messages[0] || !messages[0].media) {
@@ -231,12 +264,12 @@ class FileTransferBot {
                         const percent = total ? Math.floor((downloaded / total) * 100) : 0;
                         const bar = drawProgressBar(percent);
 
-                        const progressMsg = `📥 **در حال دریافت از تلگرام:**\n` +
-                                            `${bar} **${percent}%**\n` +
-                                            `📊 **حجم:** ${formatBytes(downloaded)} / ${formatBytes(total)}\n` +
-                                            `⚡ **سرعت:** ${formatSpeed(speed)}`;
+                        const progressMsg = `📥 <b>در حال دریافت از تلگرام:</b>\n` +
+                                            `${bar} <b>${percent}%</b>\n` +
+                                            `📊 <b>حجم:</b> ${formatBytes(downloaded)} / ${formatBytes(total)}\n` +
+                                            `⚡ <b>سرعت:</b> ${formatSpeed(speed)}`;
 
-                        this.updateStatus(chatId, progressMsg).catch(() => {});
+                        this.updateStatus(chatId, progressMsg, false).catch(() => {});
                     }
                 }
             });
@@ -250,7 +283,7 @@ class FileTransferBot {
 
                 try {
                     if (shouldCompress) {
-                        await this.updateStatus(chatId, `⚙️ **در حال فشرده‌سازی ویدیو به کیفیت 480p...**`);
+                        await this.updateStatus(chatId, `⚙️ <b>در حال فشرده‌سازی ویدیو به کیفیت 480p...</b>`, true);
                         await this.runFFmpeg([
                             '-i', downloadedFilePath,
                             '-threads', '0',
@@ -264,7 +297,7 @@ class FileTransferBot {
                             '-y', processedPath
                         ]);
                     } else {
-                        await this.updateStatus(chatId, `⚙️ **در حال همگام‌سازی فرمت ویدیو برای پخش مستقیم...**`);
+                        await this.updateStatus(chatId, `⚙️ <b>در حال همگام‌سازی فرمت ویدیو برای پخش مستقیم...</b>`, true);
                         await this.runFFmpeg([
                             '-i', downloadedFilePath,
                             '-c', 'copy',
@@ -281,18 +314,17 @@ class FileTransferBot {
             const stats = await fs.promises.stat(targetPath);
             const actualSize = stats.size;
 
-            // Upload to MinIO Host
-            await this.updateStatus(chatId, `☁️ **در حال آپلود فایل در هاست MinIO...**`);
+            await this.updateStatus(chatId, `☁️ <b>در حال آپلود فایل در هاست MinIO...</b>`, true);
             const downloadLink = await this.uploadToMinIO(targetPath, fileName);
 
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
-            const successMsg = `✅ **انتقال با موفقیت کامل شد!**\n\n` +
-                               `📁 **نام فایل:** \`${fileName}\`\n` +
-                               `📏 **حجم نهایی:** ${formatBytes(actualSize)}\n` +
-                               `⏱️ **زمان کل:** ${elapsedTime} ثانیه\n\n` +
-                               `🔗 **لینک دانلود مستقیم (اعتبار ۷ روز):**\n${downloadLink}`;
+            const successMsg = `✅ <b>انتقال با موفقیت کامل شد!</b>\n\n` +
+                               `📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n` +
+                               `📏 <b>حجم نهایی:</b> ${formatBytes(actualSize)}\n` +
+                               `⏱️ <b>زمان کل:</b> ${elapsedTime} ثانیه\n\n` +
+                               `🔗 <b>لینک دانلود مستقیم (اعتبار ۷ روز):</b>\n<a href="${downloadLink}">👉 برای دانلود فایل اینجا کلیک کنید 👈</a>`;
 
-            await this.updateStatus(chatId, successMsg);
+            await this.updateStatus(chatId, successMsg, true);
 
             await this.notifyCloudflare({
                 event: 'transfer_completed',
@@ -310,7 +342,7 @@ class FileTransferBot {
 
         } catch (err) {
             console.error("❌ Transfer Execution Error:", err);
-            await this.updateStatus(chatId, `❌ **خطا در انجام انتقال:**\n\`${err.message || String(err)}\``);
+            await this.updateStatus(chatId, `❌ <b>خطا در انجام انتقال:</b>\n<code>${escapeHtml(err.message || String(err))}</code>`, true);
 
             await this.notifyCloudflare({
                 event: 'transfer_error',
