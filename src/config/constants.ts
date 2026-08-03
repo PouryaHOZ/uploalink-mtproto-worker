@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.3.9';
-export const LAST_UPDATE_PERSIAN = 'افزودن تایم‌اوت ۲ ثانیه‌ای به fetch در checkCancel جهت جلوگیری از معطل شدن دانلود.';
+export const SYSTEM_VERSION = '0.4.0';
+export const LAST_UPDATE_PERSIAN = 'اصلاح گزارش پیشرفت لحظه‌ای FFmpeg و نمایش نوار پیشرفت فشرده‌سازی ویدیو.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,

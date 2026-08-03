@@ -1,3 +1,12 @@
+function parseHms(str) {
+    if (!str) return 0;
+    const parts = str.split(':');
+    if (parts.length === 3) {
+        return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+    }
+    return 0;
+}
+
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const fs = require("fs");
@@ -75,7 +84,7 @@ function drawProgressBar(percent, length = 10) {
 }
 
 // نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
-const SYSTEM_VERSION = '0.3.9';
+const SYSTEM_VERSION = '0.4.0';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -224,10 +233,9 @@ class FileTransferBot {
             let errorLog = '';
 
             this.activeFFmpegProcess.stderr.on('data', data => {
-                const str = data.toString();
-                errorLog += str;
+                errorLog += data.toString();
                 if (!totalDurationSec) {
-                    const match = str.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
+                    const match = errorLog.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
                     if (match) {
                         totalDurationSec = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3]);
                     }
@@ -241,7 +249,9 @@ class FileTransferBot {
                 const lines = data.toString().split('\n');
                 for (const line of lines) {
                     const [key, val] = line.split('=').map(s => s ? s.trim() : '');
-                    if (key === 'out_time_ms') {
+                    if (key === 'out_time') {
+                        outTimeSec = parseHms(val);
+                    } else if (key === 'out_time_us') {
                         outTimeSec = parseInt(val) / 1000000;
                     } else if (key === 'speed') {
                         speedStr = val;
@@ -269,7 +279,7 @@ class FileTransferBot {
         });
     }
 
-    async uploadToMinIO(filePath, fileName, onProgress) {
+        async uploadToMinIO(filePath, fileName, onProgress) {
         const bucket = config.minio.bucketName;
         const metaData = { 'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream' };
         const stats = await fs.promises.stat(filePath);
@@ -385,7 +395,17 @@ class FileTransferBot {
                     const crfValue = shouldCompress ? '28' : '23';
                     const audioBitrate = shouldCompress ? '64k' : '128k';
 
-                    await this.runFFmpeg([
+                                    lastProgressUpdate = 0;
+                await this.updateStatus(chatId, renderProgressCard({
+                    fileName,
+                    masterPercent: 65,
+                    stageName: shouldCompress ? '🗜 فشرده‌سازی و تغییر مقیاس (480p)' : '🎬 بهینه‌سازی ساختار ویدیو (720p)',
+                    stagePercent: 0,
+                    speedText: '1.0x',
+                    etaText: 'محاسبه...'
+                }), true);
+
+                await this.runFFmpeg([
                         '-i', downloadedFilePath,
                         '-threads', '0',
                         '-c:v', 'libx264',
