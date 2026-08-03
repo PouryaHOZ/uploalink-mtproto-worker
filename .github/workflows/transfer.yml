@@ -4,6 +4,10 @@ on:
   repository_dispatch:
     types: [forward_file]
 
+concurrency:
+  group: transfer-${{ github.event.client_payload.TRANSFER_ID || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   transfer:
     runs-on: ubuntu-latest
@@ -13,27 +17,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - name: Setup Node.js with pnpm cache
+      - name: Setup Node.js & pnpm Cache
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: 'pnpm'
 
+      - name: Enable Corepack & pnpm
+        run: corepack enable
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Cache FFmpeg binary
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-static-v1
+
+      - name: Install FFmpeg static binary (on cache miss)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bin
+          curl -sL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ --strip-components=1 -C ~/.local/bin --wildcards '*/ffmpeg'
+          chmod +x ~/.local/bin/ffmpeg
+
+      - name: Add FFmpeg to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - name: Create RAM temp directory
         run: mkdir -p /dev/shm/temp_transfers
-
-      - name: Install FFmpeg
-
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
 
       - name: Execute Transfer Script
         run: node src/transfer.js

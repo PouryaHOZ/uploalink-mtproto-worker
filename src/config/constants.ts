@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.5.3';
-export const LAST_UPDATE_PERSIAN = 'اصلاح دندانه‌گذاری و ساختار YAML در فایل workflow برای رفع خطای Syntax.';
+export const SYSTEM_VERSION = '0.5.5';
+export const LAST_UPDATE_PERSIAN = 'ذخیره‌سازی و کش دستی فایل باینری FFmpeg جهت کاهش زمان اجرا به زیر ۱ ثانیه.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
