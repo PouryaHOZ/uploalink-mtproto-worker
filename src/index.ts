@@ -39,7 +39,9 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
         
         await messenger.sendMessage(
             req.chatId, 
-            `🚀 **نوبت شما فرا رسید!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری...**`,
+            `⚡ **مقداردهی و راه‌اندازی سرور:**\n\n` +
+            `<code>[███░░░░░░░] 30%</code>\n` +
+            `📌 **مرحله:** تخصیص منابع ابری و دریافت اسکریپت...`,
             { inline_keyboard: [[{ text: '🛑 لغو انتقال', callback_data: `cancel_transfer:${transferId}` }]] }
         );
     } else {
