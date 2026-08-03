@@ -75,7 +75,7 @@ function drawProgressBar(percent, length = 10) {
 }
 
 // نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
-const SYSTEM_VERSION = '0.3.6';
+const SYSTEM_VERSION = '0.3.7';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -429,7 +429,6 @@ class FileTransferBot {
                 }
             });
 
-            const actualSize = (await fs.promises.stat(targetPath)).size;
             const actualSize = (await fs.promises.stat(targetPath)).size;
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
             
