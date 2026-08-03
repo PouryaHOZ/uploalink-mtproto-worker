@@ -36,7 +36,7 @@ const config = {
         region: process.env.MINIO_REGION || 'us-east-1'
     },
     performance: {
-        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'),
+        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '16'),
         tempDir: TEMP_DIR
     },
     cloudflare: {
@@ -84,7 +84,7 @@ function drawProgressBar(percent, length = 10) {
 }
 
 // نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
-const SYSTEM_VERSION = '0.4.0';
+const SYSTEM_VERSION = '0.5.0';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -332,11 +332,12 @@ class FileTransferBot {
             const messages = await client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
             if (!messages || !messages[0] || !messages[0].media) throw new Error("پیام یا فایل در تلگرام یافت نشد.");
 
-            const writeStream = fs.createWriteStream(downloadedFilePath, { highWaterMark: 4 * 1024 * 1024 });
+            const writeStream = fs.createWriteStream(downloadedFilePath, { highWaterMark: 16 * 1024 * 1024 });
             let lastProgressUpdate = 0;
             let lastCancelCheck = 0;
 
             await client.downloadMedia(messages[0].media, {
+                partSize: 512 * 1024,
                 outputFile: writeStream,
                 workers: config.performance.downloadWorkers,
                 progressCallback: async (downloaded, total) => {
