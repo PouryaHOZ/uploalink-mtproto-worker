@@ -1,12 +1,3 @@
-function parseHms(str) {
-    if (!str) return 0;
-    const parts = str.split(':');
-    if (parts.length === 3) {
-        return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
-    }
-    return 0;
-}
-
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const fs = require("fs");
@@ -53,6 +44,15 @@ const minioClient = new Minio.Client({
     accessKey: config.minio.accessKey, secretKey: config.minio.secretKey, region: config.minio.region
 });
 
+function parseHms(str) {
+    if (!str) return 0;
+    const parts = str.split(':');
+    if (parts.length === 3) {
+        return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+    }
+    return 0;
+}
+
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return "۰ بایت";
     const k = 1024, sizes = ["بایت", "کیلوبایت", "مگابایت", "گیگابایت"];
@@ -83,26 +83,34 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-// نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
-const SYSTEM_VERSION = '0.5.2';
+const SYSTEM_VERSION = '0.5.3';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
     const stageBar = drawProgressBar(stagePercent, 10);
 
-    let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (v${SYSTEM_VERSION})\n\n`;
-    card += `📊 <b>پیشرفت کل:</b>\n<code>[${masterBar}] ${masterPercent}%</code>\n\n`;
-    card += `🔄 <b>مرحله جاری:</b> ${stageName}\n`;
-    card += `<code>[${stageBar}] ${stagePercent}%</code>\n`;
+    let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (v${SYSTEM_VERSION})
 
-    if (detailsText) card += `⚖️ <b>حجم:</b> ${detailsText}\n`;
-    if (speedText) card += `⚡ <b>سرعت:</b> ${speedText}\n`;
-    if (etaText) card += `⏱️ <b>زمان تقریبی باقی‌مانده:</b> ${etaText}\n`;
+`;
+    card += `📊 <b>پیشرفت کل:</b>
+<code>[${masterBar}] ${masterPercent}%</code>
+
+`;
+    card += `🔄 <b>مرحله جاری:</b> ${stageName}
+`;
+    card += `<code>[${stageBar}] ${stagePercent}%</code>
+`;
+
+    if (detailsText) card += `⚖️ <b>حجم:</b> ${detailsText}
+`;
+    if (speedText) card += `⚡ <b>سرعت:</b> ${speedText}
+`;
+    if (etaText) card += `⏱️ <b>زمان تقریبی باقی‌مانده:</b> ${etaText}
+`;
 
     return card;
 }
 
-// 🔄 INTERNAL RETRY WRAPPER FOR NETWORK RESILIENCY
 async function withRetry(operationName, operation, retries = 3, delay = 5000) {
     for (let i = 1; i <= retries; i++) {
         try {
@@ -125,25 +133,26 @@ class TelegramClientManager {
 }
 
 class FileTransferBot {
-    async checkCancel() {
-        try {
-            const baseUrl = config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '');
-            const res = await fetch(`${baseUrl}/check-cancel?transferId=${config.transferId}`, {
-                headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }, signal: AbortSignal.timeout(2000)
-            }).then(r => r.json());
-            return res.cancelled === true;
-        } catch {
-            return false;
-        }
-    }
-
-
     constructor() {
         this.telegramClient = new TelegramClientManager();
         this.statusMessageId = null;
         this.isUpdatingStatus = false;
         this.activeFFmpegProcess = null;
         this.isCriticalSection = false;
+    }
+
+    async checkCancel() {
+        if (!config.cloudflare.webhookUrl || !config.transferId) return false;
+        try {
+            const baseUrl = config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '');
+            const res = await fetch(`${baseUrl}/check-cancel?transferId=${config.transferId}`, {
+                headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` },
+                signal: AbortSignal.timeout(2000)
+            }).then(r => r.json());
+            return res.cancelled === true;
+        } catch {
+            return false;
+        }
     }
 
     async updateStatus(chatId, text, force = false) {
@@ -174,8 +183,6 @@ class FileTransferBot {
             console.error("Failed to update status message:", e);
         } finally {
             this.isUpdatingStatus = false;
-        this.activeFFmpegProcess = null;
-        this.isCriticalSection = false;
         }
     }
 
@@ -246,7 +253,8 @@ class FileTransferBot {
             let speedStr = '1.0x';
 
             this.activeFFmpegProcess.stdout.on('data', data => {
-                const lines = data.toString().split('\n');
+                const lines = data.toString().split('
+');
                 for (const line of lines) {
                     const [key, val] = line.split('=').map(s => s ? s.trim() : '');
                     if (key === 'out_time') {
@@ -269,7 +277,8 @@ class FileTransferBot {
             this.activeFFmpegProcess.on('close', code => {
                 this.activeFFmpegProcess = null;
                 if (code === 0) resolve();
-                else reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/\n/g, ' ').trim()}`));
+                else reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/
+/g, ' ').trim()}`));
             });
 
             this.activeFFmpegProcess.on('error', err => {
@@ -279,7 +288,7 @@ class FileTransferBot {
         });
     }
 
-        async uploadToMinIO(filePath, fileName, onProgress) {
+    async uploadToMinIO(filePath, fileName, onProgress) {
         const bucket = config.minio.bucketName;
         const metaData = { 'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream' };
         const stats = await fs.promises.stat(filePath);
@@ -337,7 +346,7 @@ class FileTransferBot {
             let lastCancelCheck = 0;
 
             const adaptiveWorkers = fileSize > 50 * 1024 * 1024 ? Math.min(config.performance.downloadWorkers, 20) : 6;
-            
+
             await client.downloadMedia(messages[0].media, {
                 partSize: 512 * 1024,
                 outputFile: writeStream,
@@ -345,7 +354,6 @@ class FileTransferBot {
                 progressCallback: (downloaded, total) => {
                     const now = Date.now();
 
-                    // Non-blocking async cancel check
                     if (now - lastCancelCheck >= 3000) {
                         lastCancelCheck = now;
                         this.checkCancel().then(cancelled => {
@@ -373,12 +381,6 @@ class FileTransferBot {
                             etaText: formatEta(eta)
                         });
 
-                        // Fire and forget status update to never block MTProto network queue
-                        this.updateStatus(chatId, text, false).catch(() => {});
-                    }
-                }
-            });
-
                         this.updateStatus(chatId, text, false).catch(() => {});
                     }
                 }
@@ -387,7 +389,7 @@ class FileTransferBot {
             targetPath = downloadedFilePath;
 
             if (isVideo) {
-                if (await this.checkCancel()) throw new CancellationError("انتقال توسط کاربر لغو شد.");
+                if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
 
                 fileName = `${path.parse(fileName).name}.mp4`;
                 const processedPath = path.join(config.performance.tempDir, `processed_${Date.now()}.mp4`);
@@ -406,17 +408,17 @@ class FileTransferBot {
                     const crfValue = shouldCompress ? '28' : '23';
                     const audioBitrate = shouldCompress ? '64k' : '128k';
 
-                                    lastProgressUpdate = 0;
-                await this.updateStatus(chatId, renderProgressCard({
-                    fileName,
-                    masterPercent: 65,
-                    stageName: shouldCompress ? '🗜 فشرده‌سازی و تغییر مقیاس (480p)' : '🎬 بهینه‌سازی ساختار ویدیو (720p)',
-                    stagePercent: 0,
-                    speedText: '1.0x',
-                    etaText: 'محاسبه...'
-                }), true);
+                    lastProgressUpdate = 0;
+                    await this.updateStatus(chatId, renderProgressCard({
+                        fileName,
+                        masterPercent: 65,
+                        stageName: shouldCompress ? '🗜 فشرده‌سازی و تغییر مقیاس (480p)' : '🎬 بهینه‌سازی ساختار ویدیو (720p)',
+                        stagePercent: 0,
+                        speedText: '1.0x',
+                        etaText: 'محاسبه...'
+                    }), true);
 
-                await this.runFFmpeg([
+                    await this.runFFmpeg([
                         '-i', downloadedFilePath,
                         '-threads', '0',
                         '-c:v', 'libx264',
@@ -445,14 +447,16 @@ class FileTransferBot {
                     });
                     targetPath = processedPath;
                 } catch (ffmpegErr) {
-                    if (await this.checkCancel()) throw new CancellationError("انتقال توسط کاربر لغو شد.");
-                    throw new Error(`مشکل در ساختار فایل ویدیو.\n\nجزئیات فنی: ${ffmpegErr.message}`);
+                    if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
+                    throw new Error(`مشکل در ساختار فایل ویدیو.
+
+جزئیات فنی: ${ffmpegErr.message}`);
                 } finally {
                     clearInterval(cancelCheckInterval);
                 }
             }
 
-            if (await this.checkCancel()) throw new CancellationError("انتقال توسط کاربر لغو شد.");
+            if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
             this.isCriticalSection = true;
 
             const downloadLink = await this.uploadToMinIO(targetPath, fileName, (subPercent, sizeText, speedText, etaText) => {
@@ -480,7 +484,15 @@ class FileTransferBot {
             const actualSize = (await fs.promises.stat(targetPath)).size;
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
             
-            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n📏 <b>حجم:</b> ${formatBytes(actualSize)}\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت منقضی و فایل به صورت خودکار حذف می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
+            const successMsg = `✅ <b>انتقال کامل شد!</b>
+
+<code>[██████████] 100%</code>
+📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>
+📏 <b>حجم:</b> ${formatBytes(actualSize)}
+⏱️ <b>زمان:</b> ${elapsedTime} ثانیه
+⚠️ <b>لینک پس از ۲ ساعت منقضی و فایل به صورت خودکار حذف می‌شود.</b>
+
+🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
 
             await this.updateStatus(chatId, successMsg, true);
             await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'completed' });
@@ -488,7 +500,10 @@ class FileTransferBot {
         } catch (err) {
             console.error("❌ Transfer Execution Error:", err);
             const isNetworkError = err.message.includes('TCPFull') || err.message.includes('fetch') || err.message.includes('ECONNRESET') || err.message.includes('Timeout');
-            await this.updateStatus(chatId, `❌ <b>خطا در انجام عملیات:</b>\n<code>${escapeHtml(err.message)}</code>${isNetworkError ? '\n\n🔄 در حال بازگشت به صف برای تلاش مجدد...' : ''}`, true);
+            await this.updateStatus(chatId, `❌ <b>خطا در انجام عملیات:</b>
+<code>${escapeHtml(err.message)}</code>${isNetworkError ? '
+
+🔄 در حال بازگشت به صف برای تلاش مجدد...' : ''}`, true);
             await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'failed', error: err.message, retryable: isNetworkError });
         } finally {
             if (downloadedFilePath) await this.cleanupFile(downloadedFilePath);
