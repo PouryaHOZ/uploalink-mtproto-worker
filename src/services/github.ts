@@ -1,9 +1,17 @@
 import { Env, TransferRequest } from '../types';
 
-export async function triggerGitHubWorkflow(env: Env, transferId: string, transferRequest: TransferRequest): Promise<boolean> {
-    if (!env.GITHUB_ACTIONS_WEBHOOK || !env.GITHUB_TOKEN) {
-        console.error("GitHub Action configurations are missing.");
-        return false;
+export async function triggerGitHubWorkflow(env: Env, transferId: string, transferRequest: TransferRequest): Promise<{ success: boolean; error?: string }> {
+    const token = env.GITHUB_TOKEN;
+    if (!token) {
+        console.error("GITHUB_TOKEN is missing.");
+        return { success: false, error: "GITHUB_TOKEN تنظیم نشده است." };
+    }
+
+    // Determine the correct GitHub API dispatch endpoint
+    let dispatchUrl = env.GITHUB_ACTIONS_WEBHOOK;
+    if (!dispatchUrl || !dispatchUrl.startsWith('https://api.github.com')) {
+        const repo = env.GITHUB_REPO || 'PouryaHOZ/uploalink-mtproto-worker';
+        dispatchUrl = `https://api.github.com/repos/${repo}/dispatches`;
     }
 
     const payload = {
@@ -20,12 +28,12 @@ export async function triggerGitHubWorkflow(env: Env, transferId: string, transf
     };
 
     try {
-        const res = await fetch(env.GITHUB_ACTIONS_WEBHOOK, {
+        const res = await fetch(dispatchUrl, {
             method: 'POST',
             headers: {
                 'Accept': 'application/vnd.github.v3+json',
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${env.GITHUB_TOKEN}`,
+                'Authorization': `Bearer ${token}`,
                 'User-Agent': 'Cloudflare-Worker'
             },
             body: JSON.stringify(payload)
@@ -33,12 +41,14 @@ export async function triggerGitHubWorkflow(env: Env, transferId: string, transf
 
         if (!res.ok) {
             const errorText = await res.text();
-            console.error(`GitHub Action Trigger Failed [HTTP ${res.status}]:`, errorText);
-            return false;
+            console.error(`GitHub Dispatch Failed [HTTP ${res.status}]:`, errorText);
+            return { success: false, error: `GitHub API HTTP ${res.status}: ${errorText.slice(0, 100)}` };
         }
-        return true;
-    } catch (err) {
+
+        console.log("✅ GitHub Action Triggered Successfully!");
+        return { success: true };
+    } catch (err: any) {
         console.error("Network error triggering GitHub Action:", err);
-        return false;
+        return { success: false, error: err.message || String(err) };
     }
 }

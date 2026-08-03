@@ -4,7 +4,6 @@ import { CONSTANTS } from '../config/constants';
 export class KVService {
     constructor(private env: Env) {}
 
-    // ... (Keep existing Session/Connection/Platform account methods exactly as they were) ...
     async saveSession(userId: string, data: object): Promise<void> { await this.env.LINKS.put(`session:${userId}`, JSON.stringify(data), { expirationTtl: CONSTANTS.EXPIRATION.SESSION }); }
     async getSession(userId: string): Promise<any> { return await this.env.LINKS.get(`session:${userId}`, { type: 'json' }).catch(() => null); }
     async saveConnectionRequest(code: string, data: object): Promise<void> { await this.env.LINKS.put(`connection_request:${code}`, JSON.stringify(data), { expirationTtl: CONSTANTS.EXPIRATION.CONNECTION_REQUEST }); }
@@ -16,7 +15,6 @@ export class KVService {
     async getPlatformReverseAccount(platform: string, chatId: string): Promise<any> { return await this.env.LINKS.get(`connected_account:${platform}:${chatId}`, { type: 'json' }).catch(() => null); }
     async deletePlatformReverseAccount(platform: string, chatId: string): Promise<void> { await this.env.LINKS.delete(`connected_account:${platform}:${chatId}`); }
 
-    // --- TRANSFER & QUEUE LOGIC ---
     async saveTransferRequest(transferId: string, data: TransferRequest): Promise<void> {
         await this.env.LINKS.put(`transfer:${transferId}`, JSON.stringify(data), { expirationTtl: CONSTANTS.EXPIRATION.STATE_TRANSFER });
     }
@@ -24,7 +22,7 @@ export class KVService {
         return await this.env.LINKS.get(`transfer:${transferId}`, { type: 'json' }).catch(() => null);
     }
     
-    // Core Queue System
+    // --- QUEUE SYSTEM ---
     async getQueue(): Promise<string[]> {
         const q = await this.env.LINKS.get('transfer_queue', { type: 'json' });
         return Array.isArray(q) ? q : [];
@@ -67,18 +65,29 @@ export class KVService {
         await this.env.LINKS.delete(`active_transfer:${transferId}`);
     }
 
-    async getActiveTransfersCount(): Promise<number> {
+    // Purges active transfers older than 10 minutes (zombie tasks) and returns valid active transfers
+    async sweepAndGetActiveTransfers(): Promise<ActiveTransfer[]> {
+        const transfers: ActiveTransfer[] = [];
         const keys = await this.env.LINKS.list({ prefix: 'active_transfer:' });
-        return keys.keys.length;
+        const now = Date.now();
+        const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+
+        for (const key of keys.keys) {
+            const data = await this.env.LINKS.get(key.name, { type: 'json' }).catch(() => null) as ActiveTransfer | null;
+            if (data) {
+                if (now - data.createdAt > STALE_THRESHOLD_MS) {
+                    await this.env.LINKS.delete(key.name); // Sweep zombie key
+                } else {
+                    transfers.push(data);
+                }
+            } else {
+                await this.env.LINKS.delete(key.name);
+            }
+        }
+        return transfers;
     }
 
     async getAllActiveTransfers(): Promise<ActiveTransfer[]> {
-        const transfers: ActiveTransfer[] = [];
-        const keys = await this.env.LINKS.list({ prefix: 'active_transfer:' });
-        for (const key of keys.keys) {
-            const data = await this.env.LINKS.get(key.name, { type: 'json' }).catch(() => null);
-            if (data) transfers.push(data as ActiveTransfer);
-        }
-        return transfers;
+        return await this.sweepAndGetActiveTransfers();
     }
 }

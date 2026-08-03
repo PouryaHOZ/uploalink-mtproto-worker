@@ -10,12 +10,11 @@ import { createTransferRequest, processFileTransfer } from './handlers/transfers
 import { triggerGitHubWorkflow } from './services/github';
 import { generateConnectionCode, generatePlatformLink } from './utils/helpers';
 
-// Helper to push queue items to active execution when slots open up
 async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
     const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
-    const activeCount = await kv.getActiveTransfersCount();
+    const validActiveTransfers = await kv.sweepAndGetActiveTransfers();
 
-    if (activeCount >= MAX_CONCURRENT) return;
+    if (validActiveTransfers.length >= MAX_CONCURRENT) return;
 
     const queue = await kv.getQueue();
     if (queue.length === 0) return;
@@ -25,12 +24,12 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
 
     const req = await kv.getTransferRequest(transferId);
     if (!req) {
-        await processQueue(env, kv, messenger); // Recurse on invalid item
+        await processQueue(env, kv, messenger);
         return;
     }
 
-    const success = await triggerGitHubWorkflow(env, transferId, req);
-    if (success) {
+    const triggerResult = await triggerGitHubWorkflow(env, transferId, req);
+    if (triggerResult.success) {
         await kv.saveActiveTransfer(transferId, {
             id: transferId,
             transferRequest: req,
@@ -40,10 +39,10 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
         
         await messenger.sendMessage(
             req.chatId, 
-            `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری... (این مرحله چند ثانیه زمان می‌برد)**`
+            `🚀 **نوبت شما فرا رسید!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری...**`
         );
     } else {
-        await messenger.sendMessage(req.chatId, `❌ متاسفانه در ارتباط با سرور پردازش مشکلی رخ داد.`);
+        await messenger.sendMessage(req.chatId, `❌ **خطا در شروع سرور پردازش:**\n\`${triggerResult.error}\``);
         await processQueue(env, kv, messenger);
     }
 }
@@ -57,7 +56,6 @@ export default {
         try {
             if (path === '/health') return new Response(JSON.stringify({ status: 'healthy' }), { status: 200 });
 
-            // Action Webhook Endpoint
             if (path === '/action-webhook' && request.method === 'POST') {
                 const payload = await request.json() as any;
                 if (payload.action === 'action_update') {
@@ -96,14 +94,7 @@ export default {
 
     async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
         const kv = new KVService(env);
-        const actives = await kv.getAllActiveTransfers();
-        const now = Date.now();
-        
-        for (const act of actives) {
-            if (now - act.createdAt > 3600000) {
-                await kv.removeActiveTransfer(act.id);
-            }
-        }
+        await kv.sweepAndGetActiveTransfers();
         await processQueue(env, kv, new TelegramPlatform(env));
     },
 
@@ -213,12 +204,14 @@ export default {
                 await kv.saveTransferRequest(transferId, transferReq);
 
                 const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
-                const activeCount = await kv.getActiveTransfersCount();
+                
+                // 1. Purge zombie active transfers
+                const activeTransfers = await kv.sweepAndGetActiveTransfers();
 
-                // Direct Execution Route: If capacity exists, start workflow immediately
-                if (activeCount < MAX_CONCURRENT) {
-                    const success = await triggerGitHubWorkflow(env, transferId, transferReq);
-                    if (success) {
+                // 2. Direct Execution Path if slots are available
+                if (activeTransfers.length < MAX_CONCURRENT) {
+                    const triggerResult = await triggerGitHubWorkflow(env, transferId, transferReq);
+                    if (triggerResult.success) {
                         await kv.saveActiveTransfer(transferId, {
                             id: transferId,
                             transferRequest: transferReq,
@@ -233,10 +226,15 @@ export default {
                         );
                         await messenger.answerCallbackQuery(query.id, 'پردازش آغاز شد.');
                         return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+                    } else {
+                        // Display the exact error if dispatch failed
+                        await messenger.editMessageText(chatId, messageId, `❌ **خطا در ارسال درخواست به سرور پردازش:**\n\`${triggerResult.error}\``);
+                        await messenger.answerCallbackQuery(query.id, 'خطا در اجرای درخواست.');
+                        return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
                     }
                 }
 
-                // Fallback Queue Route: Executed only if active slots are occupied or immediate trigger failed
+                // 3. Fallback Queue Path if all slots are active
                 await kv.enqueueTransfer(transferId);
                 const position = await kv.getQueuePosition(transferId);
 
