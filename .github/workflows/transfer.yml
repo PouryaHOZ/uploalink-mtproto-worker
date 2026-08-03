@@ -13,33 +13,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js with pnpm cache
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: 22
+          cache: 'pnpm'
 
-      - name: Cache FFmpeg Binary
-        id: cache-ffmpeg
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/bin/ffmpeg
-          key: ffmpeg-binary-v1
-
-      - name: Download FFmpeg (if cache miss)
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/.local/bin
-          curl -sL https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-linux-64.zip -o /tmp/ffmpeg.zip
-          unzip -q /tmp/ffmpeg.zip -d ~/.local/bin
-          chmod +x ~/.local/bin/ffmpeg
-          rm /tmp/ffmpeg.zip
-
-      - name: Add FFmpeg to PATH
-        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      - name: Install Node Dependencies
-        run: npm ci --prefer-offline --no-audit
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Create RAM temp directory
         run: mkdir -p /dev/shm/temp_transfers
