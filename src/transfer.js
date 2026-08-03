@@ -83,7 +83,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '0.6.4';
+const SYSTEM_VERSION = '0.6.5'; // Bumped version
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -125,10 +125,12 @@ class TelegramClientManager {
 class FileTransferBot {
     constructor() {
         this.telegramClient = new TelegramClientManager();
-        this.statusMessageId = null;
+        // FIX 1: Hydrate statusMessageId immediately from env so we edit the existing message!
+        this.statusMessageId = process.env.MESSAGE_ID ? parseInt(process.env.MESSAGE_ID) : null;
         this.isUpdatingStatus = false;
         this.activeFFmpegProcess = null;
         this.isCriticalSection = false;
+        this.isCancelled = false; // Add cancellation state
     }
 
     async checkCancel() {
@@ -329,25 +331,28 @@ class FileTransferBot {
             const messages = await client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
             if (!messages || !messages[0] || !messages[0].media) throw new Error("پیام یا فایل در تلگرام یافت نشد.");
 
-            const writeStream = fs.createWriteStream(downloadedFilePath, { highWaterMark: 16 * 1024 * 1024 });
             let lastProgressUpdate = 0;
             let lastCancelCheck = 0;
 
-            const adaptiveWorkers = fileSize > 50 * 1024 * 1024 ? Math.min(config.performance.downloadWorkers, 20) : 6;
+            // FIX 2: We use max available workers natively, not restricting it for small files.
+            const adaptiveWorkers = Math.max(config.performance.downloadWorkers, 16);
 
             await client.downloadMedia(messages[0].media, {
                 partSize: 512 * 1024,
-                outputFile: writeStream,
+                outputFile: downloadedFilePath, // FIX 2: Replaced the Stream with the file path string directly! True parallel chunks!
                 workers: adaptiveWorkers,
                 progressCallback: (downloaded, total) => {
                     const now = Date.now();
 
+                    // FIX 3: Clean cancellation error trigger without needing writeStream
+                    if (this.isCancelled) {
+                        throw new Error("انتقال توسط کاربر لغو شد."); 
+                    }
+
                     if (now - lastCancelCheck >= 3000) {
                         lastCancelCheck = now;
                         this.checkCancel().then(cancelled => {
-                            if (cancelled) {
-                                writeStream.destroy();
-                            }
+                            if (cancelled) this.isCancelled = true;
                         }).catch(() => {});
                     }
 
