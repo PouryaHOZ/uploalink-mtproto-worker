@@ -1,6 +1,6 @@
-// نسخه جدید (v0.2.1): رفع خطای عدم دسترسی به فایل‌سیستم در کلودفلر ورکرز و اصلاح خروجی‌های فایل handler
-export const SYSTEM_VERSION = '0.2.1';
-export const LAST_UPDATE_PERSIAN = 'رفع خطای mkdirSync در محیط کلودفلر ورکرز و اصلاح خروجی‌های توابع پردازش فایل.';
+// نسخه جدید (v0.2.2): اضافه کردن خروجی توابع handlers/transfers.ts و حذف کامل ماژول فایل‌سیستم
+export const SYSTEM_VERSION = '0.2.2';
+export const LAST_UPDATE_PERSIAN = 'اضافه کردن خروجی توابع پردازش فایل و حذف کامل عملیات فایل‌سیستم در محیط ورکر.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
