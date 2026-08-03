@@ -427,6 +427,7 @@ class FileTransferBot {
             });
 
             const actualSize = (await fs.promises.stat(targetPath)).size;
+            const actualSize = (await fs.promises.stat(targetPath)).size;
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
             
             const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n📏 <b>حجم:</b> ${formatBytes(actualSize)}\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت منقضی و فایل به صورت خودکار حذف می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
