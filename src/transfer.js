@@ -83,7 +83,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '0.6.5'; // Bumped version
+const SYSTEM_VERSION = '0.6.5';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -125,12 +125,11 @@ class TelegramClientManager {
 class FileTransferBot {
     constructor() {
         this.telegramClient = new TelegramClientManager();
-        // FIX 1: Hydrate statusMessageId immediately from env so we edit the existing message!
         this.statusMessageId = process.env.MESSAGE_ID ? parseInt(process.env.MESSAGE_ID) : null;
         this.isUpdatingStatus = false;
         this.activeFFmpegProcess = null;
         this.isCriticalSection = false;
-        this.isCancelled = false; // Add cancellation state
+        this.isCancelled = false;
     }
 
     async checkCancel() {
@@ -334,17 +333,15 @@ class FileTransferBot {
             let lastProgressUpdate = 0;
             let lastCancelCheck = 0;
 
-            // FIX 2: We use max available workers natively, not restricting it for small files.
             const adaptiveWorkers = Math.max(config.performance.downloadWorkers, 16);
 
             await client.downloadMedia(messages[0].media, {
                 partSize: 512 * 1024,
-                outputFile: downloadedFilePath, // FIX 2: Replaced the Stream with the file path string directly! True parallel chunks!
+                outputFile: downloadedFilePath,
                 workers: adaptiveWorkers,
                 progressCallback: (downloaded, total) => {
                     const now = Date.now();
 
-                    // FIX 3: Clean cancellation error trigger without needing writeStream
                     if (this.isCancelled) {
                         throw new Error("انتقال توسط کاربر لغو شد."); 
                     }
