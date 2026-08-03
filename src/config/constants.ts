@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.5.0';
-export const LAST_UPDATE_PERSIAN = 'افزایش چشمگیر سرعت دانلود MTProto با چانک‌های ۵۱۲ کیلوبایتی و ۱۶ ورکر همزمان.';
+export const SYSTEM_VERSION = '0.5.1';
+export const LAST_UPDATE_PERSIAN = 'معماری پویا برای دانلود هوشمند: تنظیم متوازن ورکرها بر اساس حجم فایل و حذف تاخیر UI.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,

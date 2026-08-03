@@ -84,7 +84,7 @@ function drawProgressBar(percent, length = 10) {
 }
 
 // نسخه جدید (v0.3.6): تعریف یکتا نسخه زنده سیستم
-const SYSTEM_VERSION = '0.5.0';
+const SYSTEM_VERSION = '0.5.1';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText }) {
     const masterBar = drawProgressBar(masterPercent, 12);
@@ -336,22 +336,26 @@ class FileTransferBot {
             let lastProgressUpdate = 0;
             let lastCancelCheck = 0;
 
+            const adaptiveWorkers = fileSize > 50 * 1024 * 1024 ? Math.min(config.performance.downloadWorkers, 20) : 6;
+            
             await client.downloadMedia(messages[0].media, {
                 partSize: 512 * 1024,
                 outputFile: writeStream,
-                workers: config.performance.downloadWorkers,
-                progressCallback: async (downloaded, total) => {
+                workers: adaptiveWorkers,
+                progressCallback: (downloaded, total) => {
                     const now = Date.now();
 
+                    // Non-blocking async cancel check
                     if (now - lastCancelCheck >= 3000) {
                         lastCancelCheck = now;
-                        if (await this.checkCancel()) {
-                            writeStream.destroy();
-                            throw new CancellationError("انتقال توسط کاربر لغو شد.");
-                        }
+                        this.checkCancel().then(cancelled => {
+                            if (cancelled) {
+                                writeStream.destroy();
+                            }
+                        }).catch(() => {});
                     }
 
-                    if (now - lastProgressUpdate >= 3500 || downloaded === total) {
+                    if (now - lastProgressUpdate >= 3000 || downloaded === total) {
                         lastProgressUpdate = now;
                         const subPercent = total ? Math.floor((downloaded / total) * 100) : 0;
                         const masterPercent = Math.min(65, 40 + Math.floor(subPercent * 0.25));
@@ -368,6 +372,12 @@ class FileTransferBot {
                             speedText: formatSpeed(speed),
                             etaText: formatEta(eta)
                         });
+
+                        // Fire and forget status update to never block MTProto network queue
+                        this.updateStatus(chatId, text, false).catch(() => {});
+                    }
+                }
+            });
 
                         this.updateStatus(chatId, text, false).catch(() => {});
                     }
