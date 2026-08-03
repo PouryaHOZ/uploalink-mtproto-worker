@@ -1,6 +1,6 @@
 // نسخه جدید (v0.3.6): رفع خطای تعریف تکراری SYSTEM_VERSION و اصلاح فایل transfer.js
-export const SYSTEM_VERSION = '0.6.0';
-export const LAST_UPDATE_PERSIAN = 'انتقال تنظیمات only-built-dependencies به فایل .npmrc جهت سازگاری کامل با pnpm v11.';
+export const SYSTEM_VERSION = '0.6.1';
+export const LAST_UPDATE_PERSIAN = 'غیرفعال‌سازی اجرای اسکریپت‌های ساخت در CI با افزودن --ignore-scripts و تنظیم .npmrc جهت رفع خطای ERR_PNPM_IGNORED_BUILDS.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,

@@ -36,7 +36,7 @@ jobs:
         run: |
           corepack enable
           pnpm config set verify-deps-before-run false
-          pnpm install --prod --no-frozen-lockfile
+          pnpm install --prod --no-frozen-lockfile --ignore-scripts
 
       - name: Cache FFmpeg static binary
         id: cache-ffmpeg
