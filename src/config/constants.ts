@@ -1,6 +1,6 @@
-// نسخه جدید (v0.3.2): حذف کامل ماژول فایل‌سیستم از ورکر کلودفلر و افزودن export به توابع پردازش
-export const SYSTEM_VERSION = '0.3.2';
-export const LAST_UPDATE_PERSIAN = 'رفع خطای عدم دسترسی به فایل‌سیستم در کلودفلر ورکرز و صادرات رسمی توابع پردازش درخواست.';
+// نسخه جدید (v0.3.3): همگام‌سازی ورژن زنده و افزودن کلیدهای export به توابع handler
+export const SYSTEM_VERSION = '0.3.3';
+export const LAST_UPDATE_PERSIAN = 'رفع کامل خطاهای کامپایل Cloudflare Workers با صادرات صریح توابع پردازش درخواست.';
 
 export const CONSTANTS = {
     CODE_REGEX: /^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$|^[A-Za-z0-9]{8}$/,
