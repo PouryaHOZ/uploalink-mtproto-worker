@@ -71,10 +71,11 @@ CREATE TABLE IF NOT EXISTS message_state (
     used_at           INTEGER,
     used_expires_at   INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_msg_free ON message_state(message_id)
-    WHERE used = 0 AND (locked = 0 OR lock_expires_at <= CAST(strftime('%s','now') AS INTEGER));
-CREATE INDEX IF NOT EXISTS idx_msg_lock_expiry ON message_state(lock_expires_at) WHERE locked = 1;
-CREATE INDEX IF NOT EXISTS idx_msg_used_expiry ON message_state(used_expires_at) WHERE used = 1;
+-- Note: Partial indexes with strftime() are not allowed in D1/SQLite
+-- Use regular indexes instead - the WHERE clause filtering happens at query time
+CREATE INDEX IF NOT EXISTS idx_msg_free ON message_state(used, locked, lock_expires_at);
+CREATE INDEX IF NOT EXISTS idx_msg_lock_expiry ON message_state(lock_expires_at);
+CREATE INDEX IF NOT EXISTS idx_msg_used_expiry ON message_state(used_expires_at);
 
 -- ===== 5) Settings (mutable without redeploy) =====
 CREATE TABLE IF NOT EXISTS settings (

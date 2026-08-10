@@ -272,7 +272,10 @@ export class MessagePool {
             'unique constraint',
             'database binding',
             'not configured',
-            'near "("'  // SQL syntax errors often show like this
+            'near "("',  // SQL syntax errors often show like this
+            'strftime',   // Non-deterministic function in index
+            'non-deterministic',  // D1/SQLite deterministic error
+            'SQLITE_ERROR'  // SQLite-level errors
         ];
 
         for (const pattern of nonRetryablePatterns) {
