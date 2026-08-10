@@ -1,27 +1,47 @@
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "lively-leaf-6a9c",
-	"main": "src/index.ts",
-	"compatibility_date": "2026-07-27",
-	"observability": {
-		"enabled": true
-	},
-	"upload_source_maps": true,
-	"compatibility_flags": [
-		"nodejs_compat"
-	],
-	"kv_namespaces": [
-		{
-			"binding": "LINKS",
-			"id": "c83364535de2446694a1ab74aa3d640f",
-			"preview_id": "c83364535de2446694a1ab74aa3d640f"
-		}
-	],
-	"vars": {
-		"TELEGRAM_BASE_URL": "https://api.telegram.org",
-		"BALE_BASE_URL": "https://tapi.bale.ai",
-		"RUBIKA_BASE_URL": "https://botapi.rubika.ir/v3/",
-		"MAX_CONCURRENT_TRANSFERS": "5",
-		"RATE_LIMIT": "10"
-	}
+        "$schema": "node_modules/wrangler/config-schema.json",
+        "name": "lively-leaf-6a9c",
+        "main": "src/index.ts",
+        "compatibility_date": "2026-07-27",
+        "observability": {
+                "enabled": true
+        },
+        "upload_source_maps": true,
+        "compatibility_flags": [
+                "nodejs_compat"
+        ],
+        "kv_namespaces": [
+                {
+                        "binding": "LINKS",
+                        "id": "c83364535de2446694a1ab74aa3d640f",
+                        "preview_id": "c83364535de2446694a1ab74aa3d640f"
+                }
+        ],
+        "d1_databases": [
+                {
+                        "binding": "DB",
+                        "database_name": "tg-bot-db",
+                        "database_id": "307f19d7-506a-4185-9f5e-897de5f980dd",
+                        "preview_database_id": "307f19d7-506a-4185-9f5e-897de5f980dd",
+                        "migrations_dir": "migrations"
+                }
+        ],
+        "triggers": {
+                "crons": [
+                        "*/1 * * * *",
+                        "*/2 * * * *",
+                        "0 * * * *",
+                        "0 0 * * *",
+                        "0 */6 * * *"
+                ]
+        },
+        "vars": {
+                "TELEGRAM_BASE_URL": "https://api.telegram.org",
+                "BALE_BASE_URL": "https://tapi.bale.ai",
+                "RUBIKA_BASE_URL": "https://botapi.rubika.ir/v3/",
+                "MAX_CONCURRENT_TRANSFERS": "5",
+                "RATE_LIMIT": "10",
+                "DARAMET_USERNAME": "baguette219",
+                "DARAMET_BASE_URL": "https://daramet.com"
+        }
 }

@@ -2,7 +2,7 @@ import { KVService } from '../services/kv';
 import { Messenger } from '../platforms/messenger';
 import { TelegramPlatform } from '../platforms/telegram';
 import { Platform, Env, ConnectedAccount } from '../types';
-import { generateConnectionCode, generatePlatformLink, toPersianDigits } from '../utils/helpers';
+import { generateConnectionCode, generatePlatformLink, toPersianDigits, formatBytes, formatDuration } from '../utils/helpers';
 import { generateSimpleToken } from '../utils/crypto';
 import { CONSTANTS } from '../config/constants';
 
@@ -20,10 +20,17 @@ export async function handleStartCommand(env: Env, kv: KVService, messenger: Mes
     const baleStatus = connectedAcc?.baleChatId ? '✅ متصل' : '❌ غیرمتصل';
 
     const welcomeMessage = platform === 'telegram'
-        ? `✨ **به ربات انتقال هوشمند فایل خوش آمدید!**\n\n👤 **کاربر:** ${userName}\n📌 **وضعیت اتصال پلتفرم‌ها:**\n• روبیکا: ${rubikaStatus}\n• بله: ${baleStatus}\n\n⚡ **راهنمای سریع:**\n۱. با دستور /link حساب‌های خود را متصل کنید.\n۲. هر فایلی را در تلگرام ارسال کنید تا انتقال یابد.\n۳. با /status وضعیت ویدیوها و فایل‌ها را پیگیری کنید.`
+        ? `✨ **به ربات انتقال هوشمند فایل خوش آمدید!**\n\n👤 **کاربر:** ${userName}\n📌 **وضعیت اتصال پلتفرم‌ها:**\n• روبیکا: ${rubikaStatus}\n• بله: ${baleStatus}\n\n⚡ **راهنمای سریع:**\n۱. با دستور /link حساب‌های خود را متصل کنید.\n۲. هر فایلی را در تلگرام ارسال کنید تا انتقال یابد.\n۳. با /status وضعیت ویدیوها و فایل‌ها را پیگیری کنید.\n۴. با /subscribe اشتراک تهیه کنید و سهمیه بیشتر بگیرید.`
         : `👋 **سلام ${userName}!**\n\nبرای اتصال این پلتفرم به تلگرام، ابتدا دستور /start را در ربات تلگرام ارسال کنید.`;
 
-    await messenger.sendMessage(chatId, welcomeMessage);
+    const inlineKeyboard = platform === 'telegram' ? {
+        inline_keyboard: [
+            [{ text: '💎 خرید اشتراک', callback_data: 'sub_buy' },
+             { text: '📊 وضعیت اشتراک', callback_data: 'sub_status' }]
+        ]
+    } : undefined;
+
+    await messenger.sendMessage(chatId, welcomeMessage, inlineKeyboard);
 }
 
 export async function handleConnectionCode(env: Env, kv: KVService, messenger: Messenger, code: string, chatId: string, platform: Platform, user?: any): Promise<void> {
@@ -99,7 +106,7 @@ export async function askUnlinkSelection(kv: KVService, messenger: Messenger, ch
     await messenger.sendMessage(chatId, `⚠️ **قطع اتصال پلتفرم‌ها:**\nکدام اتصال حذف شود؟`, { inline_keyboard: [buttons] });
 }
 
-export async function handleStatusCommand(kv: KVService, messenger: Messenger, chatId: string): Promise<void> {
+export async function handleStatusCommand(env: Env, kv: KVService, messenger: Messenger, chatId: string, userId?: string): Promise<void> {
     const account = await kv.getConnectedAccount(chatId);
     const rubikaStatus = account?.rubikaChatId ? '✅ متصل' : '❌ غیرمتصل';
     const baleStatus = account?.baleChatId ? '✅ متصل' : '❌ غیرمتصل';
@@ -118,6 +125,46 @@ export async function handleStatusCommand(kv: KVService, messenger: Messenger, c
         userTransfers.forEach((t, i) => {
             statusCard += `${toPersianDigits((i + 1).toString())}. **${t.transferRequest.fileName}** — وضعیت: \`${t.status}\`\n`;
         });
+    }
+
+    // ===== Subscription & Quota info (extended) =====
+    if (userId) {
+        const { QuotaService } = await import('../services/quota');
+        const { PaymentService } = await import('../services/payment');
+        const quotaService = new QuotaService(env);
+        const paymentService = new PaymentService(env);
+
+        const sub = await quotaService.getSubscriptionForDisplay(userId);
+        const usage = await quotaService.getTodayUsage(userId);
+        const pending = await paymentService.getActivePendingPayment(userId);
+
+        statusCard += `\n────────────────\n💎 **اشتراک:**\n`;
+        if (sub && sub.expiry_date > Date.now()) {
+            const remaining = sub.expiry_date - Date.now();
+            const tierName = sub.tier === 'shared' ? 'اشتراکی' : 'آزمایشی';
+            statusCard += `• نوع: ${tierName}\n`;
+            statusCard += `• باقی‌مانده: ${formatDuration(remaining / 1000)}\n`;
+        } else if (sub && sub.expiry_date <= Date.now()) {
+            statusCard += `• ❌ منقضی — برای تمدید /subscribe\n`;
+        } else {
+            statusCard += `• 🆓 آزمایشی (۵۰۰ مگابایت/روز)\n`;
+        }
+
+        if (usage) {
+            const usedPercent = Math.round((usage.usedBytes / usage.dailyLimit) * 100);
+            statusCard += `\n📊 **سهمیه امروز:**\n`;
+            statusCard += `• استفاده‌شده: ${formatBytes(usage.usedBytes)}\n`;
+            statusCard += `• در حال انتقال: ${formatBytes(usage.reservedBytes)}\n`;
+            statusCard += `• باقی‌مانده: ${formatBytes(Math.max(0, usage.dailyLimit - usage.usedBytes - usage.reservedBytes))}\n`;
+            statusCard += `• کل: ${formatBytes(usage.dailyLimit)}\n`;
+        }
+
+        if (pending) {
+            const windowRemaining = pending.payment_window_expiry_at - Date.now();
+            if (windowRemaining > 0) {
+                statusCard += `\n⏳ **پرداخت در انتظار** (${formatDuration(windowRemaining / 1000)})\n`;
+            }
+        }
     }
 
     await messenger.sendMessage(chatId, statusCard);

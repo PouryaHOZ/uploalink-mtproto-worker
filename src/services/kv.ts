@@ -11,7 +11,7 @@ export class KVService {
     async deleteConnectionRequest(code: string): Promise<void> { await this.env.LINKS.delete(`connection_request:${code}`); }
     async saveConnectedAccount(telegramUserId: string, account: ConnectedAccount): Promise<void> { await this.env.LINKS.put(`connected_account:${telegramUserId}`, JSON.stringify(account)); }
     async savePlatformReverseAccount(platform: string, chatId: string, data: object): Promise<void> { await this.env.LINKS.put(`connected_account:${platform}:${chatId}`, JSON.stringify(data)); }
-    async getConnectedAccount(userId: string): Promise<ConnectedAccount | null> { return await this.env.LINKS.get(`connected_account:${userId}`, { type: 'json' }).catch(() => null); }
+    async getConnectedAccount(userId: string): Promise<ConnectedAccount | null> { return await this.env.LINKS.get<ConnectedAccount>(`connected_account:${userId}`, { type: 'json' }).catch((): null => null); }
     async getPlatformReverseAccount(platform: string, chatId: string): Promise<any> { return await this.env.LINKS.get(`connected_account:${platform}:${chatId}`, { type: 'json' }).catch(() => null); }
     async deletePlatformReverseAccount(platform: string, chatId: string): Promise<void> { await this.env.LINKS.delete(`connected_account:${platform}:${chatId}`); }
 
@@ -27,7 +27,7 @@ export class KVService {
         await this.env.LINKS.put(`transfer:${transferId}`, JSON.stringify(data), { expirationTtl: CONSTANTS.EXPIRATION.STATE_TRANSFER });
     }
     async getTransferRequest(transferId: string): Promise<TransferRequest | null> {
-        return await this.env.LINKS.get(`transfer:${transferId}`, { type: 'json' }).catch(() => null);
+        return await this.env.LINKS.get<TransferRequest>(`transfer:${transferId}`, { type: 'json' }).catch((): null => null);
     }
     
     // --- CANCELLATION FLAGS ---
@@ -78,7 +78,7 @@ export class KVService {
     }
 
     async getActiveTransfer(transferId: string): Promise<ActiveTransfer | null> {
-        return await this.env.LINKS.get(`active_transfer:${transferId}`, { type: 'json' }).catch(() => null);
+        return await this.env.LINKS.get<ActiveTransfer>(`active_transfer:${transferId}`, { type: 'json' }).catch((): null => null);
     }
 
     async removeActiveTransfer(transferId: string): Promise<void> {
@@ -92,7 +92,7 @@ export class KVService {
         const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 
         for (const key of keys.keys) {
-            const data = await this.env.LINKS.get(key.name, { type: 'json' }).catch(() => null) as ActiveTransfer | null;
+            const data = await this.env.LINKS.get<ActiveTransfer>(key.name, { type: 'json' }).catch((): null => null);
             if (data) {
                 if (now - data.createdAt > STALE_THRESHOLD_MS) {
                     await this.env.LINKS.delete(key.name);
