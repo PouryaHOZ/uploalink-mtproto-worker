@@ -61,7 +61,51 @@ export default {
         const kv = new KVService(env);
 
         try {
-            if (path === '/health') return new Response(JSON.stringify({ status: 'healthy' }), { status: 200 });
+            // Enhanced health endpoint with D1 status
+            if (path === '/health') {
+                const healthData: Record<string, any> = { 
+                    status: 'healthy',
+                    version: SYSTEM_VERSION,
+                    timestamp: new Date().toISOString()
+                };
+                
+                // Check D1 database health
+                try {
+                    const messagePool = new MessagePool(env);
+                    const dbHealth = await messagePool.healthCheck();
+                    healthData.database = dbHealth;
+                    
+                    // Include circuit breaker status
+                    healthData.circuitBreaker = messagePool.getCircuitBreakerStatus();
+                    
+                    if (!dbHealth.healthy) {
+                        healthData.status = 'degraded';
+                        
+                        // More specific status based on issue
+                        if (dbHealth.error?.includes('table does not exist')) {
+                            healthData.status = 'unhealthy';
+                            healthData.actionRequired = 'Run migrations: npx wrangler d1 migrations apply tg-bot-db --remote';
+                        } else if (dbHealth.circuitBreaker?.isOpen) {
+                            healthData.status = 'degraded';
+                            healthData.reason = 'Circuit breaker open - D1 experiencing issues';
+                        }
+                    }
+                } catch (dbErr) {
+                    healthData.status = 'degraded';
+                    healthData.database = {
+                        healthy: false,
+                        error: dbErr instanceof Error ? dbErr.message : 'Unknown DB error'
+                    };
+                }
+                
+                const statusCode = healthData.status === 'healthy' ? 200 : 
+                                   healthData.status === 'unhealthy' ? 503 : 200;
+                                   
+                return new Response(JSON.stringify(healthData, null, 2), { 
+                    status: statusCode,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
 
             // Cancellation Check Endpoint for transfer.js
             if (path === '/check-cancel') {

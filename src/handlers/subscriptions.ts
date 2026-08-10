@@ -27,12 +27,30 @@ export async function handleSubscribeCommand(
     if (!result.success || !result.payment || !result.webintentUrl) {
         const errorMessages: Record<string, string> = {
             'pool_exhausted': '❌ **ظرفیت سیستم به موقت پر است.**\nلطفاً چند دقیقه بعد دوباره تلاش کنید.',
-            'database_error': '❌ **خطا در ارتباط با پایگاه داده.**\nلطفاً چند لحظه بعد دوباره تلاش کنید.'
+            'database_error': '❌ **خطا در ارتباط با پایگاه داده.**\nلطفاً چند لحظه بعد دوباره تلاش کنید.\n\n_اگر این خطا ادامه داشت، با پشتیبانی تماس بگیرید._',
+            'd1_connection_error': '❌ **مشکل در اتصال به پایگاه داده.**\nسیستم در حال تلاش مجدد است...\nلطفاً ۱۰ ثانیه صبر کنید و دوباره /subscribe را بزنید.',
+            'table_not_found': '❌ **خطای سیستمی: جدول پیام‌ها یافت نشد.**\nاین مشکل باید توسط مدیر سیستم برطرف شود.',
+            'circuit_breaker_open': '⚠️ **پایگاه داده در حال حاضر در دسترس نیست.**\n\n' +
+                'سیستم به صورت خودکار پس از _۱ دقیقه_ دوباره امتحان می‌کند.\n' +
+                'لطفاً کمی صبر کنید و سپس /subscribe را بزنید.'
         };
+        
+        // Detect circuit breaker error for better messaging
+        let errorKey = result.error || '';
+        if (result.error?.includes('circuit breaker') || result.error?.includes('temporarily unavailable')) {
+            errorKey = 'circuit_breaker_open';
+        }
+        
+        // Log detailed error for debugging
+        console.error('[Subscribe] Payment creation failed:', {
+            error: result.error,
+            userId: userId.substring(0, 8) + '...',
+            timestamp: new Date().toISOString()
+        });
         
         await messenger.sendMessage(
             chatId,
-            errorMessages[result.error || ''] || '❌ **خطا در ایجاد درخواست پرداخت.**\nلطفاً چند دقیقه بعد دوباره تلاش کنید.'
+            errorMessages[errorKey] || `❌ **خطا در ایجاد درخواست پرداخت.**\n\nکد خطا: \`${result.error || 'unknown'}\`\nلطفاً چند دقیقه بعد دوباره تلاش کنید.`
         );
         return;
     }
