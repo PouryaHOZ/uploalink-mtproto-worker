@@ -2,7 +2,7 @@ import { Env, PendingPayment, VerificationMethod } from '../types';
 import { CONSTANTS } from '../config/constants';
 import { DarametClient } from './daramet';
 import { QuotaService } from './quota';
-import { MessagePool } from './messagePool';
+import { MessagePool, AcquiredMessage } from './messagePool';
 
 /**
  * Payment service — manages pending payments and verification.
@@ -75,7 +75,14 @@ export class PaymentService {
 
         // 2. Acquire a message from the pool (atomic)
         const paymentId = this.generatePaymentId();
-        const acquired = await this.messagePool.acquire(paymentId);
+        let acquired: AcquiredMessage | null;
+        try {
+            acquired = await this.messagePool.acquire(paymentId);
+        } catch (dbError) {
+            console.error('Failed to acquire message from pool:', dbError);
+            return { success: false, error: 'database_error' };
+        }
+        
         if (!acquired) {
             return { success: false, error: 'pool_exhausted' };
         }
@@ -461,13 +468,14 @@ export class PaymentService {
      * Records older than 24 hours past their expires_at are deleted.
      */
     async deleteOldRecords(): Promise<number> {
-        const cutoffSec = Math.floor(Date.now() / 1000) - 86400;
+        // expires_at is stored in milliseconds (Date.now()), so compare with ms
+        const cutoffMs = Date.now() - 86400 * 1000;
         const result = await this.env.DB.prepare(
             `DELETE FROM pending_payments
              WHERE status IN ('paid', 'expired', 'cancelled')
                AND expires_at < ?1`
         )
-        .bind(cutoffSec)
+        .bind(cutoffMs)
         .run();
 
         return result.meta?.changes || 0;

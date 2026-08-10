@@ -25,9 +25,14 @@ export async function handleSubscribeCommand(
     const result = await paymentService.createPendingPayment({ userId, chatId, platform });
 
     if (!result.success || !result.payment || !result.webintentUrl) {
+        const errorMessages: Record<string, string> = {
+            'pool_exhausted': '❌ **ظرفیت سیستم به موقت پر است.**\nلطفاً چند دقیقه بعد دوباره تلاش کنید.',
+            'database_error': '❌ **خطا در ارتباط با پایگاه داده.**\nلطفاً چند لحظه بعد دوباره تلاش کنید.'
+        };
+        
         await messenger.sendMessage(
             chatId,
-            '❌ **خطا در ایجاد درخواست پرداخت.**\nلطفاً چند دقیقه بعد دوباره تلاش کنید.'
+            errorMessages[result.error || ''] || '❌ **خطا در ایجاد درخواست پرداخت.**\nلطفاً چند دقیقه بعد دوباره تلاش کنید.'
         );
         return;
     }

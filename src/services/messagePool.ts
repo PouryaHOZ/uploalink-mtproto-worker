@@ -23,42 +23,49 @@ export class MessagePool {
      * Atomically claim the first available message.
      * Uses a single UPDATE...RETURNING statement with a subquery to find MIN(message_id).
      * This is race-free under D1's single-threaded execution model.
+     * 
+     * @throws {Error} If D1 query fails (caller should handle)
      */
     async acquire(paymentId: string): Promise<AcquiredMessage | null> {
         const now = Date.now();
         const lockExpiry = now + CONSTANTS.PAYMENT.MESSAGE_LOCK_TTL_MS;
 
-        const result = await this.env.DB.prepare(
-            `UPDATE message_state
-                SET locked = 1,
-                    locked_by = ?1,
-                    locked_at = ?2,
-                    lock_expires_at = ?3
-              WHERE message_id = (
-                  SELECT MIN(message_id) FROM message_state
-                   WHERE used = 0
-                     AND (locked = 0 OR lock_expires_at <= ?4)
-              )
-            RETURNING message_id`
-        )
-        .bind(paymentId, now, lockExpiry, now)
-        .first<{ message_id: number }>();
+        try {
+            const result = await this.env.DB.prepare(
+                `UPDATE message_state
+                    SET locked = 1,
+                        locked_by = ?1,
+                        locked_at = ?2,
+                        lock_expires_at = ?3
+                  WHERE message_id = (
+                      SELECT MIN(message_id) FROM message_state
+                       WHERE used = 0
+                         AND (locked = 0 OR lock_expires_at <= ?4)
+                  )
+                RETURNING message_id`
+            )
+            .bind(paymentId, now, lockExpiry, now)
+            .first<{ message_id: number }>();
 
-        if (!result) {
-            // All 10,000 messages are locked or used — should not happen normally
-            console.error('MessagePool: all 10,000 messages are locked/used');
-            return null;
+            if (!result) {
+                // All 10,000 messages are locked or used — should not happen normally
+                console.error('MessagePool: all 10,000 messages are locked/used');
+                return null;
+            }
+
+            const messageId = result.message_id;
+            const text = MESSAGES[messageId];
+
+            if (text === undefined) {
+                console.error(`MessagePool: message_id ${messageId} out of range (MESSAGE_COUNT=${MESSAGE_COUNT})`);
+                return null;
+            }
+
+            return { messageId, text };
+        } catch (err) {
+            console.error('MessagePool.acquire D1 error:', err);
+            throw new Error(`Database error in MessagePool.acquire: ${err instanceof Error ? err.message : 'Unknown error'}`);
         }
-
-        const messageId = result.message_id;
-        const text = MESSAGES[messageId];
-
-        if (text === undefined) {
-            console.error(`MessagePool: message_id ${messageId} out of range (MESSAGE_COUNT=${MESSAGE_COUNT})`);
-            return null;
-        }
-
-        return { messageId, text };
     }
 
     /**
