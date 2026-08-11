@@ -184,8 +184,8 @@ export class DarametClient {
     }
 
     /**
-     * Normalize raw Daramet donation objects (handles snake_case, camelCase, Persian).
-     * Logs each donation's raw fields for debugging.
+     * Normalize raw Daramet donation objects.
+     * Handles multiple response structures including nested donator_data format.
      */
     private normalizeDonations(raw: any[]): DarametDonation[] {
         return raw.map((d, index) => {
@@ -193,35 +193,71 @@ export class DarametClient {
             console.log(`[Daramet] normalizeDonations[${index}] raw keys:`, Object.keys(d));
             console.log(`[Daramet] normalizeDonations[${index}] raw:`, JSON.stringify(d).substring(0, 500));
             
+            // Check for NESTED structure: { donator: "...", donator_data: {...} }
+            const nestedData = d.donator_data || d.donorData || d.data || d.donation || null;
+            
+            // Use nested data if available, otherwise use flat structure
+            const source = nestedData || d;
+            
+            console.log(`[Daramet] normalizeDonations[${index}] using ${nestedData ? 'NESTED (donator_data)' : 'FLAT'} structure`);
+            if (nestedData) {
+                console.log(`[Daramet] normalizeDonations[${index}] nested keys:`, Object.keys(source));
+            }
+            
             const normalized = {
-                id: String(d.id || d.Id || d._id || d.ID || ''),
+                id: String(
+                    source.id || 
+                    d.id || 
+                    source.Id || 
+                    d.Id || 
+                    source._id ||
+                    d._id || 
+                    ''
+                ),
                 
                 // Try many possible tracking code field names
                 trackingCode: String(
+                    source.ref_id ||           // Daramet's actual field name!
+                    source.refId ||
+                    source.trackingCode || 
+                    source.tracking_code || 
+                    source.TrackingCode || 
+                    source.TRACKING_CODE ||
+                    d.ref_id ||               // Also check parent level
+                    d.refId ||
                     d.trackingCode || 
                     d.tracking_code || 
                     d.TrackingCode || 
-                    d.TRACKING_CODE ||
                     d.reference || 
                     d.ref || 
+                    source.transactionId ||
+                    source.transaction_id ||
                     d.transactionId ||
-                    d.transaction_id ||
                     d.code ||
-                    d.trackingcode ||
                     ''
                 ),
                 
                 // Try many possible amount field names
+                // NOTE: Daramet may return amount in different units (rials vs tomans)
                 amount: Number(
+                    source.amount || 
                     d.amount || 
-                    d.Amount || 
-                    d.AMOUNT ||
+                    source.Amount || 
+                    d.Amount ||
+                    source.AMOUNT ||
+                    source.value || 
                     d.value || 
+                    source.Value ||
                     d.Value ||
+                    source.pay_amount ||
+                    source.payAmount ||
                     d.pay_amount ||
                     d.payAmount ||
+                    source.donateAmount ||
+                    source.donate_amount ||
                     d.donateAmount ||
-                    d.donate_amount ||
+                    source.total ||
+                    source.Total ||
                     d.total ||
                     d.Total ||
                     0
@@ -229,43 +265,71 @@ export class DarametClient {
                 
                 // Try many possible message field names
                 message: String(
+                    source.message || 
                     d.message || 
-                    d.Message || 
+                    source.Message || 
+                    d.Message ||
+                    source.MESSAGE ||
                     d.MESSAGE ||
+                    source.note || 
                     d.note || 
+                    source.Note ||
                     d.Note ||
+                    source.description ||
                     d.description ||
+                    source.Description ||
                     d.Description ||
+                    source.comment ||
                     d.comment ||
+                    source.text ||
                     d.text ||
+                    source.msg ||
                     d.msg ||
                     ''
                 ),
                 
-                donorName: d.donorName || d.donor_name || d.name || d.Name || d.userName || undefined,
+                donorName: source.donorName || d.donorName || 
+                          source.donor_name || d.donor_name || 
+                          source.name || d.name || 
+                          source.Name || d.Name ||
+                          source.userName || d.userName ||
+                          source.donator || d.donator ||  // From nested structure
+                          undefined,
                 
                 date: this.parseDonationDate(
+                    source.timestamp ||      // Daramet's actual field name!
+                    d.timestamp ||
+                    source.date || 
                     d.date || 
-                    d.Date || 
+                    source.Date || 
+                    d.Date ||
+                    source.DATE ||
                     d.DATE ||
+                    source.createdAt || 
                     d.createdAt || 
+                    source.created_at || 
                     d.created_at || 
+                    source.CreatedAt ||
                     d.CreatedAt ||
+                    source.createdDate ||
                     d.createdDate ||
+                    source.paid_at ||
                     d.paid_at ||
-                    d.timestamp
+                    source.paidAt ||
+                    d.paidAt
                 ),
                 
-                status: d.status || d.Status || d.state
+                status: source.status || d.status || source.Status || d.Status || source.state || d.state
             };
             
             console.log(`[Daramet] normalizeDonations[${index}] result:`, {
                 id: normalized.id,
-                trackingCode: normalized.trackingCode,
+                trackingCode: normalized.trackingCode || '(empty)',
                 amount: normalized.amount,
                 messageLength: normalized.message.length,
                 messagePreview: normalized.message.substring(0, 50),
-                date: normalized.date ? new Date(normalized.date).toISOString() : 'null'
+                date: normalized.date ? new Date(normalized.date).toISOString() : 'null',
+                usedNested: !!nestedData
             });
             
             return normalized;
@@ -411,6 +475,7 @@ export class DarametClient {
 
     /**
      * Find an exact match from donation results.
+     * Handles amount unit differences (rials vs tomans).
      */
     private findExactMatch(
         donations: DarametDonation[],
@@ -421,9 +486,10 @@ export class DarametClient {
         const targetNorm = normalizeMessage(targetMessage);
 
         for (const d of donations) {
-            // Check amount
-            if (d.amount !== expectedAmount) {
-                console.log(`[Daramet] ⏭️ Skip [${d.trackingCode || '?'}]: amount ${d.amount} ≠ ${expectedAmount}`);
+            // Check amount with FLEXIBLE matching (handles rials/tomans conversion)
+            // Daramet may return 800000 (rials) when we expect 80000 (tomans)
+            if (!this.isAmountMatch(d.amount, expectedAmount)) {
+                console.log(`[Daramet] ⏭️ Skip [${d.trackingCode || '?'}]: amount ${d.amount} ≠ ${expectedAmount} (ratio: ${(d.amount / expectedAmount).toFixed(1)}x)`);
                 continue;
             }
             
@@ -439,7 +505,8 @@ export class DarametClient {
             if (dNorm === targetNorm) {
                 console.log(`[Daramet] ✅ EXACT MATCH FOUND!`, {
                     trackingCode: d.trackingCode,
-                    amount: d.amount
+                    amount: d.amount,
+                    messageLength: d.message?.length
                 });
                 return d;
             } else {
@@ -451,6 +518,33 @@ export class DarametClient {
         }
         
         return null;
+    }
+
+    /**
+     * Check if amounts match, handling common unit differences.
+     * In Iran: 1 Toman = 10 Rials, so amounts may differ by 10x.
+     */
+    private isAmountMatch(actualAmount: number, expectedAmount: number): boolean {
+        if (actualAmount === expectedAmount) return true;
+        
+        // Handle rials/tomans conversion (10x difference)
+        if (actualAmount === expectedAmount * 10) {
+            console.log(`[Daramet] Amount match: ${actualAmount} = ${expectedAmount} × 10 (rials/tomans)`);
+            return true;
+        }
+        if (expectedAmount === actualAmount * 10) {
+            console.log(`[Daramet] Amount match: ${expectedAmount} = ${actualAmount} × 10 (rials/tomans)`);
+            return true;
+        }
+        
+        // Allow small rounding differences (< 1%)
+        const diffPercent = Math.abs(actualAmount - expectedAmount) / expectedAmount;
+        if (diffPercent < 0.01) {
+            console.log(`[Daramet] Amount match: within 1% tolerance (${diffPercent.toFixed(3)}%)`);
+            return true;
+        }
+        
+        return false;
     }
 
     /**
