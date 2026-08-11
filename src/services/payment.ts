@@ -42,21 +42,25 @@ export class PaymentService {
 
     /**
      * Create a new pending payment for a user.
-     * - Checks no other pending payment exists for this user
-     * - Acquires a message atomically from the pool
-     * - Inserts a pending_payment row with TTLs
-     * - Returns the webintent URL for the user to click
+     * - Checks if user has a recently CANCELLED payment within the 3-hour window → reuses it with fresh timers
+     * - Checks if user has an active pending payment → returns existing payment
+     * - Otherwise acquires a new message from pool and creates payment
+     * 
+     * Timer behavior on re-subscribe:
+     * - Link TTL: Resets to 1 hour from now
+     * - Payment Window: Resets to 3 hours from now  
+     * - Message: Same message remains locked (not released on cancel)
      */
     async createPendingPayment(params: {
         userId: string;
         chatId: string;
         platform: 'telegram' | 'bale' | 'rubika';
-    }): Promise<{ success: boolean; payment?: PendingPayment; webintentUrl?: string; error?: string }> {
+    }): Promise<{ success: boolean; payment?: PendingPayment; webintentUrl?: string; error?: string; reused?: boolean }> {
         const { userId, chatId, platform } = params;
         const now = Date.now();
 
-        // 1. Check if user already has an active pending payment
-        const existing = await this.env.DB.prepare(
+        // 1. Check if user has an ACTIVE pending payment (status = 'pending')
+        const existingPending = await this.env.DB.prepare(
             `SELECT payment_id FROM pending_payments
              WHERE user_id = ?1 AND status = 'pending' AND payment_window_expiry_at > ?2
              LIMIT 1`
@@ -64,9 +68,9 @@ export class PaymentService {
         .bind(userId, now)
         .first<{ payment_id: string }>();
 
-        if (existing) {
-            // Return existing payment so user can re-use the link
-            const existingPayment = await this.getPendingPayment(existing.payment_id);
+        if (existingPending) {
+            // Return existing active payment so user can re-use the link
+            const existingPayment = await this.getPendingPayment(existingPending.payment_id);
             if (existingPayment) {
                 const webintentUrl = this.daramet.buildWebintentUrl(
                     existingPayment.amount,
@@ -75,12 +79,98 @@ export class PaymentService {
                 return {
                     success: true,
                     payment: existingPayment,
-                    webintentUrl
+                    webintentUrl,
+                    reused: false
                 };
             }
         }
 
-        // 2. Acquire a message from the pool (atomic)
+        // 2. Check if user has a RECENTLY CANCELLED payment within the original 3-hour window
+        //    If found, REUSE the same message with FRESH timers
+        const cancelledPayment = await this.env.DB.prepare(
+            `SELECT * FROM pending_payments
+             WHERE user_id = ?1 
+               AND status = 'cancelled'
+               AND payment_window_expiry_at > ?2
+             ORDER BY generated_at DESC
+             LIMIT 1`
+        )
+        .bind(userId, now)
+        .first<PendingPayment>();
+
+        if (cancelledPayment) {
+            console.log(`[Subscribe] Reusing cancelled payment ${cancelledPayment.payment_id} with fresh timers`);
+            
+            // Generate new payment ID for the "new" attempt
+            const newPaymentId = this.generatePaymentId();
+            
+            // Calculate FRESH timers from NOW
+            const newLinkExpiry = now + CONSTANTS.PAYMENT.LINK_TTL_MS;           // 1 hour from now
+            const newWindowExpiry = now + CONSTANTS.PAYMENT.PAYMENT_WINDOW_TTL_MS; // 3 hours from now
+            const newRecordExpiry = now + CONSTANTS.PAYMENT.RECORD_TTL_MS;
+
+            // Create NEW payment record reusing the SAME message
+            await this.env.DB.prepare(
+                `INSERT INTO pending_payments
+                    (payment_id, message_id, message_text, user_id, chat_id, platform,
+                     amount, generated_at, link_expiry_at, message_lock_expiry_at,
+                     payment_window_expiry_at, status, reminder_sent, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', 0, ?12)`
+            )
+            .bind(
+                newPaymentId,
+                cancelledPayment.message_id,      // Same message
+                cancelledPayment.message_text,    // Same text
+                userId, chatId, platform,
+                CONSTANTS.SUBSCRIPTION.PRICE_TOMAN,
+                now,                              // New generated_at
+                newLinkExpiry,                    // Fresh 1-hour link TTL
+                newWindowExpiry,                  // Fresh 3-hour window
+                newWindowExpiry,                  // Payment window = lock expiry
+                newRecordExpiry
+            )
+            .run();
+
+            // Renew the message lock for the new window
+            await this.env.DB.prepare(
+                `UPDATE message_state
+                    SET locked = 1,
+                        locked_by = ?1,
+                        locked_at = ?2,
+                        lock_expires_at = ?3
+                  WHERE message_id = ?4`
+            )
+            .bind(newPaymentId, now, newWindowExpiry, cancelledPayment.message_id)
+            .run();
+
+            const renewedPayment: PendingPayment = {
+                payment_id: newPaymentId,
+                message_id: cancelledPayment.message_id,
+                message_text: cancelledPayment.message_text,
+                user_id: userId,
+                chat_id: chatId,
+                platform,
+                amount: CONSTANTS.SUBSCRIPTION.PRICE_TOMAN,
+                generated_at: now,
+                link_expiry_at: newLinkExpiry,
+                message_lock_expiry_at: newWindowExpiry,
+                payment_window_expiry_at: newWindowExpiry,
+                status: 'pending',
+                reminder_sent: 0,
+                expires_at: newRecordExpiry
+            };
+
+            const webintentUrl = this.daramet.buildWebintentUrl(renewedPayment.amount, renewedPayment.message_text);
+
+            return {
+                success: true,
+                payment: renewedPayment,
+                webintentUrl,
+                reused: true  // Flag to indicate this was a reused payment
+            };
+        }
+
+        // 3. No existing or cancelled payment - create brand new one
         const paymentId = this.generatePaymentId();
         let acquired: AcquiredMessage | null;
         try {
@@ -94,7 +184,7 @@ export class PaymentService {
             return { success: false, error: 'pool_exhausted' };
         }
 
-        // 3. Insert pending_payment record
+        // Insert new pending_payment record
         const linkExpiry = now + CONSTANTS.PAYMENT.LINK_TTL_MS;
         const lockExpiry = now + CONSTANTS.PAYMENT.MESSAGE_LOCK_TTL_MS;
         const windowExpiry = now + CONSTANTS.PAYMENT.PAYMENT_WINDOW_TTL_MS;
@@ -136,7 +226,7 @@ export class PaymentService {
 
         const webintentUrl = this.daramet.buildWebintentUrl(payment.amount, payment.message_text);
 
-        return { success: true, payment, webintentUrl };
+        return { success: true, payment, webintentUrl, reused: false };
     }
 
     /**
@@ -170,8 +260,35 @@ export class PaymentService {
     }
 
     /**
-     * Cancel a pending payment (user-initiated).
-     * Releases the message lock so it can be reused.
+     * Cancel a pending payment (user-initiated) - KEEPS message locked.
+     * The message remains locked until the original 3-hour window expires.
+     * This prevents message reuse within the same payment window.
+     */
+    async cancelPaymentKeepMessageLocked(paymentId: string, userId: string): Promise<{ success: boolean; error?: string }> {
+        const payment = await this.getPendingPayment(paymentId);
+        if (!payment) return { success: false, error: 'not_found' };
+        if (payment.user_id !== userId) return { success: false, error: 'not_owner' };
+        if (payment.status !== 'pending') return { success: false, error: 'already_processed' };
+
+        const now = Date.now();
+        
+        // Mark as cancelled but DO NOT release the message lock
+        await this.env.DB.prepare(
+            `UPDATE pending_payments
+                SET status = 'cancelled', verified_at = ?1
+              WHERE payment_id = ?2 AND status = 'pending'`
+        )
+        .bind(now, paymentId)
+        .run();
+
+        console.log(`[Cancel] Payment ${paymentId} cancelled, message ${payment.message_id} stays locked until ${new Date(payment.payment_window_expiry_at).toISOString()}`);
+
+        return { success: true };
+    }
+
+    /**
+     * Cancel a pending payment (user-initiated) - releases message lock.
+     * Original behavior for backward compatibility.
      */
     async cancelPendingPayment(paymentId: string, userId: string): Promise<{ success: boolean; error?: string }> {
         const payment = await this.getPendingPayment(paymentId);

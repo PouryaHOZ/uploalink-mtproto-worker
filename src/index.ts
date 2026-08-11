@@ -531,7 +531,7 @@ export default {
             
             try {
                 // Try to find donation by message text (same as auto-verifier)
-                const donation = await paymentService.daramet.findDonationByMessage(
+                const donation = await paymentService.darametClient.findDonationByMessage(
                     payment.message_text,
                     payment.amount,
                     payment.generated_at
@@ -580,14 +580,70 @@ export default {
 
         if (action === 'sub_cancel') {
             const paymentId = parts[1];
+            
+            // NEW: Show confirmation prompt first
+            await messenger.answerCallbackQuery(query.id);
+            
             const paymentService = new PaymentService(env);
-            const result = await paymentService.cancelPendingPayment(paymentId, userId);
+            const payment = await paymentService.getPendingPayment(paymentId);
+            
+            // Build confirmation message with time remaining info
+            let timeInfo = '';
+            if (payment) {
+                const windowRemaining = payment.payment_window_expiry_at - Date.now();
+                if (windowRemaining > 0) {
+                    const minutes = Math.ceil(windowRemaining / 60000);
+                    timeInfo = `\n⏰ *پنجره پرداخت:* ${minutes} دقیقه باقی‌مانده`;
+                }
+            }
+            
+            await messenger.sendMessage(
+                chatId,
+                `🤔 **آیا از لغو پرداخت مطمئن هستید؟**${timeInfo}\n\n` +
+                `⚠️ *توجه:*\n` +
+                `• پیام اختصاصی شما قفل خواهد ماند تا پایان پنجره پرداخت (۳ ساعت)\n` +
+                `• اگر دوباره /subscribe بزنید، همان پیام به شما داده می‌شود\n` +
+                `• تایمرها از نو شروع خواهند شد`,
+                { inline_keyboard: [
+                    [
+                        { text: '✅ بله، لغو شود', callback_data: `sub_cancel_confirm:${paymentId}` },
+                        { text: '❌ بازگشت', callback_data: `sub_cancel_abort:${paymentId}` }
+                    ]
+                ]}
+            );
+            return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+        }
+
+        // Confirm cancellation (after user confirms)
+        if (action === 'sub_cancel_confirm') {
+            const paymentId = parts[1];
+            const paymentService = new PaymentService(env);
+            
+            // Cancel but KEEP message locked (don't release lock)
+            const result = await paymentService.cancelPaymentKeepMessageLocked(paymentId, userId);
+            
             if (result.success) {
-                await messenger.editMessageText(chatId, messageId, `🛑 **درخواست پرداخت لغو شد.**`);
-                await messenger.answerCallbackQuery(query.id, 'لغو شد.');
+                await messenger.editMessageText(chatId, messageId, `🛑 **درخواست پرداخت لغو شد.**\n\n` +
+                    `🔒 پیام اختصاصی شما تا پایان پنجره پرداخت قفل باقی می‌ماند.\n` +
+                    `🔄 برای شروع مجدد، /subscribe را بزنید.`);
+                await messenger.answerCallbackQuery(query.id, '✅ درخواست لغو شد.');
+                
+                console.log(`[Cancel] Payment ${paymentId} cancelled by user ${userId}, message remains locked`);
             } else {
                 await messenger.answerCallbackQuery(query.id, `❌ ${result.error || 'خطا در لغو'}`);
             }
+            return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+        }
+
+        // Abort cancellation (user changed their mind)
+        if (action === 'sub_cancel_abort') {
+            await messenger.answerCallbackQuery(query.id, '↩️ لغو لغو شد! درخواست شما فعال است.');
+            await messenger.sendMessage(
+                chatId,
+                '✅ **درخواست پرداخت شما همچنان فعال است.**\n\n' +
+                'هر زمان که آماده بودید، پرداخت کنید یا کد رهگیری را وارد کنید.',
+                { inline_keyboard: [[{ text: '✅ پرداخت کردم — تأیید', callback_data: `sub_verify_input:${parts[1]}` }]] }
+            );
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
 

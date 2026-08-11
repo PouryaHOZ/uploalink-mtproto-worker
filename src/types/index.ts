@@ -34,6 +34,9 @@ export interface Env {
     DARAMET_API_TOKEN: string;
     DARAMET_USERNAME: string;
     DARAMET_BASE_URL?: string;
+
+    // ===== Admin =====
+    ADMIN_SECRET?: string;
 }
 
 export type Platform = 'telegram' | 'bale' | 'rubika';

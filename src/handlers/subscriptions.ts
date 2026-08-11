@@ -62,8 +62,18 @@ export async function handleSubscribeCommand(
     const windowExpiresIn = formatPersianDuration(payment.payment_window_expiry_at - now);
     const windowExpiresAt = formatPersianTime(payment.payment_window_expiry_at);
 
+    // Show different message for reused payments
+    let headerMessage: string;
+    if (result.reused) {
+        headerMessage = `🔄 **اشتراک مجدد — ${toPersianDigits('80000')} تومان**\n\n` +
+            `✅ *پیام اختصاصی قبلی شما بازیابی شد*\n` +
+            `تایمرها از نو شروع شده‌اند!`;
+    } else {
+        headerMessage = `💎 **خرید اشتراک ۳۰ روزه — ${toPersianDigits('80000')} تومان**`;
+    }
+
     const message =
-        `💎 **خرید اشتراک ۳۰ روزه — ${toPersianDigits('80000')} تومان**\n\n` +
+        `${headerMessage}\n\n` +
         `🔗 **لینک پرداخت:**\n${result.webintentUrl}\n\n` +
         `⚠️ **توجه بسیار مهم:**\n` +
         `• روی لینک بالا کلیک کنید\n` +

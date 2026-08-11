@@ -94,9 +94,9 @@ export class MessagePool {
                 // STRATEGY 1: Optimized single-query approach (UPDATE...RETURNING)
                 try {
                     messageId = await this.acquireSingleQuery(paymentId, now, lockExpiry);
-                } catch (singleQueryError) {
-                    console.warn(`[MessagePool] Single-query failed, trying two-step fallback:`, 
-                        singleQueryError.message);
+                } catch (singleQueryError: unknown) {
+                    const errMsg = singleQueryError instanceof Error ? singleQueryError.message : String(singleQueryError);
+                    console.warn(`[MessagePool] Single-query failed, trying two-step fallback:`, errMsg);
                     
                     // STRATEGY 2: Fallback to two-step approach
                     messageId = await this.acquireTwoStep(paymentId, now, lockExpiry);
@@ -451,7 +451,8 @@ export class MessagePool {
         hasData: boolean;
         messageCount?: number;
         circuitBreaker: CircuitBreakerState;
-        error?: string
+        error?: string;
+        warning?: string
     }> {
         const result = {
             healthy: false,
@@ -507,6 +508,11 @@ export class MessagePool {
 
             if (!result.hasData) {
                 result.warning = 'Table exists but is empty. Run seed migration.';
+            }
+
+            // Clear warning if data exists
+            if (result.hasData && result.warning) {
+                delete result.warning;
             }
 
             // Final health determination
