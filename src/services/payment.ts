@@ -25,6 +25,13 @@ export class PaymentService {
     }
 
     /**
+     * Expose daramet client for direct access (used by auto-verify on button click)
+     */
+    get darametClient(): DarametClient {
+        return this.daramet;
+    }
+
+    /**
      * Generate a unique payment ID (UUID v4-like).
      */
     private generatePaymentId(): string {

@@ -510,7 +510,63 @@ export default {
 
         if (action === 'sub_verify_input') {
             const paymentId = parts[1];
-            await messenger.answerCallbackQuery(query.id, 'کد رهگیری را ارسال کنید.');
+            
+            // NEW: Try auto-verification first before asking for manual code
+            await messenger.answerCallbackQuery(query.id, '⏳ در حال بررسی خودکار پرداخت...');
+            
+            const paymentService = new PaymentService(env);
+            const payment = await paymentService.getPendingPayment(paymentId);
+            
+            if (!payment) {
+                await messenger.sendMessage(
+                    chatId,
+                    '❌ **درخواست پرداخت یافت نشد.**\n\nممکن است لغو شده باشد.',
+                    { inline_keyboard: [[{ text: '🔄 خرید اشتراک جدید', callback_data: 'sub_buy' }]] }
+                );
+                return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+            }
+            
+            // Show "checking" message
+            await messenger.sendMessage(chatId, '⏳ **در حال استعلام از دارمت...**\nلطفاً صبر کنید.');
+            
+            try {
+                // Try to find donation by message text (same as auto-verifier)
+                const donation = await paymentService.daramet.findDonationByMessage(
+                    payment.message_text,
+                    payment.amount,
+                    payment.generated_at
+                );
+                
+                if (donation) {
+                    // FOUND! Auto-activate subscription
+                    console.log(`[Auto-Verify] Found donation ${donation.trackingCode} for payment ${paymentId}`);
+                    
+                    const result = await paymentService.activateSubscription(
+                        payment.payment_id,
+                        payment.message_id,
+                        payment.user_id,
+                        payment.chat_id,
+                        payment.platform,
+                        donation.trackingCode,
+                        'auto'
+                    );
+                    
+                    if (result.success) {
+                        await sendSubscriptionActivatedMessage(env, messenger, chatId, payment.payment_id, 'auto');
+                        return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+                    } else {
+                        await messenger.sendMessage(chatId, '❌ **خطا در فعال‌سازی اشتراک.**\nلطفاً کد رهگیری را دستی وارد کنید.');
+                    }
+                } else {
+                    // Not found by message, show manual entry with helpful info
+                    console.log(`[Auto-Verify] No donation found for payment ${paymentId}, showing manual entry`);
+                }
+            } catch (err) {
+                console.error(`[Auto-Verify] API error for payment ${paymentId}:`, err);
+                await messenger.sendMessage(chatId, '⚠️ **خطا در ارتباط با دارمت.**\nلطفاً کد رهگیری را دستی وارد کنید.');
+            }
+            
+            // Fallback to manual entry
             await messenger.sendMessage(
                 chatId,
                 `📝 **تأیید دستی پرداخت**\n\n` +
