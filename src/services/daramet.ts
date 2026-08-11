@@ -129,37 +129,147 @@ export class DarametClient {
             { term }
         );
 
+        // DEBUG: Log the RAW response to understand actual field names
+        console.log(`[Daramet] RAW API response for "${term}":`, JSON.stringify(result).substring(0, 1000));
+
         // Handle various possible response shapes
-        if (Array.isArray(result)) return this.normalizeDonations(result);
-        if (Array.isArray((result as DarametApiResponse).data)) {
-            return this.normalizeDonations((result as DarametApiResponse).data as DarametDonation[]);
+        if (Array.isArray(result)) {
+            console.log(`[Daramet] Response is array with ${result.length} items`);
+            if (result.length > 0) {
+                console.log(`[Daramet] First item keys:`, Object.keys(result[0]));
+                console.log(`[Daramet] First item:`, JSON.stringify(result[0]).substring(0, 500));
+            }
+            return this.normalizeDonations(result);
         }
-        if (Array.isArray((result as DarametApiResponse).donations)) {
-            return this.normalizeDonations((result as DarametApiResponse).donations!);
+        
+        // Try to find the array in different response shapes
+        const possibleArrays = [
+            { name: 'data', value: (result as DarametApiResponse).data },
+            { name: 'donations', value: (result as DarametApiResponse).donations },
+            { name: 'items', value: (result as DarametApiResponse).items },
+            { name: 'list', value: (result as any).list },
+            { name: 'results', value: (result as any).results },
+            { name: 'records', value: (result as any).records },
+        ];
+
+        for (const { name, value } of possibleArrays) {
+            if (Array.isArray(value)) {
+                console.log(`[Daramet] Found array in '${name}' with ${value.length} items`);
+                if (value.length > 0) {
+                    console.log(`[Daramet] First item keys (${name}):`, Object.keys(value[0]));
+                    console.log(`[Daramet] First item (${name}):`, JSON.stringify(value[0]).substring(0, 500));
+                }
+                return this.normalizeDonations(value);
+            }
         }
-        if (Array.isArray((result as DarametApiResponse).items)) {
-            return this.normalizeDonations((result as DarametApiResponse).items!);
+
+        // Single object - check if it looks like a donation
+        if (result && typeof result === 'object') {
+            console.log(`[Daramet] Response keys (not array):`, Object.keys(result));
+            
+            // Check if this single object has donation-like fields
+            const singleObj = result as any;
+            const hasDonationField = singleObj.trackingCode || singleObj.amount || 
+                                     singleObj.message || singleObj.TrackingCode ||
+                                     singleObj.Amount || singleObj.Message;
+            if (hasDonationField) {
+                console.log(`[Daramet] Treating single object as donation`);
+                return this.normalizeDonations([result as any]);
+            }
         }
-        // Single object
-        if (result && typeof result === 'object' && (result as DarametDonation).trackingCode) {
-            return this.normalizeDonations([result as DarametDonation]);
-        }
+
+        console.warn(`[Daramet] Could not find donations in response structure. Keys:`, 
+            result ? Object.keys(result) : 'null/undefined');
         return [];
     }
 
     /**
-     * Normalize raw Daramet donation objects (handles snake_case and camelCase).
+     * Normalize raw Daramet donation objects (handles snake_case, camelCase, Persian).
+     * Logs each donation's raw fields for debugging.
      */
     private normalizeDonations(raw: any[]): DarametDonation[] {
-        return raw.map(d => ({
-            id: String(d.id || d.Id || d._id || ''),
-            trackingCode: String(d.trackingCode || d.tracking_code || d.TrackingCode || d.reference || d.ref || ''),
-            amount: Number(d.amount || d.Amount || d.value || 0),
-            message: String(d.message || d.Message || d.note || ''),
-            donorName: d.donorName || d.donor_name || d.name || undefined,
-            date: this.parseDonationDate(d.date || d.Date || d.createdAt || d.created_at),
-            status: d.status || d.Status
-        }));
+        return raw.map((d, index) => {
+            // DEBUG: Log all available keys in this donation object
+            console.log(`[Daramet] normalizeDonations[${index}] raw keys:`, Object.keys(d));
+            console.log(`[Daramet] normalizeDonations[${index}] raw:`, JSON.stringify(d).substring(0, 500));
+            
+            const normalized = {
+                id: String(d.id || d.Id || d._id || d.ID || ''),
+                
+                // Try many possible tracking code field names
+                trackingCode: String(
+                    d.trackingCode || 
+                    d.tracking_code || 
+                    d.TrackingCode || 
+                    d.TRACKING_CODE ||
+                    d.reference || 
+                    d.ref || 
+                    d.transactionId ||
+                    d.transaction_id ||
+                    d.code ||
+                    d.trackingcode ||
+                    ''
+                ),
+                
+                // Try many possible amount field names
+                amount: Number(
+                    d.amount || 
+                    d.Amount || 
+                    d.AMOUNT ||
+                    d.value || 
+                    d.Value ||
+                    d.pay_amount ||
+                    d.payAmount ||
+                    d.donateAmount ||
+                    d.donate_amount ||
+                    d.total ||
+                    d.Total ||
+                    0
+                ),
+                
+                // Try many possible message field names
+                message: String(
+                    d.message || 
+                    d.Message || 
+                    d.MESSAGE ||
+                    d.note || 
+                    d.Note ||
+                    d.description ||
+                    d.Description ||
+                    d.comment ||
+                    d.text ||
+                    d.msg ||
+                    ''
+                ),
+                
+                donorName: d.donorName || d.donor_name || d.name || d.Name || d.userName || undefined,
+                
+                date: this.parseDonationDate(
+                    d.date || 
+                    d.Date || 
+                    d.DATE ||
+                    d.createdAt || 
+                    d.created_at || 
+                    d.CreatedAt ||
+                    d.createdDate ||
+                    d.paid_at ||
+                    d.timestamp
+                ),
+                
+                status: d.status || d.Status || d.state
+            };
+            
+            console.log(`[Daramet] normalizeDonations[${index}] result:`, {
+                id: normalized.id,
+                trackingCode: normalized.trackingCode,
+                amount: normalized.amount,
+                messageLength: normalized.message.length,
+                messagePreview: normalized.message.substring(0, 50),
+                date: normalized.date ? new Date(normalized.date).toISOString() : 'null'
+            });
+            
+            return normalized;
+        });
     }
 
     /**
