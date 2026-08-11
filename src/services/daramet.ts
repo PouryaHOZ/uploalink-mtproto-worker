@@ -291,9 +291,13 @@ export class DarametClient {
 
     /**
      * Find a donation matching a specific message text and minimum date.
-     * Uses FULL MESSAGE TEXT for precise, exact matching.
+     * Uses smart multi-strategy search for maximum reliability.
      * 
-     * DEBUG: Logs detailed info about why matches fail to help diagnose issues.
+     * Strategy:
+     * 1. Try FULL message text (exact match)
+     * 2. If fails/empty, try last sentence (most distinctive part)
+     * 3. If fails, try first 50 chars
+     * 4. If all fail, return null
      */
     async findDonationByMessage(
         messageText: string,
@@ -301,90 +305,151 @@ export class DarametClient {
         minDate: number
     ): Promise<DarametDonation | null> {
         
-        // Use FULL message for search (not just a part) - for complete precision
-        const fullSearchTerm = messageText.trim();
+        const trimmedMessage = messageText.trim();
         
-        if (!fullSearchTerm) {
+        if (!trimmedMessage) {
             console.warn('[Daramet] Message text is empty');
             return null;
         }
 
-        console.log(`[Daramet] 🔍 Searching with FULL MESSAGE for exact match...`, {
-            searchLength: fullSearchTerm.length,
+        console.log(`[Daramet] 🔍 Smart search initiated...`, {
+            messageLength: trimmedMessage.length,
             expectedAmount: amount,
             minDate: new Date(minDate).toISOString(),
-            messagePreview: fullSearchTerm.substring(0, 80) + '...'
+            messagePreview: trimmedMessage.substring(0, 60) + (trimmedMessage.length > 60 ? '...' : '')
         });
 
-        let donations: DarametDonation[];
-        try {
-            // Search with FULL message text - this is the primary search
-            donations = await this.searchDonations(fullSearchTerm);
-        } catch (err) {
-            console.error('searchDonations failed:', err);
+        // Build search strategies in order of preference
+        const strategies = this.buildSearchStrategies(trimmedMessage);
+        
+        console.log(`[Daramet] Will try ${strategies.length} search strategies`);
+
+        for (let i = 0; i < strategies.length; i++) {
+            const strategy = strategies[i];
+            console.log(`[Daramet] Strategy ${i + 1}/${strategies.length}: ${strategy.name} ("${strategy.term.substring(0, 40)}...")`);
             
-            // If full message fails, try with first 100 chars as fallback
-            console.log('[Daramet] Full message search failed, trying truncated...');
             try {
-                donations = await this.searchDonations(fullSearchTerm.substring(0, 100));
-            } catch (fallbackErr) {
-                console.error('[Daramet] Fallback search also failed:', fallbackErr);
-                return null;
-            }
-        }
-
-        console.log(`[Daramet] searchDonations returned ${donations.length} results`);
-
-        // Log all returned donations for debugging
-        if (donations.length > 0) {
-            donations.forEach((d, i) => {
-                console.log(`[Daramet] Result[${i}]:`, {
-                    trackingCode: d.trackingCode || '(empty)',
-                    amount: d.amount,
-                    messageLength: d.message?.length || 0,
-                    messagePreview: d.message?.substring(0, 80),
-                    date: d.date ? new Date(d.date).toISOString() : 'null'
-                });
-            });
-        }
-
-        const targetNorm = normalizeMessage(messageText);
-
-        for (const d of donations) {
-            // DEBUG: Log why each donation is being skipped
-            if (d.amount !== amount) {
-                console.log(`[Daramet] ⏭️ Skipping [${d.trackingCode || '?'}]: amount mismatch (${d.amount} ≠ ${amount})`);
-                continue;
-            }
-            
-            // Date check - be more lenient with date parsing
-            // If date is 0 or can't parse, don't skip based on date (might be Persian date)
-            if (d.date && minDate && d.date > 0) {
-                if (d.date < minDate) {
-                    console.log(`[Daramet] ⏭️ Skipping [${d.trackingCode || '?'}]: date too old`);
-                    continue;
+                const donations = await this.searchDonations(strategy.term);
+                
+                if (donations && donations.length > 0) {
+                    console.log(`[Daramet] ✅ Strategy "${strategy.name}" returned ${donations.length} results!`);
+                    
+                    // Log what we got
+                    donations.forEach((d, idx) => {
+                        console.log(`[Daramet]   Result[${idx}]:`, {
+                            trackingCode: d.trackingCode || '(empty)',
+                            amount: d.amount,
+                            msgLen: d.message?.length || 0,
+                            msgPreview: d.message?.substring(0, 50),
+                            date: d.date ? new Date(d.date).toISOString() : 'null'
+                        });
+                    });
+                    
+                    // Try to find exact match among results
+                    const match = this.findExactMatch(donations, trimmedMessage, amount, minDate);
+                    if (match) {
+                        return match;
+                    }
+                    
+                    console.log(`[Daramet] Strategy "${strategy.name}" got results but no exact match, trying next...`);
+                } else {
+                    console.log(`[Daramet] Strategy "${strategy.name}" returned 0 results`);
+                }
+                
+            } catch (err) {
+                const errorMsg = err instanceof Error ? err.message : String(err);
+                console.warn(`[Daramet] Strategy "${strategy.name}" failed:`, errorMsg.substring(0, 100));
+                
+                // If it's a client error (4xx), don't retry with different strategies - just log and continue
+                if (errorMsg.includes('400') || errorMsg.includes('401') || errorMsg.includes('403') || errorMsg.includes('422')) {
+                    console.warn(`[Daramet] Client error detected, skipping to next strategy`);
                 }
             }
-            
-            const dNorm = normalizeMessage(d.message);
-            
-            // EXACT match required - compare full normalized messages
-            if (dNorm === targetNorm) {
-                console.log(`[Daramet] ✅ FOUND EXACT MATCH!`, {
-                    trackingCode: d.trackingCode,
-                    amount: d.amount,
-                    messageLength: d.message?.length
-                });
-                return d;
-            } else {
-                // Show what's different about the message
-                console.log(`[Daramet] ⏭️ Skipping [${d.trackingCode || '?'}]: message mismatch`);
-                console.log(`[Daramet]    Expected (${targetNorm.length} chars): "${targetNorm.substring(0, 100)}"`);
-                console.log(`[Daramet]    Got      (${dNorm.length} chars): "${dNorm.substring(0, 100)}"`);
+        }
+
+        console.warn(`[Daramet] ❌ All ${strategies.length} strategies exhausted - no match found`);
+        return null;
+    }
+
+    /**
+     * Build multiple search strategies from the message text.
+     * Returns array of {name, term} objects in order of preference.
+     */
+    private buildSearchStrategies(message: string): Array<{name: string, term: string}> {
+        const strategies: Array<{name: string, term: string}> = [];
+        
+        // Strategy 1: Full message (exact match attempt)
+        strategies.push({ name: 'Full Message', term: message });
+        
+        // Strategy 2: Last sentence (often most distinctive)
+        const sentences = message.split(/[.!?،؛\n]+/).filter(s => s.trim().length > 5);
+        if (sentences.length >= 1) {
+            const lastSentence = sentences[sentences.length - 1].trim();
+            if (lastSentence !== message) {
+                strategies.push({ name: 'Last Sentence', term: lastSentence });
             }
         }
         
-        console.warn(`[Daramet] ❌ No matching donation found after checking ${donations.length} results`);
+        // Strategy 3: First 50 chars
+        if (message.length > 50) {
+            strategies.push({ name: 'First 50 Chars', term: message.substring(0, 50) });
+        }
+        
+        // Strategy 4: Last 30 chars
+        if (message.length > 30) {
+            strategies.push({ name: 'Last 30 Chars', term: message.substring(message.length - 30) });
+        }
+        
+        // Strategy 5: Middle portion (if long enough)
+        if (message.length > 100) {
+            const start = Math.floor(message.length / 2) - 25;
+            strategies.push({ name: 'Middle 50 Chars', term: message.substring(start, start + 50) });
+        }
+        
+        return strategies;
+    }
+
+    /**
+     * Find an exact match from donation results.
+     */
+    private findExactMatch(
+        donations: DarametDonation[],
+        targetMessage: string,
+        expectedAmount: number,
+        minDate: number
+    ): DarametDonation | null {
+        const targetNorm = normalizeMessage(targetMessage);
+
+        for (const d of donations) {
+            // Check amount
+            if (d.amount !== expectedAmount) {
+                console.log(`[Daramet] ⏭️ Skip [${d.trackingCode || '?'}]: amount ${d.amount} ≠ ${expectedAmount}`);
+                continue;
+            }
+            
+            // Check date (lenient - skip if date=0 or Persian date that couldn't parse)
+            if (d.date && minDate && d.date > 0 && d.date < minDate) {
+                console.log(`[Daramet] ⏭️ Skip [${d.trackingCode || '?'}]: date too old`);
+                continue;
+            }
+            
+            // Check message (exact normalized match)
+            const dNorm = normalizeMessage(d.message);
+            
+            if (dNorm === targetNorm) {
+                console.log(`[Daramet] ✅ EXACT MATCH FOUND!`, {
+                    trackingCode: d.trackingCode,
+                    amount: d.amount
+                });
+                return d;
+            } else {
+                // Log mismatch details
+                console.log(`[Daramet] ⏭️ Skip [${d.trackingCode || '?'}]: message mismatch`);
+                console.log(`[Daramet]    Expected (${targetNorm.length}ch): "${targetNorm.substring(0, 80)}"`);
+                console.log(`[Daramet]    Got      (${dNorm.length}ch): "${dNorm.substring(0, 80)}"`);
+            }
+        }
+        
         return null;
     }
 
