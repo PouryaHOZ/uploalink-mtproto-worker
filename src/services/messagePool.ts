@@ -461,7 +461,8 @@ export class MessagePool {
             hasData: false,
             messageCount: undefined as number | undefined,
             circuitBreaker: { ...this.circuitBreaker },
-            error: undefined as string | undefined
+            error: undefined as string | undefined,
+            warning: undefined as string | undefined
         };
 
         try {

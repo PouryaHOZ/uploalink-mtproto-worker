@@ -582,7 +582,7 @@ export default {
             const paymentId = parts[1];
             
             // NEW: Show confirmation prompt first
-            await messenger.answerCallbackQuery(query.id);
+            await messenger.answerCallbackQuery(query.id, 'در حال بررسی...');
             
             const paymentService = new PaymentService(env);
             const payment = await paymentService.getPendingPayment(paymentId);
