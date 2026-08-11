@@ -499,14 +499,15 @@ export class DarametClient {
                 continue;
             }
             
-            // Check message (exact normalized match)
+            // Check message (exact normalized match with FUZZY comparison)
             const dNorm = normalizeMessage(d.message);
             
-            if (dNorm === targetNorm) {
+            if (this.isMessageMatch(dNorm, targetNorm)) {
                 console.log(`[Daramet] ✅ EXACT MATCH FOUND!`, {
                     trackingCode: d.trackingCode,
                     amount: d.amount,
-                    messageLength: d.message?.length
+                    messageLength: d.message?.length,
+                    matchType: dNorm === targetNorm ? 'EXACT' : 'FUZZY'
                 });
                 return d;
             } else {
@@ -542,6 +543,48 @@ export class DarametClient {
         if (diffPercent < 0.01) {
             console.log(`[Daramet] Amount match: within 1% tolerance (${diffPercent.toFixed(3)}%)`);
             return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Check if messages match, with fuzzy comparison for trailing punctuation.
+     * Handles cases where Daramet strips trailing dots, commas, etc.
+     */
+    private isMessageMatch(actual: string, expected: string): boolean {
+        // Exact match first
+        if (actual === expected) return true;
+        
+        // Fuzzy match: strip trailing punctuation and compare
+        const stripTrailingPunctuation = (s: string): string => 
+            s.replace(/[.!?،؛:,\s]+$/, '').trim();
+        
+        const actualStripped = stripTrailingPunctuation(actual);
+        const expectedStripped = stripTrailingPunctuation(expected);
+        
+        if (actualStripped === expectedStripped) {
+            console.log(`[Daramet] Message fuzzy match after stripping trailing punctuation`);
+            return true;
+        }
+        
+        // Also try stripping leading/trailing whitespace more aggressively
+        const actualTrimmed = actual.trim();
+        const expectedTrimmed = expected.trim();
+        
+        if (actualTrimmed === expectedTrimmed) {
+            console.log(`[Daramet] Message fuzzy match after trimming whitespace`);
+            return true;
+        }
+        
+        // Check if one is substring of the other (for partial matches)
+        if (actualTrimmed.includes(expectedTrimmed) || expectedTrimmed.includes(actualTrimmed)) {
+            // Only allow if length difference is small (< 5 chars)
+            const lengthDiff = Math.abs(actualTrimmed.length - expectedTrimmed.length);
+            if (lengthDiff <= 5) {
+                console.log(`[Daramet] Message fuzzy match (substring, diff=${lengthDiff}ch)`);
+                return true;
+            }
         }
         
         return false;
