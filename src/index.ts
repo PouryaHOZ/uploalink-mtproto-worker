@@ -107,6 +107,95 @@ export default {
                 });
             }
 
+            // Admin endpoint to reset stuck message pool (all messages locked/used)
+            // GET /admin/reset-messages?secret=YOUR_ADMIN_SECRET
+            if (path === '/admin/reset-messages') {
+                const adminSecret = env.ADMIN_SECRET || 'change-me-in-wrangler-config';
+                const providedSecret = url.searchParams.get('secret');
+                
+                if (!providedSecret || providedSecret !== adminSecret) {
+                    return new Response(JSON.stringify({ 
+                        error: 'Unauthorized. Provide valid secret parameter.' 
+                    }), { status: 401 });
+                }
+
+                const messagePool = new MessagePool(env);
+                
+                try {
+                    // Reset all locked and used states
+                    await env.DB.prepare(`
+                        UPDATE message_state 
+                        SET locked = 0, 
+                            locked_by = NULL, 
+                            locked_at = NULL, 
+                            lock_expires_at = NULL,
+                            used = 0,
+                            used_by = NULL,
+                            used_at = NULL,
+                            used_expires_at = NULL
+                    `).run();
+
+                    // Get fresh stats
+                    const stats = await messagePool.getStats();
+                    
+                    console.log(`[Admin] Message pool reset complete. Available: ${stats.free}/${stats.total}`);
+                    
+                    return new Response(JSON.stringify({
+                        success: true,
+                        message: 'Message pool reset successfully',
+                        stats,
+                        timestamp: new Date().toISOString()
+                    }), { 
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                } catch (err) {
+                    console.error('[Admin] Failed to reset messages:', err);
+                    return new Response(JSON.stringify({
+                        success: false,
+                        error: err instanceof Error ? err.message : 'Unknown error'
+                    }), { status: 500 });
+                }
+            }
+
+            // Admin endpoint to cleanup expired locks only
+            // GET /admin/cleanup-locks?secret=YOUR_ADMIN_SECRET
+            if (path === '/admin/cleanup-locks') {
+                const adminSecret = env.ADMIN_SECRET || 'change-me-in-wrangler-config';
+                const providedSecret = url.searchParams.get('secret');
+                
+                if (!providedSecret || providedSecret !== adminSecret) {
+                    return new Response(JSON.stringify({ 
+                        error: 'Unauthorized. Provide valid secret parameter.' 
+                    }), { status: 401 });
+                }
+
+                const messagePool = new MessagePool(env);
+                
+                try {
+                    const cleanedCount = await messagePool.cleanupExpiredLocks();
+                    const recycledCount = await messagePool.recycleUsedMessages();
+                    const stats = await messagePool.getStats();
+                    
+                    return new Response(JSON.stringify({
+                        success: true,
+                        message: 'Cleanup completed',
+                        cleaned: cleanedCount,
+                        recycled: recycledCount,
+                        stats,
+                        timestamp: new Date().toISOString()
+                    }), { 
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                } catch (err) {
+                    return new Response(JSON.stringify({
+                        success: false,
+                        error: err instanceof Error ? err.message : 'Unknown error'
+                    }), { status: 500 });
+                }
+            }
+
             // Cancellation Check Endpoint for transfer.js
             if (path === '/check-cancel') {
                 const transferId = url.searchParams.get('transferId');

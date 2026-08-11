@@ -38,6 +38,10 @@ export class DarametClient {
     private token: string;
     private username: string;
     private baseUrl: string;
+    
+    // Retry settings for API resilience
+    private maxRetries = 3;
+    private retryDelayMs = 1000;
 
     constructor(env: Env) {
         this.token = env.DARAMET_API_TOKEN;
@@ -47,29 +51,70 @@ export class DarametClient {
 
     /**
      * Internal: send an authenticated request to the Daramet API.
+     * Includes retry logic for transient failures.
      */
-    private async request<T = any>(method: string, path: string, body?: any): Promise<T> {
+    private async request<T = any>(method: string, path: string, body?: any, attempt: number = 1): Promise<T> {
         if (!this.token) {
             throw new Error('DARAMET_API_TOKEN is not configured. Run: wrangler secret put DARAMET_API_TOKEN');
         }
+        
         const url = `${this.baseUrl}${path}`;
-        const res = await fetch(url, {
-            method,
-            headers: {
-                'Authorization': this.token,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            body: body ? JSON.stringify(body) : undefined
-        });
+        
+        try {
+            const res = await fetch(url, {
+                method,
+                headers: {
+                    'Authorization': this.token,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body: body ? JSON.stringify(body) : undefined
+            });
 
-        if (!res.ok) {
-            const text = await res.text();
-            console.error(`Daramet API ${method} ${path} failed [${res.status}]: ${text.substring(0, 200)}`);
-            throw new Error(`Daramet API HTTP ${res.status}`);
+            if (!res.ok) {
+                const text = await res.text();
+                console.error(`Daramet API ${method} ${path} failed [${res.status}] (attempt ${attempt}/${this.maxRetries}): ${text.substring(0, 200)}`);
+                
+                // Don't retry on client errors (4xx), only server errors (5xx) and network issues
+                if (res.status >= 400 && res.status < 500) {
+                    throw new Error(`Daramet API HTTP ${res.status}: Client error`);
+                }
+                
+                // Retry on server errors
+                if (attempt < this.maxRetries) {
+                    await this.sleep(this.retryDelayMs * attempt);
+                    return this.request<T>(method, path, body, attempt + 1);
+                }
+                
+                throw new Error(`Daramet API HTTP ${res.status}: ${text.substring(0, 100)}`);
+            }
+
+            return res.json() as Promise<T>;
+            
+        } catch (err) {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            const isNetworkError = errorMsg.includes('fetch') || 
+                                   errorMsg.includes('network') || 
+                                   errorMsg.includes('timeout') ||
+                                   errorMsg.includes('ECONNRESET') ||
+                                   errorMsg.includes('abort');
+            
+            // Retry on network errors
+            if (isNetworkError && attempt < this.maxRetries) {
+                console.warn(`Daramet API network error (attempt ${attempt}/${this.maxRetries}), retrying...`);
+                await this.sleep(this.retryDelayMs * attempt);
+                return this.request<T>(method, path, body, attempt + 1);
+            }
+            
+            throw err;
         }
+    }
 
-        return res.json() as Promise<T>;
+    /**
+     * Simple sleep utility for retry delays
+     */
+    private sleep(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     /**
