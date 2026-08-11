@@ -19,6 +19,12 @@ export const CONSTANTS = {
         UPLOAD_BALE_MBPS: 4,
         UPLOAD_RUBIKA_MBPS: 6
     },
+    STORAGE: {
+        FILE_TTL_MS: 2 * 60 * 60 * 1000,           // 2 hours - files auto-delete after this
+        FILE_TTL_SECONDS: 2 * 60 * 60,               // 2 hours in seconds
+        MAX_STORAGE_BYTES: 9.5 * 1024 * 1024 * 1024,  // 9.5GB max storage
+        CLEANUP_CHECK_INTERVAL_MIN: 30                // Check every 30 minutes
+    },
     SUBSCRIPTION: {
         PRICE_TOMAN: 80000,
         DURATION_DAYS: 30,

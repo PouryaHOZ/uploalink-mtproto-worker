@@ -239,6 +239,24 @@ export class QuotaService {
     }
 
     /**
+     * Reset daily quota for a user (called when they subscribe).
+     * This gives them a fresh quota for the current day immediately.
+     */
+    async resetDailyQuota(userId: string): Promise<void> {
+        const now = Date.now();
+        const dayKey = getPersianDateKey(now);
+
+        // Delete today's quota record so user starts fresh
+        await this.env.DB.prepare(
+            `DELETE FROM daily_quota WHERE user_id = ?1 AND day = ?2`
+        )
+        .bind(userId, dayKey)
+        .run();
+
+        console.log(`[Quota] Daily quota reset for user ${userId} on ${dayKey} (subscription activated)`);
+    }
+
+    /**
      * Activate a subscription for a user (after payment verified).
      * If user has an active subscription, extend it (sum dates).
      * Otherwise, create a new one starting now.

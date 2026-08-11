@@ -12,7 +12,7 @@ export class TelegramPlatform implements Messenger {
             body: JSON.stringify({
                 chat_id: chatId,
                 text,
-                parse_mode: 'Markdown',
+                parse_mode: 'HTML',
                 ...(replyMarkup && { reply_markup: JSON.stringify(replyMarkup) })
             })
         });
@@ -27,7 +27,7 @@ export class TelegramPlatform implements Messenger {
                 chat_id: chatId,
                 message_id: messageId,
                 text,
-                parse_mode: 'Markdown',
+                parse_mode: 'HTML',
                 reply_markup: replyMarkup ? JSON.stringify(replyMarkup) : { inline_keyboard: [] }
             })
         });

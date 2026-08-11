@@ -387,7 +387,7 @@ export class PaymentService {
             return { success: false, error: 'payment_not_pending' };
         }
 
-        // 2. Mark message as used (90-day cooldown) + activate subscription (atomic batch)
+        // 2. Mark message as used (90-day cooldown) + activate subscription + reset quota (atomic batch)
         await this.env.DB.batch([
             // Mark message as used
             this.env.DB.prepare(
@@ -429,6 +429,14 @@ export class PaymentService {
                 CONSTANTS.SUBSCRIPTION.DURATION_DAYS * 24 * 3600 * 1000
             )
         ]);
+
+        // 3. Reset daily quota so subscriber gets fresh quota immediately
+        try {
+            await this.quota.resetDailyQuota(userId);
+        } catch (quotaError) {
+            console.error(`[Payment] Failed to reset quota for ${userId}:`, quotaError);
+            // Don't fail the subscription activation if quota reset fails
+        }
 
         return { success: true };
     }

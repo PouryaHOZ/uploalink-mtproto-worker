@@ -9,10 +9,11 @@ import { handleStartCommand, handleConnectionCode, askLinkSelection, askUnlinkSe
 import { createTransferRequest, processFileTransfer } from './handlers/transfers';
 import { handleSubscribeCommand, handleVerifyCommand, handleSubStatusCommand, sendSubscriptionActivatedMessage } from './handlers/subscriptions';
 import { triggerGitHubWorkflow } from './services/github';
-import { generateConnectionCode, generatePlatformLink } from './utils/helpers';
+import { generateConnectionCode, generatePlatformLink, formatBytes } from './utils/helpers';
 import { PaymentService } from './services/payment';
 import { QuotaService } from './services/quota';
 import { MessagePool } from './services/messagePool';
+import { StorageService } from './services/storage';
 
 async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
     const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
@@ -43,13 +44,13 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
 
         await messenger.sendMessage(
             req.chatId,
-            `⚡ **مقداردهی و راه‌اندازی سرور:**\n\n` +
+            `⚡ <b>مقداردهی و راه‌اندازی سرور:</b>\n\n` +
             `<code>[███░░░░░░░] 30%</code>\n` +
-            `📌 **مرحله:** تخصیص منابع ابری و دریافت اسکریپت...`,
+            `📌 <b>مرحله:</b> تخصیص منابع ابری و دریافت اسکریپت...`,
             { inline_keyboard: [[{ text: '🛑 لغو انتقال', callback_data: `cancel_transfer:${transferId}` }]] }
         );
     } else {
-        await messenger.sendMessage(req.chatId, `❌ **خطا در شروع سرور پردازش:**\n\`${triggerResult.error}\``);
+        await messenger.sendMessage(req.chatId, `❌ <b>خطا در شروع سرور پردازش:</b>\n<code>${triggerResult.error}</code>`);
         await processQueue(env, kv, messenger);
     }
 }
@@ -220,7 +221,7 @@ export default {
                             const pos = await kv.getQueuePosition(transferId);
                             await messenger.sendMessage(
                                 activeReq.transferRequest.chatId,
-                                `⚠️ **یک خطای شبکه‌ای موقت رخ داد.**\nدرخواست شما مجدداً به صف بازگشت (موقعیت: ${pos}).`,
+                                `⚠️ <b>یک خطای شبکه‌ای موقت رخ داد.</b>\nدرخواست شما مجدداً به صف بازگشت (موقعیت: ${pos}).`,
                                 { inline_keyboard: [[{ text: '❌ انصراف از صف', callback_data: `queue_cancel:${transferId}` }]] }
                             );
                         } else if (status === 'completed') {
@@ -274,12 +275,13 @@ export default {
         const cron = event.cron;
 
         if (cron === '*/2 * * * *') {
-            // Every 2 minutes: auto-verify pending payments + cleanup TTL records
+            // Every 2 minutes: auto-verify pending payments + cleanup TTL records + storage cleanup
             ctx.waitUntil((async () => {
                 try {
                     const paymentService = new PaymentService(env);
                     const quotaService = new QuotaService(env);
                     const messagePool = new MessagePool(env);
+                    const storageService = new StorageService(env);
 
                     // Run auto-verifier
                     await paymentService.runAutoVerifier(async (payment, success) => {
@@ -299,6 +301,28 @@ export default {
 
                     // Delete old non-pending payment records
                     await paymentService.deleteOldRecords();
+
+                    // ===== STORAGE CLEANUP: Mark expired files for deletion =====
+                    // Files older than 2 hours are marked as cleanup_pending
+                    // The external processing server (MinIO) handles actual file deletion
+                    try {
+                        const expiredCount = await storageService.cleanupExpiredRecords();
+                        if (expiredCount > 0) {
+                            console.log(`[Cron] Storage cleanup: ${expiredCount} files marked for deletion`);
+
+                            // Optionally purge old cleanup records (once per hour effectively due to */2)
+                            await storageService.purgeCleanupRecords();
+                        }
+
+                        // Log storage stats periodically (every ~10 minutes due to random)
+                        if (Math.random() < 0.2) { // ~20% chance each run = every 10 mins avg
+                            const stats = await storageService.getStorageStats();
+                            console.log(`[Storage] Stats: ${stats.activeFiles} active files, ${stats.expiredFiles} expired, ${formatBytes(stats.totalBytes)} total`);
+                        }
+                    } catch (storageErr) {
+                        console.error('[Cron] Storage cleanup failed:', storageErr);
+                        // Don't fail the entire cron job if storage cleanup fails
+                    }
                 } catch (err) {
                     console.error('Cron */2 failed:', err);
                 }
@@ -316,9 +340,9 @@ export default {
                         const messenger = new TelegramPlatform(env);
                         await messenger.sendMessage(
                             payment.chat_id,
-                            `⚠️ **لینک پرداخت شما منقضی شد.**\n\n` +
+                            `⚠️ <b>لینک پرداخت شما منقضی شد.</b>\n\n` +
                             `اگر پرداخت را انجام داده‌اید، کد رهگیری را با /verify ارسال کنید:\n` +
-                            `\`/verify 12345678\`\n\n` +
+                            `<code>/verify 12345678</code>\n\n` +
                             `اگر هنوز پرداخت نکرده‌اید، می‌توانید با /subscribe دوباره درخواست دهید.\n` +
                             `پنجره پرداخت هنوز باز است.`,
                             { inline_keyboard: [[{ text: '📝 تأیید دستی', callback_data: `sub_verify_input:${payment.payment_id}` }]] }
@@ -330,7 +354,7 @@ export default {
                         const messenger = new TelegramPlatform(env);
                         await messenger.sendMessage(
                             payment.chat_id,
-                            `⏰ **پنجره پرداخت به پایان رسید.**\n\n` +
+                            `⏰ <b>پنجره پرداخت به پایان رسید.</b>\n\n` +
                             `برای دریافت اشتراک، /subscribe را دوباره بزنید.`
                         );
                     });
@@ -441,8 +465,8 @@ export default {
             await kv.saveUserVersion(userId, SYSTEM_VERSION);
             await messenger.sendMessage(
                 chatId,
-                `🎉 **نسخه جدید سیستم (v${SYSTEM_VERSION}) منتشر شد!**\n\n` +
-                `📝 **تغییرات این آپدیت:**\n${LAST_UPDATE_PERSIAN}`
+                `🎉 <b>نسخه جدید سیستم (v${SYSTEM_VERSION}) منتشر شد!</b>\n\n` +
+                `📝 <b>تغییرات این آپدیت:</b>\n${LAST_UPDATE_PERSIAN}`
             );
         }
 
@@ -520,14 +544,14 @@ export default {
             if (!payment) {
                 await messenger.sendMessage(
                     chatId,
-                    '❌ **درخواست پرداخت یافت نشد.**\n\nممکن است لغو شده باشد.',
+                    '❌ <b>درخواست پرداخت یافت نشد.</b>\n\nممکن است لغو شده باشد.',
                     { inline_keyboard: [[{ text: '🔄 خرید اشتراک جدید', callback_data: 'sub_buy' }]] }
                 );
                 return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
             }
             
             // Show "checking" message
-            await messenger.sendMessage(chatId, '⏳ **در حال استعلام از دارمت...**\nلطفاً صبر کنید.');
+            await messenger.sendMessage(chatId, '⏳ <b>در حال استعلام از دارمت...</b>\nلطفاً صبر کنید.');
             
             try {
                 // Try to find donation by message text (same as auto-verifier)
@@ -555,7 +579,7 @@ export default {
                         await sendSubscriptionActivatedMessage(env, messenger, chatId, payment.payment_id, 'auto');
                         return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
                     } else {
-                        await messenger.sendMessage(chatId, '❌ **خطا در فعال‌سازی اشتراک.**\nلطفاً کد رهگیری را دستی وارد کنید.');
+                        await messenger.sendMessage(chatId, '❌ <b>خطا در فعال‌سازی اشتراک.</b>\nلطفاً کد رهگیری را دستی وارد کنید.');
                     }
                 } else {
                     // Not found by message, show manual entry with helpful info
@@ -563,15 +587,15 @@ export default {
                 }
             } catch (err) {
                 console.error(`[Auto-Verify] API error for payment ${paymentId}:`, err);
-                await messenger.sendMessage(chatId, '⚠️ **خطا در ارتباط با دارمت.**\nلطفاً کد رهگیری را دستی وارد کنید.');
+                await messenger.sendMessage(chatId, '⚠️ <b>خطا در ارتباط با دارمت.</b>\nلطفاً کد رهگیری را دستی وارد کنید.');
             }
             
             // Fallback to manual entry
             await messenger.sendMessage(
                 chatId,
-                `📝 **تأیید دستی پرداخت**\n\n` +
+                `📝 <b>تأیید دستی پرداخت</b>\n\n` +
                 `کد رهگیری پرداخت خود را به این شکل ارسال کنید:\n` +
-                `\`/verify 12345678\`\n\n` +
+                `<code>/verify 12345678</code>\n\n` +
                 `💡 کد رهگیری را از صفحه پرداخت دارمت یا پیامک تأیید می‌توانید پیدا کنید.`,
                 { inline_keyboard: [[{ text: '❌ لغو درخواست', callback_data: `sub_cancel:${paymentId}` }]] }
             );
@@ -599,8 +623,8 @@ export default {
             
             await messenger.sendMessage(
                 chatId,
-                `🤔 **آیا از لغو پرداخت مطمئن هستید؟**${timeInfo}\n\n` +
-                `⚠️ *توجه:*\n` +
+                `🤔 <b>آیا از لغو پرداخت مطمئن هستید؟</b>${timeInfo}\n\n` +
+                `⚠️ <i>توجه:</i>\n` +
                 `• پیام اختصاصی شما قفل خواهد ماند تا پایان پنجره پرداخت (۳ ساعت)\n` +
                 `• اگر دوباره /subscribe بزنید، همان پیام به شما داده می‌شود\n` +
                 `• تایمرها از نو شروع خواهند شد`,
@@ -623,7 +647,7 @@ export default {
             const result = await paymentService.cancelPaymentKeepMessageLocked(paymentId, userId);
             
             if (result.success) {
-                await messenger.editMessageText(chatId, messageId, `🛑 **درخواست پرداخت لغو شد.**\n\n` +
+                await messenger.editMessageText(chatId, messageId, `🛑 <b>درخواست پرداخت لغو شد.</b>\n\n` +
                     `🔒 پیام اختصاصی شما تا پایان پنجره پرداخت قفل باقی می‌ماند.\n` +
                     `🔄 برای شروع مجدد، /subscribe را بزنید.`);
                 await messenger.answerCallbackQuery(query.id, '✅ درخواست لغو شد.');
@@ -640,7 +664,7 @@ export default {
             await messenger.answerCallbackQuery(query.id, '↩️ لغو لغو شد! درخواست شما فعال است.');
             await messenger.sendMessage(
                 chatId,
-                '✅ **درخواست پرداخت شما همچنان فعال است.**\n\n' +
+                '✅ <b>درخواست پرداخت شما همچنان فعال است.</b>\n\n' +
                 'هر زمان که آماده بودید، پرداخت کنید یا کد رهگیری را وارد کنید.',
                 { inline_keyboard: [[{ text: '✅ پرداخت کردم — تأیید', callback_data: `sub_verify_input:${parts[1]}` }]] }
             );
@@ -651,7 +675,7 @@ export default {
         if (action === 'queue_cancel') {
             const transferId = parts[1];
             await kv.dequeueTransfer(transferId);
-            await messenger.editMessageText(chatId, messageId, `🛑 **درخواست شما از صف لغو شد.**`);
+            await messenger.editMessageText(chatId, messageId, `🛑 <b>درخواست شما از صف لغو شد.</b>`);
             await processQueue(env, kv, messenger);
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
         }
@@ -678,7 +702,7 @@ export default {
             } else {
                 // If it was in queue
                 await kv.dequeueTransfer(transferId);
-                await messenger.editMessageText(chatId, messageId, `🛑 **فرآیند انتقال لغو شد.**`);
+                await messenger.editMessageText(chatId, messageId, `🛑 <b>فرآیند انتقال لغو شد.</b>`);
                 await messenger.answerCallbackQuery(query.id, 'انتقال لغو شد.');
 
                 // Release reserved quota
@@ -721,7 +745,7 @@ export default {
                         await messenger.editMessageText(
                             chatId,
                             messageId,
-                            `🚀 **درخواست پذیرفته شد!**\n\n\`[██░░░░░░░░] 20%\`\n⏳ **در حال استارت سرور پردازش ابری...**`,
+                            `🚀 <b>درخواست پذیرفته شد!</b>\n\n<code>[██░░░░░░░░] 20%</code>\n⏳ <b>در حال استارت سرور پردازش ابری...</b>`,
                             { inline_keyboard: [[{ text: '🛑 لغو انتقال', callback_data: `cancel_transfer:${transferId}` }]] }
                         );
                         await messenger.answerCallbackQuery(query.id, 'پردازش آغاز شد.');
@@ -736,7 +760,7 @@ export default {
                                 console.error('Failed to release reserved quota on trigger fail:', err);
                             }
                         }
-                        await messenger.editMessageText(chatId, messageId, `❌ **خطا در ارسال درخواست به سرور پردازش:**\n\`${triggerResult.error}\``);
+                        await messenger.editMessageText(chatId, messageId, `❌ <b>خطا در ارسال درخواست به سرور پردازش:</b>\n<code>${triggerResult.error}</code>`);
                         await messenger.answerCallbackQuery(query.id, 'خطا در اجرای درخواست.');
                         return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
                     }
@@ -748,13 +772,13 @@ export default {
                 await messenger.editMessageText(
                     chatId,
                     messageId,
-                    `⏳ **ظرفیت پردازش هم‌زمان پر است؛ شما در صف قرار گرفتید.**\n\n📍 موقعیت شما در صف: **${position}**\n\nسیستم به محض آزاد شدن سرورها، فایل شما را به صورت خودکار پردازش می‌کند.`,
+                    `⏳ <b>ظرفیت پردازش هم‌زمان پر است؛ شما در صف قرار گرفتید.</b>\n\n📍 موقعیت شما در صف: <b>${position}</b>\n\nسیستم به محض آزاد شدن سرورها، فایل شما را به صورت خودکار پردازش می‌کند.`,
                     { inline_keyboard: [[{ text: '❌ انصراف از صف', callback_data: `queue_cancel:${transferId}` }]] }
                 );
                 await messenger.answerCallbackQuery(query.id, 'در صف قرار گرفتید.');
                 return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
             } else {
-                await messenger.editMessageText(chatId, messageId, `❌ **خطا:** درخواست یافت نشد یا منقضی شده است.`);
+                await messenger.editMessageText(chatId, messageId, `❌ <b>خطا:</b> درخواست یافت نشد یا منقضی شده است.`);
             }
             await messenger.answerCallbackQuery(query.id, 'درخواست ثبت شد.');
             return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });

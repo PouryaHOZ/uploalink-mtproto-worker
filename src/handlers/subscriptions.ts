@@ -26,12 +26,12 @@ export async function handleSubscribeCommand(
 
     if (!result.success || !result.payment || !result.webintentUrl) {
         const errorMessages: Record<string, string> = {
-            'pool_exhausted': '❌ **ظرفیت سیستم به موقت پر است.**\nلطفاً چند دقیقه بعد دوباره تلاش کنید.',
-            'database_error': '❌ **خطا در ارتباط با پایگاه داده.**\nلطفاً چند لحظه بعد دوباره تلاش کنید.\n\n_اگر این خطا ادامه داشت، با پشتیبانی تماس بگیرید._',
-            'd1_connection_error': '❌ **مشکل در اتصال به پایگاه داده.**\nسیستم در حال تلاش مجدد است...\nلطفاً ۱۰ ثانیه صبر کنید و دوباره /subscribe را بزنید.',
-            'table_not_found': '❌ **خطای سیستمی: جدول پیام‌ها یافت نشد.**\nاین مشکل باید توسط مدیر سیستم برطرف شود.',
-            'circuit_breaker_open': '⚠️ **پایگاه داده در حال حاضر در دسترس نیست.**\n\n' +
-                'سیستم به صورت خودکار پس از _۱ دقیقه_ دوباره امتحان می‌کند.\n' +
+            'pool_exhausted': '❌ <b>ظرفیت سیستم به موقت پر است.</b>\nلطفاً چند دقیقه بعد دوباره تلاش کنید.',
+            'database_error': '❌ <b>خطا در ارتباط با پایگاه داده.</b>\nلطفاً چند لحظه بعد دوباره تلاش کنید.\n\n<i>اگر این خطا ادامه داشت، با پشتیبانی تماس بگیرید.</i>',
+            'd1_connection_error': '❌ <b>مشکل در اتصال به پایگاه داده.</b>\nسیستم در حال تلاش مجدد است...\nلطفاً ۱۰ ثانیه صبر کنید و دوباره /subscribe را بزنید.',
+            'table_not_found': '❌ <b>خطای سیستمی: جدول پیام‌ها یافت نشد.</b>\nاین مشکل باید توسط مدیر سیستم برطرف شود.',
+            'circuit_breaker_open': '⚠️ <b>پایگاه داده در حال حاضر در دسترس نیست.</b>\n\n' +
+                'سیستم به صورت خودکار پس از <i>۱ دقیقه</i> دوباره امتحان می‌کند.\n' +
                 'لطفاً کمی صبر کنید و سپس /subscribe را بزنید.'
         };
         
@@ -50,7 +50,7 @@ export async function handleSubscribeCommand(
         
         await messenger.sendMessage(
             chatId,
-            errorMessages[errorKey] || `❌ **خطا در ایجاد درخواست پرداخت.**\n\nکد خطا: \`${result.error || 'unknown'}\`\nلطفاً چند دقیقه بعد دوباره تلاش کنید.`
+            errorMessages[errorKey] || `❌ <b>خطا در ایجاد درخواست پرداخت.</b>\n\nکد خطا: <code>${result.error || 'unknown'}</code>\nلطفاً چند دقیقه بعد دوباره تلاش کنید.`
         );
         return;
     }
@@ -65,24 +65,28 @@ export async function handleSubscribeCommand(
     // Show different message for reused payments
     let headerMessage: string;
     if (result.reused) {
-        headerMessage = `🔄 **اشتراک مجدد — ${toPersianDigits('80000')} تومان**\n\n` +
-            `✅ *پیام اختصاصی قبلی شما بازیابی شد*\n` +
+        headerMessage = `🔄 <b>اشتراک مجدد — ${toPersianDigits('80000')} تومان</b>\n\n` +
+            `✅ <i>پیام اختصاصی قبلی شما بازیابی شد</i>\n` +
             `تایمرها از نو شروع شده‌اند!`;
     } else {
-        headerMessage = `💎 **خرید اشتراک ۳۰ روزه — ${toPersianDigits('80000')} تومان**`;
+        headerMessage = `💎 <b>خرید اشتراک ۳۰ روزه — ${toPersianDigits('80000')} تومان</b>`;
     }
+
+    // Use HTML <a> tag for the payment link to ensure the ENTIRE URL is clickable
+    // This prevents issues where trailing dots or punctuation might be excluded from auto-detected URLs
+    const paymentLinkHtml = `<a href="${result.webintentUrl}">${result.webintentUrl}</a>`;
 
     const message =
         `${headerMessage}\n\n` +
-        `🔗 **لینک پرداخت:**\n${result.webintentUrl}\n\n` +
-        `⚠️ **توجه بسیار مهم:**\n` +
+        `🔗 <b>لینک پرداخت:</b>\n${paymentLinkHtml}\n\n` +
+        `⚠️ <b>توجه بسیار مهم:</b>\n` +
         `• روی لینک بالا کلیک کنید\n` +
         `• در صفحه باز شده، روی دکمه «تأیید و پرداخت» کلیک کنید\n` +
-        `• به لینک، مبلغ یا پیام **هیچ تغییری** ایجاد نکنید\n` +
+        `• به لینک، مبلغ یا پیام <b>هیچ تغییری</b> ایجاد نکنید\n` +
         `• در غیر این صورت، اشتراک شما فعال نخواهد شد\n\n` +
-        `⏰ **لینک تا ${linkExpiresIn} فعال است.**\n` +
+        `⏰ <b>لینک تا ${linkExpiresIn} فعال است.</b>\n` +
         `🔄 اگر لینک منقضی شد، با کد رهگیری از /verify استفاده کنید.\n\n` +
-        `📋 **پنجره پرداخت:** ${windowExpiresIn} (تا ساعت ${windowExpiresAt})`;
+        `📋 <b>پنجره پرداخت:</b> ${windowExpiresIn} (تا ساعت ${windowExpiresAt})`;
 
     const inlineKeyboard = {
         inline_keyboard: [
@@ -114,9 +118,9 @@ export async function handleVerifyCommand(
     if (!trackingCode) {
         await messenger.sendMessage(
             chatId,
-            `📝 **تأیید دستی پرداخت**\n\n` +
+            `📝 <b>تأیید دستی پرداخت</b>\n\n` +
             `کد رهگیری پرداخت خود را به این شکل ارسال کنید:\n` +
-            `\`/verify 12345678\`\n\n` +
+            `<code>/verify 12345678</code>\n\n` +
             `💡 کد رهگیری را از صفحه پرداخت دارمت یا پیامک تأیید می‌توانید پیدا کنید.`
         );
         return;
@@ -129,7 +133,7 @@ export async function handleVerifyCommand(
     if (!pending) {
         await messenger.sendMessage(
             chatId,
-            '❌ **درخواست پرداخت فعالی برای شما یافت نشد.**\n\n' +
+            '❌ <b>درخواست پرداخت فعلی برای شما یافت نشد.</b>\n\n' +
             'برای خرید اشتراک از /subscribe استفاده کنید.'
         );
         return;
@@ -143,7 +147,7 @@ export async function handleVerifyCommand(
         if (result.alreadyActive) {
             await messenger.sendMessage(
                 chatId,
-                '✅ **این پرداخت قبلاً تأیید شده و اشتراک شما فعال است.**'
+                '✅ <b>این پرداخت قبلاً تأیید شده و اشتراک شما فعال است.</b>'
             );
             return;
         }
@@ -161,7 +165,7 @@ export async function handleVerifyCommand(
         };
         await messenger.sendMessage(
             chatId,
-            `❌ **تأیید ناموفق:**\n\n${errorMessages[result.error || ''] || 'خطای ناشناخته.'}`
+            `❌ <b>تأیید ناموفق:</b>\n\n${errorMessages[result.error || ''] || 'خطای ناشناخته.'}`
         );
     }
 }
@@ -187,26 +191,26 @@ export async function handleSubStatusCommand(
     const usage = await quotaService.getTodayUsage(userId);
     const pending = await paymentService.getActivePendingPayment(userId);
 
-    let message = '📊 **وضعیت اشتراک و سهمیه**\n\n';
+    let message = '📊 <b>وضعیت اشتراک و سهمیه</b>\n\n';
 
     if (sub && sub.expiry_date > Date.now()) {
         const remaining = sub.expiry_date - Date.now();
         const tierName = sub.tier === 'shared' ? 'اشتراکی' : 'آزمایشی';
-        message += `💎 **اشتراک:** ${tierName}\n`;
-        message += `⏰ **انقضا:** ${formatPersianDate(sub.expiry_date)}\n`;
-        message += `⏳ **باقی‌مانده:** ${formatPersianDuration(remaining)}\n\n`;
+        message += `💎 <b>اشتراک:</b> ${tierName}\n`;
+        message += `⏰ <b>انقضا:</b> ${formatPersianDate(sub.expiry_date)}\n`;
+        message += `⏳ <b>باقی‌مانده:</b> ${formatPersianDuration(remaining)}\n\n`;
     } else if (sub && sub.expiry_date <= Date.now()) {
-        message += `❌ **اشتراک شما منقضی شده است.**\n`;
+        message += `❌ <b>اشتراک شما منقضی شده است.</b>\n`;
         message += `برای تمدید: /subscribe\n\n`;
     } else {
-        message += `🆓 **بدون اشتراک فعال** — از سهمیه آزمایشی استفاده می‌کنید.\n`;
+        message += `🆓 <b>بدون اشتراک فعال</b> — از سهمیه آزمایشی استفاده می‌کنید.\n`;
         message += `برای خرید اشتراک: /subscribe\n\n`;
     }
 
     if (usage) {
         const usedPercent = Math.round((usage.usedBytes / usage.dailyLimit) * 100);
         const remainingBytes = Math.max(0, usage.dailyLimit - usage.usedBytes - usage.reservedBytes);
-        message += `📊 **سهمیه امروز (Asia/Tehran):**\n`;
+        message += `📊 <b>سهمیه امروز (Asia/Tehran):</b>\n`;
         message += `• استفاده‌شده: ${formatBytes(usage.usedBytes)}\n`;
         message += `• در حال انتقال: ${formatBytes(usage.reservedBytes)}\n`;
         message += `• باقی‌مانده: ${formatBytes(remainingBytes)}\n`;
@@ -217,7 +221,7 @@ export async function handleSubStatusCommand(
     if (pending) {
         const windowRemaining = pending.payment_window_expiry_at - Date.now();
         if (windowRemaining > 0) {
-            message += `⏳ **پرداخت در انتظار:**\n`;
+            message += `⏳ <b>پرداخت در انتظار:</b>\n`;
             message += `• مبلغ: ${toPersianDigits(pending.amount.toString())} تومان\n`;
             message += `• باقی‌مانده پنجره: ${formatPersianDuration(windowRemaining)}\n\n`;
         }
@@ -247,12 +251,12 @@ export async function sendSubscriptionActivatedMessage(
 
     await messenger.sendMessage(
         chatId,
-        `✅ **اشتراک شما با موفقیت فعال شد!**\n\n` +
-        `💎 **اشتراک اشتراکی — ۳۰ روز**\n` +
-        `📊 **سهمیه روزانه:** ${formatBytes(CONSTANTS.SUBSCRIPTION.SHARED_DAILY_QUOTA_BYTES)}\n` +
-        `📦 **حداکثر حجم هر فایل:** ${formatBytes(CONSTANTS.SUBSCRIPTION.SHARED_PER_FILE_LIMIT_BYTES)}\n` +
-        `⏰ **تاریخ انقضا:** ${formatPersianDate(expiryDate)}\n\n` +
-        `📝 **روش تأیید:** ${methodText}\n\n` +
+        `✅ <b>اشتراک شما با موفقیت فعال شد!</b>\n\n` +
+        `💎 <b>اشتراک اشتراکی — ۳۰ روز</b>\n` +
+        `📊 <b>سهمیه روزانه:</b> ${formatBytes(CONSTANTS.SUBSCRIPTION.SHARED_DAILY_QUOTA_BYTES)}\n` +
+        `📦 <b>حداکثر حجم هر فایل:</b> ${formatBytes(CONSTANTS.SUBSCRIPTION.SHARED_PER_FILE_LIMIT_BYTES)}\n` +
+        `⏰ <b>تاریخ انقضا:</b> ${formatPersianDate(expiryDate)}\n\n` +
+        `📝 <b>روش تأیید:</b> ${methodText}\n\n` +
         `🎉 از این پس می‌توانید فایل‌های خود را با سهمیه کامل ارسال کنید.`
     );
 }

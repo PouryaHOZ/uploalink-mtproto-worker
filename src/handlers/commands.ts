@@ -20,8 +20,8 @@ export async function handleStartCommand(env: Env, kv: KVService, messenger: Mes
     const baleStatus = connectedAcc?.baleChatId ? '✅ متصل' : '❌ غیرمتصل';
 
     const welcomeMessage = platform === 'telegram'
-        ? `✨ **به ربات انتقال هوشمند فایل خوش آمدید!**\n\n👤 **کاربر:** ${userName}\n📌 **وضعیت اتصال پلتفرم‌ها:**\n• روبیکا: ${rubikaStatus}\n• بله: ${baleStatus}\n\n⚡ **راهنمای سریع:**\n۱. با دستور /link حساب‌های خود را متصل کنید.\n۲. هر فایلی را در تلگرام ارسال کنید تا انتقال یابد.\n۳. با /status وضعیت ویدیوها و فایل‌ها را پیگیری کنید.\n۴. با /subscribe اشتراک تهیه کنید و سهمیه بیشتر بگیرید.`
-        : `👋 **سلام ${userName}!**\n\nبرای اتصال این پلتفرم به تلگرام، ابتدا دستور /start را در ربات تلگرام ارسال کنید.`;
+        ? `✨ <b>به ربات انتقال هوشمند فایل خوش آمدید!</b>\n\n👤 <b>کاربر:</b> ${userName}\n📌 <b>وضعیت اتصال پلتفرم‌ها:</b>\n• روبیکا: ${rubikaStatus}\n• بله: ${baleStatus}\n\n⚡ <b>راهنمای سریع:</b>\n۱. با دستور /link حساب‌های خود را متصل کنید.\n۲. هر فایلی را در تلگرام ارسال کنید تا انتقال یابد.\n۳. با /status وضعیت ویدیوها و فایل‌ها را پیگیری کنید.\n۴. با /subscribe اشتراک تهیه کنید و سهمیه بیشتر بگیرید.`
+        : `👋 <b>سلام ${userName}!</b>\n\nبرای اتصال این پلتفرم به تلگرام، ابتدا دستور /start را در ربات تلگرام ارسال کنید.`;
 
     const inlineKeyboard = platform === 'telegram' ? {
         inline_keyboard: [
@@ -39,7 +39,7 @@ export async function handleConnectionCode(env: Env, kv: KVService, messenger: M
     const connectionRequest = await kv.getConnectionRequest(cleanCode);
 
     if (!connectionRequest || Date.now() > connectionRequest.expiresAt || connectionRequest.targetPlatform !== platform) {
-        await messenger.sendMessage(chatIdStr, '❌ **کد واردشده نامعتبر یا منقضی شده است.**\nلطفاً کد جدیدی دریافت کنید.');
+        await messenger.sendMessage(chatIdStr, '❌ <b>کد واردشده نامعتبر یا منقضی شده است.</b>\nلطفاً کد جدیدی دریافت کنید.');
         return;
     }
 
@@ -69,13 +69,13 @@ export async function handleConnectionCode(env: Env, kv: KVService, messenger: M
     const platformName = platform === 'bale' ? 'بله' : 'روبیکا';
 
     // 1. Send confirmation message to Rubika/Bale
-    await messenger.sendMessage(chatIdStr, `🎉 **اتصال با موفقیت انجام شد!**\nحساب ${platformName} شما به تلگرام متصل گردید.`);
+    await messenger.sendMessage(chatIdStr, `🎉 <b>اتصال با موفقیت انجام شد!</b>\nحساب ${platformName} شما به تلگرام متصل گردید.`);
 
     // 2. Direct confirmation notification to Telegram user
     const telegramMessenger = new TelegramPlatform(env);
     await telegramMessenger.sendMessage(
         telegramChatIdStr,
-        `🎉 **حساب ${platformName} با موفقیت به تلگرام متصل شد!**\n\nاز این پس فایل‌های ارسالی شما مستقیماً به ${platformName} منتقل خواهند شد.`
+        `🎉 <b>حساب ${platformName} با موفقیت به تلگرام متصل شد!</b>\n\nاز این پس فایل‌های ارسالی شما مستقیماً به ${platformName} منتقل خواهند شد.`
     );
 
     await kv.deleteConnectionRequest(cleanCode);
@@ -83,7 +83,7 @@ export async function handleConnectionCode(env: Env, kv: KVService, messenger: M
 
 export async function askLinkSelection(messenger: Messenger, chatId: string, platform: Platform): Promise<void> {
     if (platform === 'telegram') {
-        await messenger.sendMessage(chatId, `🔗 **اتصال به پیام‌رسان‌های داخلی:**\nلطفاً پلتفرم موردنظر خود را جهت اتصال انتخاب کنید:`, {
+        await messenger.sendMessage(chatId, `🔗 <b>اتصال به پیام‌رسان‌های داخلی:</b>\nلطفاً پلتفرم موردنظر خود را جهت اتصال انتخاب کنید:`, {
             inline_keyboard: [
                 [{ text: '📌 اتصال به روبیکا', callback_data: `link:rubika` },
                  { text: '📌 اتصال به بله', callback_data: `link:bale` }]
@@ -99,11 +99,11 @@ export async function askUnlinkSelection(kv: KVService, messenger: Messenger, ch
     if (account?.baleChatId) buttons.push({ text: '🔴 قطع اتصال بله', callback_data: `unlink:bale` });
 
     if (buttons.length === 0) {
-        await messenger.sendMessage(chatId, `❌ **هیچ پلتفرمی به حساب شما متصل نیست.**`);
+        await messenger.sendMessage(chatId, `❌ <b>هیچ پلتفرمی به حساب شما متصل نیست.</b>`);
         return;
     }
 
-    await messenger.sendMessage(chatId, `⚠️ **قطع اتصال پلتفرم‌ها:**\nکدام اتصال حذف شود؟`, { inline_keyboard: [buttons] });
+    await messenger.sendMessage(chatId, `⚠️ <b>قطع اتصال پلتفرم‌ها:</b>\nکدام اتصال حذف شود؟`, { inline_keyboard: [buttons] });
 }
 
 export async function handleStatusCommand(env: Env, kv: KVService, messenger: Messenger, chatId: string, userId?: string): Promise<void> {
@@ -114,16 +114,16 @@ export async function handleStatusCommand(env: Env, kv: KVService, messenger: Me
     const transfers = await kv.getAllActiveTransfers();
     const userTransfers = transfers.filter(t => t.transferRequest.chatId === chatId);
 
-    let statusCard = `📊 **داشبورد وضعیت سیستم:**\n\n` +
-                     `📱 **پلتفرم‌های متصل:**\n` +
+    let statusCard = `📊 <b>داشبورد وضعیت سیستم:</b>\n\n` +
+                     `📱 <b>پلتفرم‌های متصل:</b>\n` +
                      `• روبیکا: ${rubikaStatus}\n` +
                      `• بله: ${baleStatus}\n\n` +
-                     `🔄 **فایل‌های در حال انتقال:** ${toPersianDigits(userTransfers.length.toString())} مورد\n`;
+                     `🔄 <b>فایل‌های در حال انتقال:</b> ${toPersianDigits(userTransfers.length.toString())} مورد\n`;
 
     if (userTransfers.length > 0) {
-        statusCard += `\n📋 **جزئیات:**\n`;
+        statusCard += `\n📋 <b>جزئیات:</b>\n`;
         userTransfers.forEach((t, i) => {
-            statusCard += `${toPersianDigits((i + 1).toString())}. **${t.transferRequest.fileName}** — وضعیت: \`${t.status}\`\n`;
+            statusCard += `${toPersianDigits((i + 1).toString())}. <b>${t.transferRequest.fileName}</b> — وضعیت: <code>${t.status}</code>\n`;
         });
     }
 
@@ -138,7 +138,7 @@ export async function handleStatusCommand(env: Env, kv: KVService, messenger: Me
         const usage = await quotaService.getTodayUsage(userId);
         const pending = await paymentService.getActivePendingPayment(userId);
 
-        statusCard += `\n────────────────\n💎 **اشتراک:**\n`;
+        statusCard += `\n────────────────\n💎 <b>اشتراک:</b>\n`;
         if (sub && sub.expiry_date > Date.now()) {
             const remaining = sub.expiry_date - Date.now();
             const tierName = sub.tier === 'shared' ? 'اشتراکی' : 'آزمایشی';
@@ -152,7 +152,7 @@ export async function handleStatusCommand(env: Env, kv: KVService, messenger: Me
 
         if (usage) {
             const usedPercent = Math.round((usage.usedBytes / usage.dailyLimit) * 100);
-            statusCard += `\n📊 **سهمیه امروز:**\n`;
+            statusCard += `\n📊 <b>سهمیه امروز:</b>\n`;
             statusCard += `• استفاده‌شده: ${formatBytes(usage.usedBytes)}\n`;
             statusCard += `• در حال انتقال: ${formatBytes(usage.reservedBytes)}\n`;
             statusCard += `• باقی‌مانده: ${formatBytes(Math.max(0, usage.dailyLimit - usage.usedBytes - usage.reservedBytes))}\n`;
@@ -162,7 +162,7 @@ export async function handleStatusCommand(env: Env, kv: KVService, messenger: Me
         if (pending) {
             const windowRemaining = pending.payment_window_expiry_at - Date.now();
             if (windowRemaining > 0) {
-                statusCard += `\n⏳ **پرداخت در انتظار** (${formatDuration(windowRemaining / 1000)})\n`;
+                statusCard += `\n⏳ <b>پرداخت در انتظار</b> (${formatDuration(windowRemaining / 1000)})\n`;
             }
         }
     }
