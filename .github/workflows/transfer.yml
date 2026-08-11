@@ -60,8 +60,8 @@ jobs:
       - name: Execute Transfer Script
         run: node --max-old-space-size=4096 src/transfer.js
         env:
-          DOWNLOAD_WORKERS: 48
-          DOWNLOAD_CHUNK_SIZE: 1048576
+          DOWNLOAD_WORKERS: 1
+          DOWNLOAD_CHUNK_SIZE: 262144
           NODE_ENV: production
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
