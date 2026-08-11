@@ -82,5 +82,4 @@ jobs:
           CLOUDFLARE_WEBHOOK_URL: ${{ secrets.CLOUDFLARE_WEBHOOK_URL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TRANSFER_ID: ${{ github.event.client_payload.TRANSFER_ID }}
-          DOWNLOAD_WORKERS: 8
           TEMP_DIR: /dev/shm/temp_transfers
