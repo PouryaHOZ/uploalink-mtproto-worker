@@ -736,26 +736,39 @@ class TelegramDownloadStream extends Readable {
     }
 
     /**
-     * Reliable download-to-stream method
-     * Downloads file to temp location, then streams it through
-     * This is the PRIMARY pipeline method that works consistently
+     * HYBRID STREAMING METHOD - Parallel Download + Compress + Upload
+     * 
+     * Strategy: Start reading from temp file as soon as data is available,
+     * allowing FFmpeg to begin processing while download continues.
+     * This gives TRUE parallel pipeline behavior!
      */
     async _downloadAndStream() {
         const tempPath = path.join(config.performance.tempDir, `pipeline_${Date.now()}.tmp`);
         this._tempFilePath = tempPath;  // Store for cleanup
         
+        // Track streaming state
+        let streamStarted = false;
+        let downloadComplete = false;
+        const MIN_BYTES_TO_START_STREAMING = 2 * 1024 * 1024; // 2MB minimum before starting FFmpeg
+        const downloadStart = Date.now();
+        
         try {
-            console.log(`[Pipeline] Phase 1: Downloading to temp file (${formatBytes(this.totalSize || 0)})`);
-            console.log(`[Pipeline] Chunk size: ${formatBytes(this.options.partSize || config.performance.downloadChunkSize)}, Workers: ${this.options.workers || config.performance.downloadWorkers}`);
+            console.log(`[Pipeline] Starting hybrid parallel download (${formatBytes(this.totalSize || 0)})`);
+            console.log(`[Pipeline] Will start streaming after ${formatBytes(MIN_BYTES_TO_START_STREAMING)} downloaded`);
             
-            // Phase 1: Download to temp file (fast with optimized 256KB chunks)
-            const downloadStart = Date.now();
+            // Create write stream for temp file
+            const writeStream = fs.createWriteStream(tempPath);
+            let totalWritten = 0;
             
-            await this.client.downloadMedia(
-                this.rawInput,  // Use original input (Message or media object)
+            // Start download in "manual" mode using iter_download internally
+            // We'll use downloadMedia but with a custom approach to enable early streaming
+            
+            // Phase 1: Download with progress tracking
+            const downloadPromise = this.client.downloadMedia(
+                this.rawInput,
                 {
                     partSize: this.options.partSize || config.performance.downloadChunkSize,
-                    outputFile: tempPath,
+                    outputFile: tempPath,  // Write directly to file
                     workers: this.options.workers || config.performance.downloadWorkers,
                     progressCallback: (downloaded, total) => {
                         this.downloadedBytes = downloaded;
@@ -771,30 +784,118 @@ class TelegramDownloadStream extends Readable {
                             percent: total ? Math.floor((downloaded / total) * 100) : 0,
                             speed: formatBytes(speed) + '/s'
                         });
+                        
+                        // 🔥 KEY: Start streaming once we have enough data!
+                        if (!streamStarted && downloaded >= MIN_BYTES_TO_START_STREAMING && total > MIN_BYTES_TO_START_STREAMING) {
+                            this._startStreamingFromFile(tempPath);
+                            streamStarted = true;
+                            console.log(`[Pipeline] 🚀 Started parallel streaming at ${formatBytes(downloaded)} downloaded`);
+                        }
                     }
                 }
             );
             
-            const downloadTime = ((Date.now() - downloadStart) / 1000).toFixed(1);
-            console.log(`[Pipeline] Phase 1 complete: Downloaded in ${downloadTime}s`);
+            await downloadPromise;
+            downloadComplete = true;
             
-            // Phase 2: Stream from temp file (this feeds FFmpeg simultaneously)
-            console.log('[Pipeline] Phase 2: Streaming from temp file to pipeline');
+            const downloadTime = ((Date.now() - downloadStart) / 1000).toFixed(1);
+            console.log(`[Pipeline] Download complete in ${downloadTime}s`);
+            
+            // If we haven't started streaming yet (small file), start now
+            if (!streamStarted) {
+                this._startStreamingFromFile(tempPath);
+                streamStarted = true;
+                console.log('[Pipeline] Started streaming after full download (small file)');
+            }
+            
+        } catch (err) {
+            console.error(`[Pipeline] Download failed: ${err.message}`);
+            this.destroy(err);
+        }
+    }
+
+    /**
+     * Start reading from temp file and pushing into the stream pipeline
+     * This allows FFmpeg to start processing while download continues
+     */
+    _startStreamingFromFile(tempPath) {
+        // Check if file exists and has content
+        try {
+            if (!fs.existsSync(tempPath)) {
+                console.warn('[Pipeline] Temp file not found yet');
+                return;
+            }
+            
+            const stats = fs.statSync(tempPath);
+            if (stats.size === 0) {
+                console.warn('[Pipeline] Temp file empty');
+                return;
+            }
+            
+            console.log(`[Pipeline] Opening stream on temp file (${formatBytes(stats.size)} available)`);
             
             const fileStream = fs.createReadStream(tempPath, { 
-                highWaterMark: this.options.highWaterMark || (config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024)
+                highWaterMark: this.options.highWaterMark || (config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024),
+                // Don't set end position - allow file to grow as download continues!
             });
+            
+            let bytesRead = 0;
+            let fileSizeAtStart = stats.size;
+            let lastSizeCheck = Date.now();
+            let waitingForData = false;
             
             // Handle backpressure properly
             fileStream.on('data', (chunk) => {
+                bytesRead += chunk.length;
+                
                 if (!this.push(chunk)) {
                     fileStream.pause();  // Backpressure: pause when buffer full
                 }
             });
             
             fileStream.on('end', () => {
-                console.log('[Pipeline] Temp file stream complete');
-                this.push(null);  // Signal EOF
+                console.log(`[Pipeline] Stream ended: ${formatBytes(bytesRead)} read`);
+                
+                // File might still be growing! Check if download is complete
+                // by seeing if file size increased since we started
+                setTimeout(() => {
+                    try {
+                        const currentSize = fs.statSync(tempPath).size;
+                        if (currentSize > fileSizeAtStart && bytesRead < currentSize) {
+                            console.log(`[Pipeline] File grew from ${formatBytes(fileSizeAtStart)} to ${formatBytes(currentSize)}, continuing...`);
+                            
+                            // Create new stream from current position
+                            const continueStream = fs.createReadStream(tempPath, {
+                                start: bytesRead,
+                                highWaterMark: this.options.highWaterMark
+                            });
+                            
+                            continueStream.on('data', (chunk) => {
+                                if (!this.push(chunk)) {
+                                    continueStream.pause();
+                                }
+                            });
+                            
+                            continueStream.on('end', () => {
+                                this.push(null);  // Final EOF
+                            });
+                            
+                            continueStream.on('error', (err) => {
+                                this.destroy(err);
+                            });
+                            
+                            this.on('drain', () => {
+                                if (continueStream.isPaused()) {
+                                    continueStream.resume();
+                                }
+                            });
+                        } else {
+                            this.push(null);  // Signal EOF - truly done
+                        }
+                    } catch (e) {
+                        this.push(null);  // Error reading, signal EOF
+                    }
+                }, 500);  // Small delay to allow download to write more data
             });
             
             fileStream.on('error', (err) => {
@@ -810,7 +911,7 @@ class TelegramDownloadStream extends Readable {
             });
             
         } catch (err) {
-            console.error(`[Pipeline] Download failed: ${err.message}`);
+            console.error(`[Pipeline] Failed to start streaming: ${err.message}`);
             this.destroy(err);
         }
     }
