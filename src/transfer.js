@@ -1522,13 +1522,27 @@ class FileTransferBot {
                 highWaterMark: config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024 // 2MB
             });
 
-            // Track download progress
+            // Track download progress AND update UI
+            let lastDownloadUpdate = 0;
+            const DOWNLOAD_UPDATE_INTERVAL = 2000; // Update every 2 seconds (avoid spam)
+            
             downloadStream.on('downloadProgress', (progress) => {
                 this.pipelineState.download = {
                     percent: progress.percent,
-                    speed: '',
+                    speed: progress.speed || '',
                     details: `${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}`
                 };
+                
+                // Throttle UI updates to avoid hitting Telegram rate limits
+                const now = Date.now();
+                if (now - lastDownloadUpdate >= DOWNLOAD_UPDATE_INTERVAL) {
+                    lastDownloadUpdate = now;
+                    
+                    // Calculate overall progress: Download is ~40% of total
+                    const masterPercent = Math.min(5 + Math.floor(progress.percent * 0.35), 40);
+                    
+                    this._updatePipelineStatus(chatId, fileName, masterPercent);
+                }
             });
 
             // Check if video processing needed
