@@ -624,13 +624,60 @@ class TelegramDownloadStream extends Readable {
         });
         
         this.client = client;
-        this.media = media;
+        this.rawInput = media;  // Store original input for fallback
+        this.media = this._extractMedia(media);  // Extract proper media object
         this.options = options;
         this.iterator = null;
         this.downloadedBytes = 0;
         this.totalBytes = options.totalSize || 0;
         this.isReading = false;
         this.destroyed = false;
+    }
+
+    /**
+     * Extract the correct media object from various input formats
+     * GramJS iterDownload needs: document, video, or photo object (not Message or MessageMedia)
+     */
+    _extractMedia(input) {
+        // If already a proper media object (has id and accessHash)
+        if (input && input.id !== undefined && input.accessHash !== undefined) {
+            console.log('[Pipeline] Media: Direct file object (id, accessHash)');
+            return input;
+        }
+        
+        // If input is a Message object, extract media from it
+        if (input && input.className === 'Message' || (input.media && input.id)) {
+            // Try to get document/video/photo from message
+            const mediaObj = input.media;
+            if (mediaObj) {
+                // MessageMediaDocument -> .document
+                if (mediaObj.document) {
+                    console.log('[Pipeline] Media: Extracted from MessageMediaDocument.document');
+                    return mediaObj.document;
+                }
+                // MessageMediaPhoto -> .photo
+                if (mediaObj.photo) {
+                    console.log('[Pipeline] Media: Extracted from MessageMediaPhoto.photo');
+                    return mediaObj.photo;
+                }
+            }
+        }
+        
+        // If input has .document property (MessageMediaDocument)
+        if (input && input.document) {
+            console.log('[Pipeline] Media: Input has .document property');
+            return input.document;
+        }
+        
+        // If input has .photo property (MessageMediaPhoto)
+        if (input && input.photo) {
+            console.log('[Pipeline] Media: Input has .photo property');
+            return input.photo;
+        }
+        
+        // Return as-is (will fail gracefully and use fallback)
+        console.log(`[Pipeline] Media: Using raw input (${input?.className || typeof input})`);
+        return input;
     }
 
     async _read() {
@@ -642,16 +689,26 @@ class TelegramDownloadStream extends Readable {
             if (!this.iterator) {
                 // Use iterDownload for streaming (if available), fallback to downloadMedia
                 // GRAMJS API: iterDownload(media, options) - returns AsyncGenerator<Buffer>
+                // media must be: Document, Photo, or similar file location object
                 if (typeof this.client.iterDownload === 'function') {
-                    console.log('[Pipeline] Using iterDownload for streaming');
-                    this.iterator = this.client.iterDownload(
-                        this.media,  // First argument: media object
-                        {
-                            requestSize: this.options.requestSize || config.performance.pipeline.iterDownloadRequestSize,
-                            partSize: this.options.partSize || config.performance.downloadChunkSize,
-                            workers: this.options.workers || config.performance.downloadWorkers
-                        }
-                    );
+                    console.log('[Pipeline] Attempting iterDownload for streaming...');
+                    console.log(`[Pipeline] Media type: ${this.media?.className || 'unknown'}, has id: ${!!this.media?.id}`);
+                    
+                    try {
+                        this.iterator = this.client.iterDownload(
+                            this.media,  // First argument: extracted media object (document/video/photo)
+                            {
+                                requestSize: this.options.requestSize || config.performance.pipeline.iterDownloadRequestSize,
+                                partSize: this.options.partSize || config.performance.downloadChunkSize,
+                                workers: this.options.workers || config.performance.downloadWorkers
+                            }
+                        );
+                    } catch (iterError) {
+                        console.warn(`[Pipeline] iterDownload failed: ${iterError.message}`);
+                        console.log('[Pipeline] Falling back to file-based download');
+                        await this._fallbackToFile();
+                        return;
+                    }
                 } else {
                     // Fallback: Download to temp file then stream
                     console.log('[Pipeline] iterDownload not available, using file-based fallback');
@@ -681,13 +738,21 @@ class TelegramDownloadStream extends Readable {
             }
             
         } catch (err) {
-            this.destroy(err);
+            console.error(`[Pipeline] Stream error: ${err.message}`);
+            // If iterDownload fails during iteration, try fallback
+            if (!this._fallbackUsed && err.message.includes('cast')) {
+                console.log('[Pipeline] Media format error, switching to fallback');
+                await this._fallbackToFile();
+            } else {
+                this.destroy(err);
+            }
         } finally {
             this.isReading = false;
         }
     }
 
     async _fallbackToFile() {
+        this._fallbackUsed = true;
         // Fallback: Download to temp file first, then read from it
         const tempPath = path.join(config.performance.tempDir, `pipeline_fallback_${Date.now()}.tmp`);
         
@@ -1413,9 +1478,8 @@ class FileTransferBot {
 
         try {
             // PHASE 1: Create download stream
-            // GRAMJS NOTE: iterDownload expects Message object (not message.media)
-            // This is different from downloadMedia which can accept both
-            const downloadStream = new TelegramDownloadStream(client, message, {
+            // Pass message.media - _extractMedia() will handle extracting document/video/photo
+            const downloadStream = new TelegramDownloadStream(client, message.media, {
                 totalSize: fileSize,
                 partSize: config.performance.downloadChunkSize, // 256KB
                 requestSize: config.performance.pipeline.iterDownloadRequestSize, // 512KB
