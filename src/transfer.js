@@ -1413,7 +1413,9 @@ class FileTransferBot {
 
         try {
             // PHASE 1: Create download stream
-            const downloadStream = new TelegramDownloadStream(client, message.media, {
+            // GRAMJS NOTE: iterDownload expects Message object (not message.media)
+            // This is different from downloadMedia which can accept both
+            const downloadStream = new TelegramDownloadStream(client, message, {
                 totalSize: fileSize,
                 partSize: config.performance.downloadChunkSize, // 256KB
                 requestSize: config.performance.pipeline.iterDownloadRequestSize, // 512KB
