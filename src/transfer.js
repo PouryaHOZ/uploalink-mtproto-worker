@@ -1,14 +1,15 @@
-const { TelegramClient } = require("telegram");
+const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const Minio = require("minio");
 const { EventEmitter } = require("events");
-const { Readable, PassThrough } = require("stream");
+const { PassThrough } = require("stream");
+const http = require("http");
 
 // ============================================================================
-// CONFIGURATION - Optimized for Pipeline Architecture v3.0.3 (Promise Handled)
+// CONFIGURATION - Optimized for Pipeline Architecture v4.1.0 (HTTP Bridge + Full UI)
 // ============================================================================
 const TEMP_DIR = fs.existsSync("/dev/shm") ? "/dev/shm/temp_transfers" : "./temp_transfers";
 const rawEndpoint = (process.env.MINIO_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -33,15 +34,13 @@ const config = {
     },
     performance: {
         downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '262144'), // 256KB
-        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'), // For sequential speed
+        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'),
         maxConcurrentTransfers: parseInt(process.env.MAX_CONCURRENT_TRANSFERS || '5'),
         tempDir: TEMP_DIR,
         
         pipeline: {
             enabled: true,
-            iterDownloadRequestSize: 512 * 1024,
             ffmpegInputBufferMB: 2,
-            multipartPartSize: 16 * 1024 * 1024,
         },
         
         memoryBudget: {
@@ -273,6 +272,130 @@ const minioClient = new Minio.Client({
 });
 
 // ============================================================================
+// TELEGRAM HTTP BRIDGE (Pipeline Architecture Core)
+// ============================================================================
+class TelegramHttpBridge extends EventEmitter {
+    constructor(client, media, totalSize) {
+        super();
+        this.client = client;
+        this.totalSize = totalSize;
+        this.location = this._extractLocation(media);
+        this.server = null;
+        this.port = 0;
+        this.isActive = true;
+        this.totalSent = 0;
+    }
+
+    _extractLocation(media) {
+        try {
+            let doc = media?.document || media;
+            if (doc && doc.id && doc.accessHash) {
+                return new Api.InputDocumentFileLocation({
+                    id: doc.id,
+                    accessHash: doc.accessHash,
+                    fileReference: doc.fileReference || Buffer.alloc(0),
+                    thumbSize: ''
+                });
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    start() {
+        return new Promise((resolve, reject) => {
+            if (!this.location) return reject(new Error("Cannot extract file location for HTTP Bridge."));
+            
+            this.server = http.createServer(this.handleRequest.bind(this));
+            this.server.on('error', reject);
+            
+            this.server.listen(0, '127.0.0.1', () => {
+                this.port = this.server.address().port;
+                console.log(`[HTTP Bridge] Running at http://127.0.0.1:${this.port}`);
+                resolve(`http://127.0.0.1:${this.port}/stream.mp4`);
+            });
+        });
+    }
+
+    async handleRequest(req, res) {
+        if (!this.isActive) {
+            res.writeHead(503);
+            return res.end();
+        }
+
+        const range = req.headers.range;
+        if (!range) {
+            res.writeHead(200, { 'Content-Length': this.totalSize, 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes' });
+            this.streamRange(0, this.totalSize - 1, res);
+        } else {
+            const positions = range.replace(/bytes=/, "").split("-");
+            const start = parseInt(positions[0], 10);
+            const end = positions[1] ? parseInt(positions[1], 10) : this.totalSize - 1;
+            const chunksize = (end - start) + 1;
+
+            res.writeHead(206, {
+                'Content-Range': `bytes ${start}-${end}/${this.totalSize}`,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': chunksize,
+                'Content-Type': 'video/mp4',
+            });
+            this.streamRange(start, end, res);
+        }
+    }
+
+    async streamRange(start, end, res) {
+        let currentOffset = start;
+        const fetchSize = 512 * 1024; // 512KB chunks for efficiency
+
+        try {
+            while (currentOffset <= end && this.isActive) {
+                if (res.destroyed || res.closed) break;
+
+                // Telegram offset MUST be divisible by 4096
+                const alignedOffset = Math.floor(currentOffset / 4096) * 4096;
+                const skipBytes = currentOffset - alignedOffset;
+
+                const result = await this.client.invoke(new Api.upload.GetFile({
+                    location: this.location,
+                    offset: BigInt(alignedOffset),
+                    limit: fetchSize
+                }));
+
+                if (!result || !result.bytes || result.bytes.length === 0) break;
+
+                let data = result.bytes;
+                if (skipBytes > 0) data = data.slice(skipBytes);
+
+                const bytesNeeded = (end - currentOffset) + 1;
+                if (data.length > bytesNeeded) data = data.slice(0, bytesNeeded);
+
+                currentOffset += data.length;
+                this.totalSent += data.length;
+                
+                // Emit progress for UI
+                this.emit('progress', this.totalSent, this.totalSize);
+
+                if (!res.write(data)) {
+                    await new Promise(r => res.once('drain', r));
+                }
+            }
+            if (!res.destroyed && !res.closed) res.end();
+        } catch (err) {
+            if (!res.headersSent) res.writeHead(500);
+            res.end();
+        }
+    }
+
+    stop() {
+        this.isActive = false;
+        if (this.server) {
+            this.server.close();
+            this.server = null;
+        }
+        console.log(`[HTTP Bridge] Closed.`);
+    }
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 function parseHms(str) {
@@ -312,7 +435,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '3.0.3'; // Unhandled Rejection fixed version
+const SYSTEM_VERSION = '4.1.0';
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText, queuePosition = null, stages = null }) {
     if (stages && Array.isArray(stages)) {
@@ -411,174 +534,6 @@ async function validateFile(filePath, expectedSize = null) {
         if (expectedSize && stats.size < expectedSize * 0.90) console.warn(`[Validation] File size mismatch: got ${formatBytes(stats.size)}, expected ~${formatBytes(expectedSize)}`);
         return { valid: true, size: stats.size };
     } catch (err) { return { valid: false, error: err.message, size: 0 }; }
-}
-
-// ============================================================================
-// TELEGRAM DOWNLOAD STREAM - Sequential Mode (Stable)
-// ============================================================================
-class TelegramDownloadStream extends Readable {
-    constructor(client, media, options = {}) {
-        super({
-            highWaterMark: options.highWaterMark || (config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024),
-            autoDestroy: true
-        });
-        
-        this.client = client;
-        this.rawInput = media;
-        this.media = this._extractMedia(media);
-        this.options = options;
-        this.iterator = null;
-        this.downloadedBytes = 0;
-        this.totalBytes = options.totalSize || 0;
-        this.isReading = false;
-        this.destroyed = false;
-    }
-
-    _extractMedia(input) {
-        if (input && input.id !== undefined && input.accessHash !== undefined) return input;
-        if (input && input.className === 'Message' || (input.media && input.id)) {
-            const mediaObj = input.media;
-            if (mediaObj) {
-                if (mediaObj.document) return mediaObj.document;
-                if (mediaObj.photo) return mediaObj.photo;
-            }
-        }
-        if (input && input.document) return input.document;
-        if (input && input.photo) return input.photo;
-        return input;
-    }
-
-    async _read() {
-        if (this.isReading || this.destroyed) return;
-        try {
-            this.isReading = true;
-            if (!this.iterator) {
-                console.log('[Pipeline] Using reliable file-based streaming approach (Sequential 1-Worker)');
-                await this._downloadAndStream();
-                return;
-            }
-            const { value: chunk, done } = await this.iterator.next();
-            if (done || this.destroyed) { this.push(null); return; }
-            this.downloadedBytes += chunk.length;
-            this.emit('downloadProgress', { downloaded: this.downloadedBytes, total: this.totalBytes, percent: this.totalBytes ? Math.floor((this.downloadedBytes / this.totalBytes) * 100) : 0 });
-            if (!this.push(chunk)) { /* Backpressure */ }
-        } catch (err) {
-            console.error(`[Pipeline] Stream error: ${err.message}`);
-            this.destroy(err);
-        } finally {
-            this.isReading = false;
-        }
-    }
-
-    async _downloadAndStream() {
-        const tempPath = path.join(config.performance.tempDir, `pipeline_${Date.now()}.tmp`);
-        this._tempFilePath = tempPath;
-        let streamStarted = false;
-        let downloadComplete = false;
-        const MIN_BYTES_TO_START_STREAMING = 2 * 1024 * 1024;
-        const downloadStart = Date.now();
-        
-        try {
-            console.log(`[Pipeline] Starting sequential parallel download (${formatBytes(this.totalSize || 0)})`);
-            const writeStream = fs.createWriteStream(tempPath);
-            let totalWritten = 0;
-            
-            const downloadPromise = this.client.downloadMedia(
-                this.rawInput,
-                {
-                    partSize: this.options.partSize || config.performance.downloadChunkSize,
-                    outputFile: tempPath,
-                    workers: 1, 
-                    progressCallback: (downloaded, total) => {
-                        // 🔥 FIX: Prevent ghost downloads if Pipeline fails and destroys the stream
-                        if (this.destroyed) throw new Error("Pipeline aborted, stopping background stream");
-
-                        this.downloadedBytes = downloaded;
-                        this.totalBytes = total;
-                        const elapsed = (Date.now() - downloadStart) / 1000;
-                        const speed = elapsed > 0 ? downloaded / elapsed : 0;
-                        
-                        this.emit('downloadProgress', { 
-                            downloaded, total, percent: total ? Math.floor((downloaded / total) * 100) : 0, speed: formatBytes(speed) + '/s'
-                        });
-                        
-                        if (!streamStarted && downloaded >= MIN_BYTES_TO_START_STREAMING && total > MIN_BYTES_TO_START_STREAMING) {
-                            this._startStreamingFromFile(tempPath);
-                            streamStarted = true;
-                            console.log(`[Pipeline] 🚀 Started parallel streaming at ${formatBytes(downloaded)} downloaded`);
-                        }
-                    }
-                }
-            );
-            
-            await downloadPromise;
-            downloadComplete = true;
-            
-            if (!streamStarted) {
-                this._startStreamingFromFile(tempPath);
-                streamStarted = true;
-            }
-        } catch (err) {
-            if (!this.destroyed) {
-                console.error(`[Pipeline] Download failed: ${err.message}`);
-                this.destroy(err);
-            }
-        }
-    }
-
-    _startStreamingFromFile(tempPath) {
-        try {
-            if (!fs.existsSync(tempPath)) return;
-            const stats = fs.statSync(tempPath);
-            if (stats.size === 0) return;
-            
-            const fileStream = fs.createReadStream(tempPath, { 
-                highWaterMark: this.options.highWaterMark || (config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024)
-            });
-            
-            let bytesRead = 0;
-            let fileSizeAtStart = stats.size;
-            
-            fileStream.on('data', (chunk) => {
-                bytesRead += chunk.length;
-                if (!this.push(chunk)) fileStream.pause();
-            });
-            
-            fileStream.on('end', () => {
-                setTimeout(() => {
-                    try {
-                        const currentSize = fs.statSync(tempPath).size;
-                        if (currentSize > fileSizeAtStart && bytesRead < currentSize) {
-                            const continueStream = fs.createReadStream(tempPath, { start: bytesRead, highWaterMark: this.options.highWaterMark });
-                            continueStream.on('data', (chunk) => { if (!this.push(chunk)) continueStream.pause(); });
-                            continueStream.on('end', () => { this.push(null); });
-                            continueStream.on('error', (err) => { this.destroy(err); });
-                            this.on('drain', () => { if (continueStream.isPaused()) continueStream.resume(); });
-                        } else {
-                            this.push(null);
-                        }
-                    } catch (e) { this.push(null); }
-                }, 500);
-            });
-            
-            fileStream.on('error', (err) => { this.destroy(err); });
-            this.on('drain', () => { if (fileStream.isPaused()) fileStream.resume(); });
-            
-        } catch (err) { this.destroy(err); }
-    }
-
-    setTotalSize(bytes) { this.totalBytes = bytes; }
-
-    _destroy(error, callback) {
-        this.destroyed = true;
-        if (this.iterator && typeof this.iterator.return === 'function') this.iterator.return().catch(() => {});
-        if (this._tempFilePath) {
-            try { 
-                if (fs.existsSync(this._tempFilePath)) fs.unlinkSync(this._tempFilePath);
-            } catch (e) { }
-        }
-        super._destroy(error, callback);
-    }
 }
 
 // ============================================================================
@@ -816,15 +771,17 @@ class FileTransferBot {
         });
     }
 
-    spawnFFmpegPipeline(ffmpegOptions, onProgress, signal) {
+    spawnFFmpegPipeline(httpUrl, ffmpegOptions, onProgress, signal, pipelineContext) {
         const args = [
-            '-i', 'pipe:0', '-threads', '0', '-c:v', 'libx264', '-crf', ffmpegOptions.crf || '28',
+            '-i', httpUrl, '-threads', '0', '-c:v', 'libx264', '-crf', ffmpegOptions.crf || '28',
             '-preset', 'veryfast', '-vf', ffmpegOptions.scaleFilter || 'scale=854:-2',
             '-c:a', 'aac', '-b:a', ffmpegOptions.audioBitrate || '64k',
-            '-movflags', '+faststart', '-f', 'mp4', 'pipe:1'
+            // 🔥 CRITICAL FIX: To pipe an MP4 out, it MUST be fragmented
+            '-movflags', 'frag_keyframe+empty_moov', 
+            '-f', 'mp4', 'pipe:1'
         ];
         
-        console.log(`[Pipeline] Spawning FFmpeg with pipe I/O`);
+        console.log(`[Pipeline] Spawning FFmpeg via HTTP Bridge`);
         const ffmpegProcess = spawn('ffmpeg', args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             signal
@@ -832,14 +789,6 @@ class FileTransferBot {
         
         this.activeFFmpegProcess = ffmpegProcess;
         
-        ffmpegProcess.stdin.on('error', (err) => {
-            if (err.code === 'EPIPE' || err.code === 'EOF') {
-                // Ignore EPIPE.
-            } else {
-                console.error(`[Pipeline] FFmpeg stdin error:`, err.message);
-            }
-        });
-
         let totalDurationSec = 0;
         let errorLog = '';
         const MAX_ERROR_LOG_SIZE = 50000;
@@ -872,12 +821,14 @@ class FileTransferBot {
 
         ffmpegProcess.on('close', code => {
             this.activeFFmpegProcess = null;
-            if (code !== 0 && code !== null) console.error(`[Pipeline] FFmpeg exited with code ${code}: ${errorLog.slice(-300)}`);
+            if (code !== 0 && code !== null && !pipelineContext.isAborting) {
+                console.error(`[Pipeline] FFmpeg exited with code ${code}: ${errorLog.slice(-300)}`);
+            }
         });
 
         ffmpegProcess.on('error', err => {
             this.activeFFmpegProcess = null;
-            console.error(`[Pipeline] FFmpeg error:`, err.message);
+            if (!pipelineContext.isAborting) console.error(`[Pipeline] FFmpeg error:`, err.message);
         });
 
         return ffmpegProcess;
@@ -926,7 +877,7 @@ class FileTransferBot {
         return await minioClient.presignedGetObject(bucket, fileName, 7200);
     }
 
-    async uploadStreamToMinIO(inputStream, fileName, totalSize, onProgress, signal) {
+    async uploadStreamToMinIO(inputStream, fileName, totalSize, onProgress, signal, pipelineContext) {
         const bucket = config.minio.bucketName;
         const metaData = { 
             'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
@@ -940,14 +891,13 @@ class FileTransferBot {
         const startTime = Date.now();
 
         inputStream.on('error', (err) => {
+            if (pipelineContext.isAborting) return;
             console.error('[Pipeline] Input stream error during upload:', err.message);
             progressStream.destroy(err);
-            // 🔥 FIX: DO NOT call this.abortController.abort() here! 
-            // It breaks the sequential fallback which uses the same controller.
         });
 
         progressStream.on('error', (err) => {
-            console.error('[Pipeline] Progress stream error:', err.message);
+            if (!pipelineContext.isAborting) console.error('[Pipeline] Progress stream error:', err.message);
         });
 
         inputStream.pipe(progressStream);
@@ -975,12 +925,11 @@ class FileTransferBot {
         try {
             await uploadPromise;
             console.log(`[Pipeline] Streaming upload completed: ${fileName}`);
+            return await minioClient.presignedGetObject(bucket, fileName, 7200);
         } catch (err) {
-            console.error(`[Pipeline] Streaming upload failed:`, err.message);
+            if (pipelineContext.isAborting) return null; // Silent abort
             throw err;
         }
-
-        return await minioClient.presignedGetObject(bucket, fileName, 7200);
     }
 
     async downloadFromTelegramOptimized(client, message, filePath, fileSize, onProgress, signal) {
@@ -1097,108 +1046,66 @@ class FileTransferBot {
 
     async executePipeline(client, message, chatId, fileName, fileSize, isVideo, shouldCompress) {
         const transferId = config.transferId;
-        const startTime = Date.now();
-        
-        let downloadStream;
+        const pipelineContext = { isAborting: false };
+        let httpBridge = null;
         let ffmpegProcess;
-        
-        console.log(`[Pipeline] Starting pipeline transfer for: ${fileName}`);
+        let startBridgeTime = Date.now();
         
         await this.updateStatus(chatId, renderProgressCard({
             fileName, masterPercent: 5,
             stages: [
-                { icon: '📥', name: 'دانلود از تلگرام', percent: 0, speed: '...', details: '...' },
+                { icon: '📥', name: 'استریم از تلگرام', percent: 0, speed: '...', details: '...' },
                 { icon: '🗜', name: 'فشرده‌سازی', percent: 0, speed: '...', details: '...' },
                 { icon: '⬆️', name: 'آپلود به سرور', percent: 0, speed: '...', details: '...' }
             ]
         }), true, true);
 
         try {
-            downloadStream = new TelegramDownloadStream(client, message.media, {
-                totalSize: fileSize,
-                partSize: config.performance.downloadChunkSize,
-                requestSize: config.performance.pipeline.iterDownloadRequestSize,
-                workers: 1, 
-                highWaterMark: config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024
-            });
+            if (!isVideo) throw new Error("NON_STREAMABLE_MEDIA"); // Force fallback for non-video
 
-            downloadStream.on('error', (err) => {
-                console.warn(`[Pipeline] Download stream error: ${err.message}`);
-                if (ffmpegProcess) {
-                    try { ffmpegProcess.stdin.end(); } catch(e){}
-                    try { ffmpegProcess.kill('SIGKILL'); } catch(e){}
-                }
-            });
-
+            httpBridge = new TelegramHttpBridge(client, message.media, fileSize);
+            
             let lastDownloadUpdate = 0;
-            const DOWNLOAD_UPDATE_INTERVAL = 2000; 
-            
-            downloadStream.on('downloadProgress', (progress) => {
-                this.pipelineState.download = {
-                    percent: progress.percent, speed: progress.speed || '', details: `${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}`
+            httpBridge.on('progress', (downloaded, total) => {
+                const elapsed = (Date.now() - startBridgeTime) / 1000;
+                const speed = elapsed > 0 ? downloaded / elapsed : 0;
+                const percent = total ? Math.floor((downloaded / total) * 100) : 0;
+
+                this.pipelineState.download = { 
+                    percent: percent, 
+                    speed: formatBytes(speed) + '/s', 
+                    details: `${formatBytes(downloaded)} / ${formatBytes(total)}` 
                 };
-                const now = Date.now();
-                if (now - lastDownloadUpdate >= DOWNLOAD_UPDATE_INTERVAL) {
-                    lastDownloadUpdate = now;
-                    const masterPercent = Math.min(5 + Math.floor(progress.percent * 0.35), 40);
-                    this._updatePipelineStatus(chatId, fileName, masterPercent);
+                
+                if (Date.now() - lastDownloadUpdate >= 2000) {
+                    lastDownloadUpdate = Date.now();
+                    this._updatePipelineStatus(chatId, fileName, Math.min(5 + Math.floor(percent * 0.35), 40));
                 }
             });
 
-            if (!isVideo) {
-                downloadStream.destroy();
-                console.log(`[Pipeline] Non-video file, using direct download→upload`);
-                
-                const tempFilePath = path.join(config.performance.tempDir, `direct_${transferId}_${fileName}`);
-                
-                const downloadResult = await this.downloadFromTelegramOptimized(
-                    client, message, tempFilePath, fileSize,
-                    (downloaded, total) => {
-                        this.pipelineState.download = { percent: total ? Math.floor((downloaded / total) * 100) : 0, details: `${formatBytes(downloaded)} / ${formatBytes(total)}` };
-                        this._updatePipelineStatus(chatId, fileName, 50);
-                    },
-                    this.abortController.signal
-                );
-                
-                this.pipelineState.upload = { percent: 0, speed: '...', details: '...' };
-                const downloadLink = await this.uploadToMinIO(tempFilePath, fileName, 
-                    (percent, details, speed, eta) => {
-                        this.pipelineState.upload = { percent, speed, details };
-                        this._updatePipelineStatus(chatId, fileName, 85);
-                    },
-                    this.abortController.signal
-                );
-                
-                await this.cleanupFile(tempFilePath);
-                return downloadLink;
-            }
+            const httpUrl = await httpBridge.start();
 
-            console.log(`[Pipeline] Video detected, executing Download→FFmpeg→Upload pipeline`);
-            
             const maxDim = shouldCompress ? 854 : 1280;
             const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
             const crfValue = shouldCompress ? '28' : '23';
             const audioBitrate = shouldCompress ? '64k' : '128k';
 
-            ffmpegProcess = this.spawnFFmpegPipeline({
+            ffmpegProcess = this.spawnFFmpegPipeline(httpUrl, {
                 crf: crfValue, scaleFilter: scaleFilter, audioBitrate: audioBitrate
             }, (percent, speed, eta) => {
                 this.pipelineState.compress = { percent, speed, details: `${percent}%` };
                 this._updatePipelineStatus(chatId, fileName, 50);
-            }, this.abortController.signal);
+            }, this.abortController.signal, pipelineContext);
 
             ffmpegProcess.stdout.on('error', (err) => {
-                console.error('[Pipeline] FFmpeg stdout error:', err.message);
+                if (pipelineContext.isAborting) return;
                 try { ffmpegProcess.kill('SIGTERM'); } catch (e) {}
             });
 
-            downloadStream.pipe(ffmpegProcess.stdin);
-
             const outputFileName = `${path.parse(fileName).name}.mp4`;
-            this.pipelineState.upload = { percent: 0, speed: '...', details: '...' };
             
-            // 🔥 FIX: Capture upload promise and suppress unhandled rejections if Pipeline aborts early
-            const uploadPromise = this.uploadStreamToMinIO(
+            // Safe upload task wrapping
+            const uploadTask = this.uploadStreamToMinIO(
                 ffmpegProcess.stdout, 
                 outputFileName,
                 fileSize, 
@@ -1206,11 +1113,12 @@ class FileTransferBot {
                     this.pipelineState.upload = { percent, speed, details };
                     this._updatePipelineStatus(chatId, fileName, 85);
                 },
-                this.abortController.signal
-            );
-            
-            // This prevents Node.js from crashing if uploadPromise rejects AFTER Promise.all has already thrown
-            uploadPromise.catch(() => {});
+                this.abortController.signal, 
+                pipelineContext
+            ).catch(err => {
+                if (!pipelineContext.isAborting) console.error(`[Pipeline] Upload task error: ${err.message}`);
+                return null;
+            });
 
             await Promise.all([
                 new Promise((resolve, reject) => {
@@ -1219,22 +1127,16 @@ class FileTransferBot {
                         else reject(new Error(`FFmpeg exited with code ${code}`));
                     });
                     ffmpegProcess.on('error', reject);
-                    downloadStream.on('error', reject); 
                 }),
-                uploadPromise
+                uploadTask
             ]);
 
-            console.log(`[Pipeline] Completed successfully!`);
             return await minioClient.presignedGetObject(config.minio.bucketName, outputFileName, 7200);
 
         } catch (err) {
-            console.error(`[Pipeline] Error:`, err.message);
-            
-            if (downloadStream) downloadStream.destroy();
-            if (ffmpegProcess) {
-                try { ffmpegProcess.kill('SIGKILL'); } catch (e) {}
-            }
-            
+            pipelineContext.isAborting = true; // Signals streams to die silently
+            if (httpBridge) httpBridge.stop();
+            if (ffmpegProcess) { try { ffmpegProcess.kill('SIGKILL'); } catch (e) {} }
             throw err; 
         }
     }
@@ -1251,7 +1153,7 @@ class FileTransferBot {
             const text = renderProgressCard({
                 fileName, masterPercent,
                 stages: [
-                    { icon: '📥', name: 'دانلود از تلگرام', percent: dl, speed: this.pipelineState.download.speed, details: this.pipelineState.download.details },
+                    { icon: '📥', name: 'استریم از تلگرام', percent: dl, speed: this.pipelineState.download.speed, details: this.pipelineState.download.details },
                     { icon: '🗜', name: 'فشرده‌سازی', percent: co, speed: this.pipelineState.compress.speed, details: this.pipelineState.compress.details },
                     { icon: '⬆️', name: 'آپلود به سرور', percent: ul, speed: this.pipelineState.upload.speed, details: this.pipelineState.upload.details }
                 ]
@@ -1323,9 +1225,14 @@ class FileTransferBot {
                 console.log(`[Main] Using Pipeline Architecture for video transfer`);
                 try {
                     downloadLink = await this.executePipeline(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress);
+                    if (!downloadLink) throw new Error("Pipeline upload link not generated");
                     fileName = `${path.parse(fileName).name}.mp4`;
                 } catch (pipelineErr) {
-                    console.warn(`[Main] Pipeline failed, falling back to sequential:`, pipelineErr.message);
+                    if (pipelineErr.message === 'NON_STREAMABLE_MEDIA') {
+                        console.log(`[Pipeline] Media safely skipped for Sequential processing...`);
+                    } else {
+                        console.warn(`[Main] Pipeline failed, falling back to sequential:`, pipelineErr.message);
+                    }
                     downloadLink = await this.executeSequential(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress, startTime);
                 }
             } else {
@@ -1586,11 +1493,12 @@ class FileTransferBot {
 // ============================================================================
 console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║     ⚡ File Transfer Bot v${SYSTEM_VERSION} - PROMISE FIX ⚡               ║
+║     ⚡ File Transfer Bot v${SYSTEM_VERSION} - HTTP BRIDGE + FULL UI ⚡      ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Pipeline Settings:                                          ║
-║  • Mode: Sequential Write Stream (workers: 1)                ║
-║  • Error Scope Handling: Enhanced (Unhandled Rejection Fixed)║
+║  Pipeline Features:                                          ║
+║  • Mode: Internal HTTP Streaming Proxy                       ║
+║  • Output format: Fragmented MP4 for continuous pipe         ║
+║  • Seamless Sequential Fallback (with Adaptive Workers)      ║
 ╚══════════════════════════════════════════════════════════════╝
 `);
 
