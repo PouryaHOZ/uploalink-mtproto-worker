@@ -1,4 +1,4 @@
-const { TelegramClient, Api } = require("telegram");
+const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const fs = require("fs");
 const path = require("path");
@@ -8,7 +8,7 @@ const { EventEmitter } = require("events");
 const { Readable, PassThrough } = require("stream");
 
 // ============================================================================
-// CONFIGURATION - Optimized for Pipeline Architecture v3.1 (Buffer Manager)
+// CONFIGURATION - Optimized for Pipeline Architecture v3.0.1 (Stable 1-Worker Stream)
 // ============================================================================
 const TEMP_DIR = fs.existsSync("/dev/shm") ? "/dev/shm/temp_transfers" : "./temp_transfers";
 const rawEndpoint = (process.env.MINIO_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -32,15 +32,16 @@ const config = {
         region: process.env.MINIO_REGION || 'us-east-1'
     },
     performance: {
-        downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '262144'), // 256KB
-        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'), // Back to 8 workers!
+        downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '262144'), // 256KB (GramJS max)
+        downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'), // For sequential fallback
         maxConcurrentTransfers: parseInt(process.env.MAX_CONCURRENT_TRANSFERS || '5'),
         tempDir: TEMP_DIR,
         
+        // Pipeline-specific settings
         pipeline: {
             enabled: true,
             iterDownloadRequestSize: 512 * 1024,
-            ffmpegInputBufferMB: 4, // Increased to 4MB for multi-worker smoothing
+            ffmpegInputBufferMB: 2,
             multipartPartSize: 16 * 1024 * 1024,
         },
         
@@ -79,7 +80,7 @@ const config = {
 if (!fs.existsSync(config.performance.tempDir)) fs.mkdirSync(config.performance.tempDir, { recursive: true });
 
 // ============================================================================
-// MEMORY BUDGET MANAGER & TRANSFER QUEUE
+// MEMORY BUDGET MANAGER
 // ============================================================================
 class MemoryBudgetManager extends EventEmitter {
     constructor(options = {}) {
@@ -156,6 +157,9 @@ class MemoryBudgetManager extends EventEmitter {
     }
 }
 
+// ============================================================================
+// TRANSFER QUEUE 
+// ============================================================================
 class TransferQueue extends EventEmitter {
     constructor(options = {}) {
         super();
@@ -200,6 +204,9 @@ class TransferQueue extends EventEmitter {
     clear() { const count = this.queue.length; this.queue = []; this.processing.clear(); this.emit('cleared', { removedCount: count }); return count; }
 }
 
+// ============================================================================
+// CONCURRENCY CONTROLLER
+// ============================================================================
 class ConcurrencyController extends EventEmitter {
     constructor(options = {}) {
         super();
@@ -251,6 +258,13 @@ class ConcurrencyController extends EventEmitter {
         this.memoryManager.release(transferId); this.transferQueue.remove(transferId);
         this.activeTransfers.delete(transferId); this._processQueue(); this.emit('cancelled', { transferId });
     }
+    getStatus() {
+        return {
+            memory: this.memoryManager.getStatus(),
+            queue: { waiting: this.transferQueue.length, processing: this.transferQueue.processing.size, maxConcurrent: this.maxConcurrent, active: this.activeTransfers.size },
+            positions: this.transferQueue.positionInfo
+        };
+    }
     stop() { this.memoryManager.stop(); this.transferQueue.clear(); }
 }
 
@@ -260,7 +274,7 @@ const minioClient = new Minio.Client({
 });
 
 // ============================================================================
-// UTILITIES
+// UTILITY FUNCTIONS
 // ============================================================================
 function parseHms(str) {
     if (!str) return 0;
@@ -299,57 +313,34 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '3.1.0';
+const SYSTEM_VERSION = '3.0.1'; // Stable Pipeline version
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText, queuePosition = null, stages = null }) {
     if (stages && Array.isArray(stages)) {
-        let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (Pipeline v${SYSTEM_VERSION})
-
-`;
-        card += `📊 <b>پیشرفت کل:</b>
-<code>[${drawProgressBar(masterPercent, 12)}] ${masterPercent}%</code>
-
-`;
-        card += `🔄 <b>مراحل موازی:</b>
-
-`;
+        let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (Pipeline v${SYSTEM_VERSION})\n\n`;
+        card += `📊 <b>پیشرفت کل:</b>\n<code>[${drawProgressBar(masterPercent, 12)}] ${masterPercent}%</code>\n\n`;
+        card += `🔄 <b>مراحل موازی:</b>\n\n`;
         for (const stage of stages) {
             const bar = drawProgressBar(stage.percent || 0, 10);
-            card += `${stage.icon} ${stage.name}
-`;
+            card += `${stage.icon} ${stage.name}\n`;
             card += `<code>[${bar}] ${stage.percent || 0}%</code>`;
             if (stage.speed) card += ` | ${stage.speed}`;
             if (stage.details) card += ` | ${stage.details}`;
-            card += `
-
-`;
+            card += `\n\n`;
         }
-        if (etaText) card += `⏱️ <b>زمان تقریبی:</b> ${etaText}
-`;
+        if (etaText) card += `⏱️ <b>زمان تقریبی:</b> ${etaText}\n`;
         return card;
     }
     const masterBar = drawProgressBar(masterPercent, 12);
     const stageBar = drawProgressBar(stagePercent, 10);
-    let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (v${SYSTEM_VERSION})
-
-`;
-    if (queuePosition !== null) card += `⏳ <b>وضعیت صف:</b> در انتظار (#${queuePosition})
-
-`;
-    card += `📊 <b>پیشرفت کل:</b>
-<code>[${masterBar}] ${masterPercent}%</code>
-
-`;
-    card += `🔄 <b>مرحله جاری:</b> ${stageName}
-`;
-    card += `<code>[${stageBar}] ${stagePercent}%</code>
-`;
-    if (detailsText) card += `⚖️ <b>حجم:</b> ${detailsText}
-`;
-    if (speedText) card += `⚡ <b>سرعت:</b> ${speedText}
-`;
-    if (etaText) card += `⏱️ <b>زمان تقریبی باقی‌مانده:</b> ${etaText}
-`;
+    let card = `🎬 <b>پردازش فایل:</b> <code>${escapeHtml(fileName)}</code> (v${SYSTEM_VERSION})\n\n`;
+    if (queuePosition !== null) card += `⏳ <b>وضعیت صف:</b> در انتظار (#${queuePosition})\n\n`;
+    card += `📊 <b>پیشرفت کل:</b>\n<code>[${masterBar}] ${masterPercent}%</code>\n\n`;
+    card += `🔄 <b>مرحله جاری:</b> ${stageName}\n`;
+    card += `<code>[${stageBar}] ${stagePercent}%</code>\n`;
+    if (detailsText) card += `⚖️ <b>حجم:</b> ${detailsText}\n`;
+    if (speedText) card += `⚡ <b>سرعت:</b> ${speedText}\n`;
+    if (etaText) card += `⏱️ <b>زمان تقریبی باقی‌مانده:</b> ${etaText}\n`;
     return card;
 }
 
@@ -389,7 +380,7 @@ class TelegramClientManager {
     }
     async disconnect() {
         if (this.isConnected) {
-            try { await this.client.disconnect(); } catch (e) {}
+            try { await this.client.disconnect(); } catch (e) { console.warn('[Telegram] Disconnect error:', e.message); }
             this.isConnected = false;
         }
     }
@@ -416,180 +407,179 @@ async function validateFile(filePath, expectedSize = null) {
     try {
         if (!fs.existsSync(filePath)) return { valid: false, error: 'File does not exist', size: 0 };
         const stats = await fs.promises.stat(filePath);
-        if (stats.size === 0) return { valid: false, error: 'File is empty', size: 0 };
-        if (expectedSize && stats.size < expectedSize * 0.01) return { valid: false, error: `File too small`, size: stats.size };
+        if (stats.size === 0) return { valid: false, error: 'File is empty (download likely failed)', size: 0 };
+        if (expectedSize && stats.size < expectedSize * 0.01) return { valid: false, error: `File too small: got ${stats.size}, expected ~${expectedSize}`, size: stats.size };
+        if (expectedSize && stats.size < expectedSize * 0.90) console.warn(`[Validation] File size mismatch: got ${formatBytes(stats.size)}, expected ~${formatBytes(expectedSize)}`);
         return { valid: true, size: stats.size };
     } catch (err) { return { valid: false, error: err.message, size: 0 }; }
 }
 
 // ============================================================================
-// PARALLEL BUFFER MANAGER (V3.1 - Safe Multi-Worker Streaming)
+// TELEGRAM DOWNLOAD STREAM - Sequential Mode (Stable)
 // ============================================================================
-class ParallelBufferStream extends Readable {
+class TelegramDownloadStream extends Readable {
     constructor(client, media, options = {}) {
         super({
-            highWaterMark: options.highWaterMark || (4 * 1024 * 1024), // 4MB Buffer
+            highWaterMark: options.highWaterMark || (config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024),
             autoDestroy: true
         });
         
         this.client = client;
-        this.media = media;
-        this.fileSize = options.totalSize || 0;
-        this.partSize = options.partSize || 262144; // 256KB
-        this.maxWorkers = options.workers || 8;
-        
-        this.mediaLocation = this._extractLocation(media);
-        
-        this.nextOffsetToDownload = 0;
-        this.nextOffsetToPush = 0;
+        this.rawInput = media;
+        this.media = this._extractMedia(media);
+        this.options = options;
+        this.iterator = null;
         this.downloadedBytes = 0;
-        
-        this.chunkBuffer = new Map();
-        this.activeWorkers = 0;
-        this.destroyed = false;
+        this.totalBytes = options.totalSize || 0;
         this.isReading = false;
-        this.downloadStart = Date.now();
-        
-        if (!this.mediaLocation) {
-            console.warn("[BufferManager] Native extraction failed, fallback to sequential iterDownload");
-            this.fallbackIterator = this.client.iterDownload({
-                file: media,
-                requestSize: this.partSize
-            });
-        } else {
-            console.log(`[BufferManager] Parallel streaming initialized (${this.maxWorkers} workers)`);
-        }
+        this.destroyed = false;
     }
-    
-    _extractLocation(media) {
-        try {
-            let doc = media?.document || media;
-            if (doc && doc.id && doc.accessHash) {
-                return new Api.InputDocumentFileLocation({
-                    id: doc.id,
-                    accessHash: doc.accessHash,
-                    fileReference: doc.fileReference || Buffer.alloc(0),
-                    thumbSize: ''
-                });
+
+    _extractMedia(input) {
+        if (input && input.id !== undefined && input.accessHash !== undefined) return input;
+        if (input && input.className === 'Message' || (input.media && input.id)) {
+            const mediaObj = input.media;
+            if (mediaObj) {
+                if (mediaObj.document) return mediaObj.document;
+                if (mediaObj.photo) return mediaObj.photo;
             }
-        } catch (e) {}
-        return null;
+        }
+        if (input && input.document) return input.document;
+        if (input && input.photo) return input.photo;
+        return input;
     }
-    
+
     async _read() {
-        if (this.destroyed) return;
-        
-        // 1. Sequential Fallback Mode (if location extraction failed)
-        if (this.fallbackIterator) {
-            try {
-                const { value, done } = await this.fallbackIterator.next();
-                if (done) { this.push(null); return; }
-                this.downloadedBytes += value.length;
-                this._emitProgress();
-                this.push(value);
-            } catch (err) { this.destroy(err); }
-            return;
-        }
-        
-        // 2. Parallel Mode
-        this.isReading = true;
-        this._fillBuffer();
-    }
-    
-    _fillBuffer() {
-        if (this.destroyed) return;
-        
-        // Step A: Push ready contiguous chunks in order
-        while (this.chunkBuffer.has(this.nextOffsetToPush)) {
-            const chunk = this.chunkBuffer.get(this.nextOffsetToPush);
-            this.chunkBuffer.delete(this.nextOffsetToPush);
-            this.nextOffsetToPush += chunk.length;
-            
-            if (!this.push(chunk)) {
-                this.isReading = false; // Downstream backpressure applied
-                return;
-            }
-        }
-        
-        // Step B: Check for completion
-        if (this.nextOffsetToPush >= this.fileSize && this.fileSize > 0) {
-            this.push(null);
-            return;
-        }
-        
-        // Step C: Spawn new parallel fetchers
-        while (this.activeWorkers < this.maxWorkers && this.nextOffsetToDownload < this.fileSize) {
-            const offset = this.nextOffsetToDownload;
-            this.nextOffsetToDownload += this.partSize;
-            this._fetchChunk(offset, this.partSize);
-        }
-    }
-    
-    async _fetchChunk(offset, limit, retries = 3) {
-        this.activeWorkers++;
+        if (this.isReading || this.destroyed) return;
         try {
-            const result = await this.client.invoke(new Api.upload.GetFile({
-                location: this.mediaLocation,
-                offset: BigInt(offset),
-                limit: limit
-            }));
-            
-            if (this.destroyed) return;
-            const chunk = result.bytes;
-            
-            if (!chunk || chunk.length === 0) {
-                if (offset === this.nextOffsetToPush) this.push(null); // Early EOF
+            this.isReading = true;
+            if (!this.iterator) {
+                console.log('[Pipeline] Using reliable file-based streaming approach (Sequential 1-Worker)');
+                await this._downloadAndStream();
                 return;
             }
-            
-            this.chunkBuffer.set(offset, chunk);
+            const { value: chunk, done } = await this.iterator.next();
+            if (done || this.destroyed) { this.push(null); return; }
             this.downloadedBytes += chunk.length;
-            this._emitProgress();
-            
-            if (this.isReading) this._fillBuffer();
-            
+            this.emit('downloadProgress', { downloaded: this.downloadedBytes, total: this.totalBytes, percent: this.totalBytes ? Math.floor((this.downloadedBytes / this.totalBytes) * 100) : 0 });
+            if (!this.push(chunk)) { /* Backpressure */ }
         } catch (err) {
-            if (this.destroyed) return;
-            console.error(`[BufferManager] Worker error at offset ${offset}:`, err.message);
-            
-            if (retries > 0) {
-                setTimeout(() => {
-                    this.activeWorkers--;
-                    this._fetchChunk(offset, limit, retries - 1);
-                }, 2000);
-                return;
-            } else {
-                this.destroy(new Error(`Failed to fetch chunk at offset ${offset}: ${err.message}`));
-            }
+            console.error(`[Pipeline] Stream error: ${err.message}`);
+            this.destroy(err);
         } finally {
-            this.activeWorkers--;
-            if (this.isReading && !this.destroyed) this._fillBuffer();
+            this.isReading = false;
         }
     }
-    
-    _emitProgress() {
-        const elapsed = (Date.now() - this.downloadStart) / 1000;
-        const speed = elapsed > 0 ? this.downloadedBytes / elapsed : 0;
-        this.emit('downloadProgress', {
-            downloaded: this.downloadedBytes,
-            total: this.fileSize,
-            percent: this.fileSize ? Math.floor((this.downloadedBytes / this.fileSize) * 100) : 0,
-            speed: formatBytes(speed) + '/s'
-        });
+
+    async _downloadAndStream() {
+        const tempPath = path.join(config.performance.tempDir, `pipeline_${Date.now()}.tmp`);
+        this._tempFilePath = tempPath;
+        let streamStarted = false;
+        let downloadComplete = false;
+        const MIN_BYTES_TO_START_STREAMING = 2 * 1024 * 1024;
+        const downloadStart = Date.now();
+        
+        try {
+            console.log(`[Pipeline] Starting sequential parallel download (${formatBytes(this.totalSize || 0)})`);
+            const writeStream = fs.createWriteStream(tempPath);
+            let totalWritten = 0;
+            
+            const downloadPromise = this.client.downloadMedia(
+                this.rawInput,
+                {
+                    partSize: this.options.partSize || config.performance.downloadChunkSize,
+                    outputFile: tempPath,
+                    // 🔥 CRITICAL FIX: Ensure 1 worker so bytes are written sequentially for the pipe
+                    workers: 1, 
+                    progressCallback: (downloaded, total) => {
+                        this.downloadedBytes = downloaded;
+                        this.totalBytes = total;
+                        const elapsed = (Date.now() - downloadStart) / 1000;
+                        const speed = elapsed > 0 ? downloaded / elapsed : 0;
+                        
+                        this.emit('downloadProgress', { 
+                            downloaded, total, percent: total ? Math.floor((downloaded / total) * 100) : 0, speed: formatBytes(speed) + '/s'
+                        });
+                        
+                        if (!streamStarted && downloaded >= MIN_BYTES_TO_START_STREAMING && total > MIN_BYTES_TO_START_STREAMING) {
+                            this._startStreamingFromFile(tempPath);
+                            streamStarted = true;
+                            console.log(`[Pipeline] 🚀 Started parallel streaming at ${formatBytes(downloaded)} downloaded`);
+                        }
+                    }
+                }
+            );
+            
+            await downloadPromise;
+            downloadComplete = true;
+            
+            if (!streamStarted) {
+                this._startStreamingFromFile(tempPath);
+                streamStarted = true;
+            }
+        } catch (err) {
+            console.error(`[Pipeline] Download failed: ${err.message}`);
+            this.destroy(err);
+        }
     }
-    
-    _destroy(err, cb) {
+
+    _startStreamingFromFile(tempPath) {
+        try {
+            if (!fs.existsSync(tempPath)) return;
+            const stats = fs.statSync(tempPath);
+            if (stats.size === 0) return;
+            
+            const fileStream = fs.createReadStream(tempPath, { 
+                highWaterMark: this.options.highWaterMark || (config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024)
+            });
+            
+            let bytesRead = 0;
+            let fileSizeAtStart = stats.size;
+            
+            fileStream.on('data', (chunk) => {
+                bytesRead += chunk.length;
+                if (!this.push(chunk)) fileStream.pause();
+            });
+            
+            fileStream.on('end', () => {
+                setTimeout(() => {
+                    try {
+                        const currentSize = fs.statSync(tempPath).size;
+                        if (currentSize > fileSizeAtStart && bytesRead < currentSize) {
+                            const continueStream = fs.createReadStream(tempPath, { start: bytesRead, highWaterMark: this.options.highWaterMark });
+                            continueStream.on('data', (chunk) => { if (!this.push(chunk)) continueStream.pause(); });
+                            continueStream.on('end', () => { this.push(null); });
+                            continueStream.on('error', (err) => { this.destroy(err); });
+                            this.on('drain', () => { if (continueStream.isPaused()) continueStream.resume(); });
+                        } else {
+                            this.push(null);
+                        }
+                    } catch (e) { this.push(null); }
+                }, 500);
+            });
+            
+            fileStream.on('error', (err) => { this.destroy(err); });
+            this.on('drain', () => { if (fileStream.isPaused()) fileStream.resume(); });
+            
+        } catch (err) { this.destroy(err); }
+    }
+
+    setTotalSize(bytes) { this.totalBytes = bytes; }
+
+    _destroy(error, callback) {
         this.destroyed = true;
-        this.chunkBuffer.clear();
-        if (this.fallbackIterator && typeof this.fallbackIterator.return === 'function') {
-            this.fallbackIterator.return().catch(()=>{});
+        if (this.iterator && typeof this.iterator.return === 'function') this.iterator.return().catch(() => {});
+        if (this._tempFilePath) {
+            try { 
+                if (fs.existsSync(this._tempFilePath)) fs.unlinkSync(this._tempFilePath);
+            } catch (e) { }
         }
-        cb(err);
+        super._destroy(error, callback);
     }
 }
 
 // ============================================================================
-// MAIN FILE TRANSFER BOT CLASS 
+// MAIN FILE TRANSFER BOT CLASS
 // ============================================================================
 class FileTransferBot {
     constructor() {
@@ -609,15 +599,21 @@ class FileTransferBot {
         };
         
         this._lastPipelineUpdate = 0;
+        
         this.concurrencyController = new ConcurrencyController({
             maxConcurrent: config.performance.maxConcurrentTransfers,
             memoryBudget: config.performance.memoryBudget
+        });
+
+        this.concurrencyController.on('queued', ({ transferId, position }) => {
+            console.log(`[Concurrency] Transfer ${transferId} queued at position ${position}`);
         });
     }
 
     async checkCancel() {
         if (this.abortController.signal.aborted) return true;
         if (!config.cloudflare.webhookUrl || !config.transferId) return false;
+        
         try {
             const baseUrl = config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '');
             const encodedTransferId = encodeURIComponent(config.transferId);
@@ -638,7 +634,9 @@ class FileTransferBot {
         try {
             const endpoint = this.statusMessageId ? 'editMessageText' : 'sendMessage';
             const body = { chat_id: chatId, text: text, parse_mode: 'HTML', disable_web_page_preview: true };
+            
             if (this.statusMessageId) body.message_id = this.statusMessageId;
+
             if (showStopButton && config.transferId) {
                 body.reply_markup = JSON.stringify({
                     inline_keyboard: [[{ text: '🛑 توقف انتقال', callback_data: `stop_${config.transferId}` }]]
@@ -652,13 +650,18 @@ class FileTransferBot {
             if (res.ok && res.result) {
                 if (!this.statusMessageId) this.statusMessageId = res.result.message_id;
             } else if (endpoint === 'editMessageText') {
-                delete body.message_id; delete body.reply_markup;
+                delete body.message_id;
+                delete body.reply_markup;
                 const fallbackRes = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/sendMessage`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
                 }).then(r => r.json());
                 if (fallbackRes.ok && fallbackRes.result) this.statusMessageId = fallbackRes.result.message_id;
             }
-        } catch (e) { } finally { this.isUpdatingStatus = false; }
+        } catch (e) {
+            console.error("Failed to update status message:", e);
+        } finally {
+            this.isUpdatingStatus = false;
+        }
     }
 
     async handleCallbackQuery(callbackQuery) {
@@ -673,9 +676,13 @@ class FileTransferBot {
                         body: JSON.stringify({ callback_query_id: callbackQuery.id, text: '✅ در حال توقف انتقال...', show_alert: false })
                     });
                 } catch (e) {}
+                
                 this.isCancelled = true;
                 this.abortController.abort();
-                if (this.activeFFmpegProcess) { try { this.activeFFmpegProcess.kill('SIGKILL'); } catch (e) {} }
+                if (this.activeFFmpegProcess) {
+                    try { this.activeFFmpegProcess.kill('SIGKILL'); } catch (e) {}
+                }
+                
                 const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
                 await this.updateStatus(chatId, `🛑 <b>انتقال لغو شد!</b>\n\n📁 فایل: <code>${escapeHtml(this.currentFileName)}</code>\n\n⚠️ توسط کاربر متوقف شد.`, true);
                 await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'cancelled', reason: 'user_requested' });
@@ -688,13 +695,18 @@ class FileTransferBot {
     startCallbackListener(chatId) {
         if (!config.telegram.botToken || !config.transferId) return;
         const pollInterval = setInterval(async () => {
-            if (this.abortController.signal.aborted) { clearInterval(pollInterval); return; }
+            if (this.abortController.signal.aborted) {
+                clearInterval(pollInterval);
+                return;
+            }
             try {
                 const encodedTransferId = encodeURIComponent(config.transferId);
                 const res = await fetch(`${config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '')}/check-stop?transferId=${encodedTransferId}`, {
                     headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }, signal: AbortSignal.timeout(2000)
                 }).then(r => r.json()).catch(() => ({}));
-                if (res.shouldStop) await this.handleCallbackQuery({ data: `stop_${config.transferId}`, id: 'poll' });
+                if (res.shouldStop) {
+                    await this.handleCallbackQuery({ data: `stop_${config.transferId}`, id: 'poll' });
+                }
             } catch (e) {}
         }, 2000);
         return pollInterval;
@@ -721,7 +733,9 @@ class FileTransferBot {
             });
         });
 
-        let currentSize = 0; const toDelete = [], keptObjects = [];
+        let currentSize = 0;
+        const toDelete = [], keptObjects = [];
+
         for (const obj of objects) {
             if (now - new Date(obj.lastModified).getTime() > TWO_HOURS_MS) toDelete.push(obj.name);
             else { currentSize += obj.size; keptObjects.push(obj); }
@@ -735,7 +749,12 @@ class FileTransferBot {
                 if (currentSize + requiredBytes <= MAX_STORAGE) break;
             }
         }
-        if (toDelete.length > 0) await withRetry('Delete Old Objects', async () => { await minioClient.removeObjects(bucket, toDelete); });
+
+        if (toDelete.length > 0) {
+            await withRetry('Delete Old Objects', async () => {
+                await minioClient.removeObjects(bucket, toDelete);
+            });
+        }
     }
 
     runFFmpeg(args, onProgress, signal) {
@@ -744,18 +763,26 @@ class FileTransferBot {
             const ffmpegProcess = spawn('ffmpeg', fullArgs, { signal });
             this.activeFFmpegProcess = ffmpegProcess;
             
-            let totalDurationSec = 0; let errorLog = ''; const MAX_ERROR_LOG_SIZE = 50000;
+            let totalDurationSec = 0;
+            let errorLog = '';
+            const MAX_ERROR_LOG_SIZE = 50000;
 
             ffmpegProcess.stderr.on('data', data => {
                 errorLog += data.toString();
-                if (errorLog.length > MAX_ERROR_LOG_SIZE) errorLog = errorLog.slice(-MAX_ERROR_LOG_SIZE);
+                if (errorLog.length > MAX_ERROR_LOG_SIZE) {
+                    errorLog = errorLog.slice(-MAX_ERROR_LOG_SIZE);
+                }
                 if (!totalDurationSec) {
                     const match = errorLog.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-                    if (match) totalDurationSec = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3]);
+                    if (match) {
+                        totalDurationSec = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3]);
+                    }
                 }
             });
 
-            let outTimeSec = 0; let speedStr = '1.0x';
+            let outTimeSec = 0;
+            let speedStr = '1.0x';
+
             ffmpegProcess.stdout.on('data', data => {
                 const lines = data.toString().split('\n');
                 for (const line of lines) {
@@ -764,6 +791,7 @@ class FileTransferBot {
                     else if (key === 'out_time_us') outTimeSec = parseInt(val) / 1000000;
                     else if (key === 'speed') speedStr = val;
                 }
+
                 if (totalDurationSec > 0 && onProgress) {
                     const percent = Math.min(100, Math.floor((outTimeSec / totalDurationSec) * 100));
                     const numSpeed = parseFloat(speedStr.replace('x', '')) || 1.0;
@@ -774,9 +802,14 @@ class FileTransferBot {
 
             ffmpegProcess.on('close', code => {
                 this.activeFFmpegProcess = null;
-                if (code === 0) resolve(); else reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/\n/g, ' ').trim()}`));
+                if (code === 0) resolve();
+                else reject(new Error(`FFmpeg Error: ${errorLog.slice(-300).replace(/\n/g, ' ').trim()}`));
             });
-            ffmpegProcess.on('error', err => { this.activeFFmpegProcess = null; reject(err); });
+
+            ffmpegProcess.on('error', err => {
+                this.activeFFmpegProcess = null;
+                reject(err);
+            });
         });
     }
 
@@ -788,22 +821,33 @@ class FileTransferBot {
             '-movflags', '+faststart', '-f', 'mp4', 'pipe:1'
         ];
         
-        const ffmpegProcess = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'], signal });
+        console.log(`[Pipeline] Spawning FFmpeg with pipe I/O`);
+        const ffmpegProcess = spawn('ffmpeg', args, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            signal
+        });
+        
         this.activeFFmpegProcess = ffmpegProcess;
         
-        let totalDurationSec = 0; let errorLog = ''; const MAX_ERROR_LOG_SIZE = 50000;
-        let outTimeSec = 0; let speedStr = '1.0x';
+        let totalDurationSec = 0;
+        let errorLog = '';
+        const MAX_ERROR_LOG_SIZE = 50000;
+        let outTimeSec = 0;
+        let speedStr = '1.0x';
 
         ffmpegProcess.stderr.on('data', data => {
             errorLog += data.toString();
-            if (errorLog.length > MAX_ERROR_LOG_SIZE) errorLog = errorLog.slice(-MAX_ERROR_LOG_SIZE);
+            if (errorLog.length > MAX_ERROR_LOG_SIZE) {
+                errorLog = errorLog.slice(-MAX_ERROR_LOG_SIZE);
+            }
             if (!totalDurationSec) {
                 const match = errorLog.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
                 if (match) totalDurationSec = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3]);
             }
             const timeMatch = errorLog.match(/time=(\d+):(\d+):(\d+\.\d+)/g);
             if (timeMatch?.length > 0) {
-                outTimeSec = parseHms(timeMatch[timeMatch.length - 1].replace('time=', ''));
+                const lastTime = timeMatch[timeMatch.length - 1];
+                outTimeSec = parseHms(lastTime.replace('time=', ''));
                 const speedMatch = errorLog.match(/speed=(\S+)\s*$/m);
                 if (speedMatch) speedStr = speedMatch[1];
                 if (totalDurationSec > 0 && onProgress) {
@@ -815,22 +859,38 @@ class FileTransferBot {
             }
         });
 
-        ffmpegProcess.on('close', code => { this.activeFFmpegProcess = null; });
-        ffmpegProcess.on('error', err => { this.activeFFmpegProcess = null; });
+        ffmpegProcess.on('close', code => {
+            this.activeFFmpegProcess = null;
+            if (code !== 0 && code !== null) console.error(`[Pipeline] FFmpeg exited with code ${code}: ${errorLog.slice(-300)}`);
+        });
+
+        ffmpegProcess.on('error', err => {
+            this.activeFFmpegProcess = null;
+            console.error(`[Pipeline] FFmpeg error:`, err.message);
+        });
+
         return ffmpegProcess;
     }
 
     async uploadToMinIO(filePath, fileName, onProgress, signal) {
         const bucket = config.minio.bucketName;
-        const metaData = { 'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream', 'X-Upload-Version': SYSTEM_VERSION };
+        const metaData = { 
+            'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
+            'X-Upload-Version': SYSTEM_VERSION
+        };
+
         const validation = await validateFile(filePath);
         if (!validation.valid) throw new Error(`Pre-upload validation failed: ${validation.error}`);
+
         const totalSize = validation.size;
+        console.log(`[Upload] Starting upload: ${fileName} (${formatBytes(totalSize)})`);
 
         return await withRetry('MinIO File Upload', async () => {
             const fileStream = fs.createReadStream(filePath, { highWaterMark: 16 * 1024 * 1024 });
             if (signal) signal.addEventListener('abort', () => fileStream.destroy(), { once: true });
-            let uploadedBytes = 0; const startTime = Date.now();
+
+            let uploadedBytes = 0;
+            const startTime = Date.now();
 
             fileStream.on('data', chunk => {
                 uploadedBytes += chunk.length;
@@ -845,24 +905,36 @@ class FileTransferBot {
             });
 
             await minioClient.putObject(bucket, fileName, fileStream, totalSize, metaData);
+            console.log(`[Upload] Completed: ${fileName}`);
         }, 3, 5000);
+
         return await minioClient.presignedGetObject(bucket, fileName, 7200);
     }
 
     async uploadStreamToMinIO(inputStream, fileName, totalSize, onProgress, signal) {
         const bucket = config.minio.bucketName;
-        const metaData = { 'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream', 'X-Upload-Version': SYSTEM_VERSION };
-        
-        const progressStream = new PassThrough();
-        let uploadedBytes = 0; const startTime = Date.now();
+        const metaData = { 
+            'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
+            'X-Upload-Version': SYSTEM_VERSION
+        };
 
+        console.log(`[Pipeline] Starting streaming upload: ${fileName}`);
+
+        const progressStream = new PassThrough();
+        let uploadedBytes = 0;
+        const startTime = Date.now();
+
+        // 🔥 CRITICAL FIX: Handle pipe errors properly and notify MinIO to abort
         inputStream.on('error', (err) => {
             console.error('[Pipeline] Input stream error during upload:', err.message);
             progressStream.destroy(err);
-            if (signal && !signal.aborted) this.abortController.abort();
+            if (signal && !signal.aborted) {
+                this.abortController.abort(); 
+            }
         });
 
         inputStream.pipe(progressStream);
+
         progressStream.on('data', (chunk) => {
             uploadedBytes += chunk.length;
             if (onProgress && totalSize) {
@@ -874,17 +946,147 @@ class FileTransferBot {
             }
         });
 
-        if (signal) signal.addEventListener('abort', () => { inputStream.destroy(); progressStream.destroy(); }, { once: true });
+        if (signal) {
+            signal.addEventListener('abort', () => {
+                inputStream.destroy();
+                progressStream.destroy();
+            }, { once: true });
+        }
 
         const uploadPromise = minioClient.putObject(bucket, fileName, progressStream, undefined, metaData);
-        await uploadPromise;
+        
+        try {
+            await uploadPromise;
+            console.log(`[Pipeline] Streaming upload completed: ${fileName}`);
+        } catch (err) {
+            console.error(`[Pipeline] Streaming upload failed:`, err.message);
+            throw err;
+        }
+
         return await minioClient.presignedGetObject(bucket, fileName, 7200);
+    }
+
+    async downloadFromTelegramOptimized(client, message, filePath, fileSize, onProgress, signal) {
+        const throttler = this.createAdaptiveThrottler();
+        
+        console.log(`[Download⚡] Starting optimized download:` +
+            ` chunkSize=${formatBytes(config.performance.downloadChunkSize)}, ` +
+            `initialWorkers=${config.performance.downloadWorkers}, ` +
+            `adaptive=${config.performance.adaptiveThrottling.enabled}`);
+        
+        let downloadAttempts = 0;
+        const maxDownloadAttempts = 3;
+        let lastError = null;
+
+        while (downloadAttempts < maxDownloadAttempts) {
+            downloadAttempts++;
+            try {
+                if (fs.existsSync(filePath)) await fs.promises.unlink(filePath);
+
+                let lastProgressTime = Date.now();
+                let lastProgressBytes = 0;
+                let speedLogCounter = 0;
+                let instantSpeed = 0;
+
+                await client.downloadMedia(message.media, {
+                    partSize: config.performance.downloadChunkSize,
+                    outputFile: filePath,
+                    workers: throttler.getCurrentWorkers(),
+                    progressCallback: (downloaded, total) => {
+                        if (signal?.aborted) throw new Error("انتقال توسط کاربر لغو شد.");
+                        
+                        const now = Date.now();
+                        const bytesSinceLast = downloaded - lastProgressBytes;
+                        
+                        if (now - lastProgressTime >= 1000) {
+                            instantSpeed = bytesSinceLast / ((now - lastProgressTime) / 1000);
+                            throttler.recordSpeed(instantSpeed);
+                            
+                            lastProgressTime = now;
+                            lastProgressBytes = downloaded;
+                            
+                            speedLogCounter++;
+                            if (speedLogCounter >= 5) {
+                                console.log(`[Speed⚡] ${formatBytes(instantSpeed)}/s (workers: ${throttler.getCurrentWorkers()}, ${Math.round(downloaded/total*100)}%)`);
+                                speedLogCounter = 0;
+                            }
+                        }
+                        if (onProgress) onProgress(downloaded, total);
+                    }
+                });
+
+                const validation = await validateFile(filePath, fileSize);
+                if (!validation.valid) throw new Error(`Download validation failed: ${validation.error}`);
+                if (fileSize && validation.size < fileSize * 0.90) console.warn(`[Download⚡] Size warning: ${formatBytes(validation.size)} vs expected ${formatBytes(fileSize)}`);
+
+                console.log(`[Download⚡] Success: ${formatBytes(validation.size)} in ${downloadAttempts} attempt(s)`);
+                return validation;
+
+            } catch (err) {
+                lastError = err;
+                console.error(`[Download⚡] Attempt ${downloadAttempts} failed:`, err.message);
+
+                if (downloadAttempts < maxDownloadAttempts) {
+                    const reconnected = await this.telegramClient.reconnectIfNeeded(err);
+                    if (reconnected) { console.log(`[Download⚡] Reconnected, retrying...`); continue; }
+                    await new Promise(r => setTimeout(r, 3000 * downloadAttempts));
+                }
+            }
+        }
+        throw lastError || new Error('Download failed after all retries');
+    }
+
+    createAdaptiveThrottler() {
+        const settings = config.performance.adaptiveThrottling;
+        return {
+            speedHistory: [],
+            optimalWorkers: config.performance.downloadWorkers,
+            lastAdjustment: Date.now(),
+            
+            recordSpeed(speedBytesPerSec) {
+                if (!settings.enabled) return this.optimalWorkers;
+                this.speedHistory.push({ speed: speedBytesPerSec, time: Date.now() });
+                if (this.speedHistory.length > 10) this.speedHistory.shift();
+                
+                const now = Date.now();
+                if (now - this.lastAdjustment > settings.adjustmentIntervalMs) {
+                    this.lastAdjustment = now;
+                    return this.adjustWorkers();
+                }
+                return this.optimalWorkers;
+            },
+            
+            adjustWorkers() {
+                if (this.speedHistory.length < 5) return this.optimalWorkers;
+                const recentSpeeds = this.speedHistory.slice(-5).map(s => s.speed);
+                const avgSpeed = recentSpeeds.reduce((a, b) => a + b, 0) / recentSpeeds.length;
+                const firstHalf = recentSpeeds.slice(0, 3).reduce((a, b) => a + b, 0) / 3;
+                const secondHalf = recentSpeeds.slice(-3).reduce((a, b) => a + b, 0) / 3;
+                const trend = secondHalf - firstHalf;
+                const trendPercent = avgSpeed > 0 ? trend / avgSpeed : 0;
+                
+                if (trendPercent < -settings.speedDropThreshold && this.optimalWorkers < settings.maxWorkers) {
+                    this.optimalWorkers = Math.min(settings.maxWorkers, this.optimalWorkers + 4);
+                }
+                else if (trendPercent > -settings.speedRecoveryThreshold && this.optimalWorkers > settings.minWorkers) {
+                    this.optimalWorkers = Math.max(settings.minWorkers, this.optimalWorkers - 2);
+                }
+                return this.optimalWorkers;
+            },
+            
+            getCurrentWorkers() { return this.optimalWorkers; }
+        };
     }
 
     async executePipeline(client, message, chatId, fileName, fileSize, isVideo, shouldCompress) {
         const transferId = config.transferId;
+        const startTime = Date.now();
+        
+        // 🔥 CRITICAL FIX: Declare streams OUTSIDE the try block for scope safety
         let downloadStream;
         let ffmpegProcess;
+        
+        console.log(`[Pipeline] Starting pipeline transfer for: ${fileName}`);
         
         await this.updateStatus(chatId, renderProgressCard({
             fileName, masterPercent: 5,
@@ -896,64 +1098,115 @@ class FileTransferBot {
         }), true, true);
 
         try {
-            // Use the new custom ParallelBufferManager Stream
-            downloadStream = new ParallelBufferStream(client, message.media, {
+            downloadStream = new TelegramDownloadStream(client, message.media, {
                 totalSize: fileSize,
                 partSize: config.performance.downloadChunkSize,
-                workers: config.performance.downloadWorkers,
+                requestSize: config.performance.pipeline.iterDownloadRequestSize,
+                workers: 1, // Fixed to 1 inside TelegramDownloadStream for sequential safety
                 highWaterMark: config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024
             });
 
             let lastDownloadUpdate = 0;
+            const DOWNLOAD_UPDATE_INTERVAL = 2000; 
+            
             downloadStream.on('downloadProgress', (progress) => {
-                this.pipelineState.download = { percent: progress.percent, speed: progress.speed || '', details: `${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}` };
-                if (Date.now() - lastDownloadUpdate >= 2000) {
-                    lastDownloadUpdate = Date.now();
-                    this._updatePipelineStatus(chatId, fileName, Math.min(5 + Math.floor(progress.percent * 0.35), 40));
+                this.pipelineState.download = {
+                    percent: progress.percent, speed: progress.speed || '', details: `${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)}`
+                };
+                const now = Date.now();
+                if (now - lastDownloadUpdate >= DOWNLOAD_UPDATE_INTERVAL) {
+                    lastDownloadUpdate = now;
+                    const masterPercent = Math.min(5 + Math.floor(progress.percent * 0.35), 40);
+                    this._updatePipelineStatus(chatId, fileName, masterPercent);
                 }
             });
 
             if (!isVideo) {
                 downloadStream.destroy();
-                throw new Error("Non-video pipeline unsupported directly here, falling back to sequential...");
+                console.log(`[Pipeline] Non-video file, using direct download→upload`);
+                
+                const tempFilePath = path.join(config.performance.tempDir, `direct_${transferId}_${fileName}`);
+                
+                const downloadResult = await this.downloadFromTelegramOptimized(
+                    client, message, tempFilePath, fileSize,
+                    (downloaded, total) => {
+                        this.pipelineState.download = { percent: total ? Math.floor((downloaded / total) * 100) : 0, details: `${formatBytes(downloaded)} / ${formatBytes(total)}` };
+                        this._updatePipelineStatus(chatId, fileName, 50);
+                    },
+                    this.abortController.signal
+                );
+                
+                this.pipelineState.upload = { percent: 0, speed: '...', details: '...' };
+                const downloadLink = await this.uploadToMinIO(tempFilePath, fileName, 
+                    (percent, details, speed, eta) => {
+                        this.pipelineState.upload = { percent, speed, details };
+                        this._updatePipelineStatus(chatId, fileName, 85);
+                    },
+                    this.abortController.signal
+                );
+                
+                await this.cleanupFile(tempFilePath);
+                return downloadLink;
             }
 
+            console.log(`[Pipeline] Video detected, executing Download→FFmpeg→Upload pipeline`);
+            
             const maxDim = shouldCompress ? 854 : 1280;
             const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
-            
+            const crfValue = shouldCompress ? '28' : '23';
+            const audioBitrate = shouldCompress ? '64k' : '128k';
+
             ffmpegProcess = this.spawnFFmpegPipeline({
-                crf: shouldCompress ? '28' : '23', scaleFilter: scaleFilter, audioBitrate: shouldCompress ? '64k' : '128k'
+                crf: crfValue, scaleFilter: scaleFilter, audioBitrate: audioBitrate
             }, (percent, speed, eta) => {
                 this.pipelineState.compress = { percent, speed, details: `${percent}%` };
                 this._updatePipelineStatus(chatId, fileName, 50);
             }, this.abortController.signal);
 
-            ffmpegProcess.stdout.on('error', (err) => { try { ffmpegProcess.kill('SIGTERM'); } catch (e) {} });
+            ffmpegProcess.stdout.on('error', (err) => {
+                console.error('[Pipeline] FFmpeg stdout error:', err.message);
+                try { ffmpegProcess.kill('SIGTERM'); } catch (e) {}
+            });
+
             downloadStream.pipe(ffmpegProcess.stdin);
 
             const outputFileName = `${path.parse(fileName).name}.mp4`;
+            this.pipelineState.upload = { percent: 0, speed: '...', details: '...' };
+            
             const uploadPromise = this.uploadStreamToMinIO(
-                ffmpegProcess.stdout, outputFileName, fileSize,
+                ffmpegProcess.stdout, 
+                outputFileName,
+                fileSize, 
                 (percent, details, speed, eta) => {
                     this.pipelineState.upload = { percent, speed, details };
                     this._updatePipelineStatus(chatId, fileName, 85);
-                }, this.abortController.signal
+                },
+                this.abortController.signal
             );
 
             await Promise.all([
                 new Promise((resolve, reject) => {
-                    ffmpegProcess.on('close', (code) => { if (code === 0 || code === null) resolve(); else reject(new Error(`FFmpeg exited with code ${code}`)); });
+                    ffmpegProcess.on('close', (code) => {
+                        if (code === 0 || code === null) resolve();
+                        else reject(new Error(`FFmpeg exited with code ${code}`));
+                    });
                     ffmpegProcess.on('error', reject);
                 }),
                 uploadPromise
             ]);
 
+            console.log(`[Pipeline] Completed successfully!`);
             return await minioClient.presignedGetObject(config.minio.bucketName, outputFileName, 7200);
 
         } catch (err) {
-            // FIX: Scope-safe cleanup
+            console.error(`[Pipeline] Error:`, err.message);
+            
+            // 🔥 CRITICAL FIX: Safe cleanup without scope errors
             if (downloadStream) downloadStream.destroy();
-            if (ffmpegProcess) { try { ffmpegProcess.kill('SIGKILL'); } catch (e) {} }
+            if (ffmpegProcess) {
+                try { ffmpegProcess.kill('SIGKILL'); } catch (e) {}
+            }
+            
             throw err;
         }
     }
@@ -967,19 +1220,22 @@ class FileTransferBot {
             const ul = this.pipelineState.upload.percent || 0;
             const masterPercent = Math.min(98, Math.floor(dl * 0.4 + co * 0.35 + ul * 0.25 + baseMasterPercent * 0.2));
 
-            this.updateStatus(chatId, renderProgressCard({
+            const text = renderProgressCard({
                 fileName, masterPercent,
                 stages: [
                     { icon: '📥', name: 'دانلود از تلگرام', percent: dl, speed: this.pipelineState.download.speed, details: this.pipelineState.download.details },
                     { icon: '🗜', name: 'فشرده‌سازی', percent: co, speed: this.pipelineState.compress.speed, details: this.pipelineState.compress.details },
                     { icon: '⬆️', name: 'آپلود به سرور', percent: ul, speed: this.pipelineState.upload.speed, details: this.pipelineState.upload.details }
                 ]
-            }), false, true).catch(() => {});
+            });
+
+            this.updateStatus(chatId, text, false, true).catch(() => {});
         }
     }
 
     async start() {
         const startTime = Date.now();
+        let downloadedFilePath = '', targetPath = '';
         const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
         const messageId = process.env.MESSAGE_ID || '0';
         let fileName = process.env.FILE_NAME || `file_${Date.now()}`;
@@ -989,48 +1245,329 @@ class FileTransferBot {
         const transferId = config.transferId || `transfer_${Date.now()}`;
         
         this.currentFileName = fileName;
+
         const callbackPoller = this.startCallbackListener(chatId);
 
         try {
-            await this.concurrencyController.requestTransfer(transferId, { fileName, fileSize, isVideo, priority: 3 });
+            const requestResult = await this.concurrencyController.requestTransfer(transferId, {
+                fileName, fileSize, isVideo, priority: shouldCompress ? 3 : 5
+            });
+
             this.concurrencyController.registerActiveTransfer(transferId, this.abortController);
-            await this.telegramClient.connect();
-            await this.manageStorage(fileSize);
 
-            const messages = await this.telegramClient.client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
-            if (!messages || !messages[0] || !messages[0].media) throw new Error("فایل در تلگرام یافت نشد.");
+            if (requestResult.status === 'queued') {
+                await this.updateStatus(chatId, renderProgressCard({
+                    fileName, masterPercent: 0, stageName: '⏳ در صف انتظار...', stagePercent: 0, queuePosition: requestResult.position
+                }), true);
 
-            let downloadLink;
-            if (isVideo && config.performance.pipeline.enabled) {
-                try {
-                    downloadLink = await this.executePipeline(this.telegramClient.client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress);
-                    fileName = `${path.parse(fileName).name}.mp4`;
-                } catch (pipelineErr) {
-                    console.warn(`[Main] Pipeline failed, falling back:`, pipelineErr.message);
-                    // Sequential logic fallback handled here (removed from code size limits, assume fallback handled)
-                    throw new Error("Pipeline fallback currently disabled for testing buffer mode. " + pipelineErr.message);
+                while (this.concurrencyController.transferQueue.getPosition(transferId) !== null) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    
+                    const pos = this.concurrencyController.transferQueue.getPosition(transferId);
+                    if (pos !== null) {
+                        await this.updateStatus(chatId, renderProgressCard({
+                            fileName, masterPercent: 0, stageName: `⏳ در صف انتظار (#${pos})`, stagePercent: 0, queuePosition: pos
+                        })).catch(() => {});
+                    }
+                    
+                    if (await this.checkCancel()) {
+                        this.concurrencyController.cancelTransfer(transferId);
+                        throw new Error("انتقال توسط کاربر لغو شد.");
+                    }
                 }
             }
+
+            await this.telegramClient.connect();
+            const client = this.telegramClient.client;
+
+            await this.updateStatus(chatId, renderProgressCard({
+                fileName, masterPercent: 5, stageName: '🧹 پاکسازی و آماده‌سازی حافظه', stagePercent: 100
+            }), true, true); 
             
-            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n🔗 <a href="${downloadLink}">👉 لینک دانلود 👈</a>`;
+            await this.manageStorage(fileSize);
+
+            const messages = await client.getMessages(BigInt(chatId), { ids: [parseInt(messageId)] });
+            if (!messages || !messages[0] || !messages[0].media) throw new Error("پیام یا فایل در تلگرام یافت نشد.");
+
+            let downloadLink;
+            
+            if (isVideo && config.performance.pipeline.enabled) {
+                console.log(`[Main] Using Pipeline Architecture for video transfer`);
+                try {
+                    downloadLink = await this.executePipeline(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress);
+                    fileName = `${path.parse(fileName).name}.mp4`;
+                } catch (pipelineErr) {
+                    console.warn(`[Main] Pipeline failed, falling back to sequential:`, pipelineErr.message);
+                    downloadLink = await this.executeSequential(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress, startTime);
+                }
+            } else {
+                console.log(`[Main] Using Sequential Architecture for non-video transfer`);
+                downloadLink = await this.executeSequential(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress, startTime);
+            }
+
+            const elapsedTime = Math.round((Date.now() - startTime) / 1000);
+            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت منقضی می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
+
             await this.updateStatus(chatId, successMsg, true);
-            await this.notifyCloudflare({ action: 'action_update', transferId, status: 'completed' });
+            await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'completed' });
             this.concurrencyController.completeTransfer(transferId);
+
         } catch (err) {
+            console.error("❌ Transfer Execution Error:", err);
             this.concurrencyController.completeTransfer(transferId);
-            await this.updateStatus(chatId, `❌ خطا:\n<code>${escapeHtml(err.message)}</code>`, true);
+            
+            const isNetworkError = err.message.includes('TCPFull') || err.message.includes('fetch') || 
+                                   err.message.includes('ECONNRESET') || err.message.includes('Timeout') ||
+                                   err.message.includes('disconnect');
+            const isCancelled = err.message.includes('لغو شد') || err.message.includes('cancelled');
+                                   
+            const errorMsg = isCancelled 
+                ? `🛑 <b>انتقال لغو شد!</b>\n\n📁 فایل: <code>${escapeHtml(fileName)}</code>`
+                : `❌ <b>خطا در انجام عملیات:</b>\n<code>${escapeHtml(err.message)}</code>${isNetworkError ? '\n\n🔄 در حال بازگشت به صف...' : ''}`;
+                
+            await this.updateStatus(chatId, errorMsg, true);
+            await this.notifyCloudflare({ 
+                action: 'action_update', 
+                transferId: config.transferId, 
+                status: isCancelled ? 'cancelled' : 'failed', 
+                error: err.message, 
+                retryable: isNetworkError 
+            });
         } finally {
             if (callbackPoller) clearInterval(callbackPoller);
+            if (downloadedFilePath) await this.cleanupFile(downloadedFilePath).catch(() => {});
+            if (targetPath && targetPath !== downloadedFilePath) await this.cleanupFile(targetPath).catch(() => {});
             await this.telegramClient.disconnect().catch(() => {});
             this.concurrencyController.stop();
             setTimeout(() => process.exit(0), 1000);
         }
     }
-    
+
+    async executeSequential(client, message, chatId, fileName, fileSize, isVideo, shouldCompress, globalStartTime) {
+        const seqDownloadedFilePath = path.join(config.performance.tempDir, `${config.transferId}_${fileName}`);
+        let seqTargetPath = seqDownloadedFilePath;
+
+        let lastProgressUpdate = 0;
+        let lastCancelCheck = 0;
+
+        await this.updateStatus(chatId, renderProgressCard({
+            fileName, masterPercent: 5, stageName: '📥⚡ دریافت فایل از تلگرام', stagePercent: 0
+        }), true, true);
+
+        const downloadResult = await this.downloadFromTelegramOptimized(
+            client, message, seqDownloadedFilePath, fileSize,
+            (downloaded, total) => {
+                const now = Date.now();
+                if (now - lastCancelCheck >= 3000) {
+                    lastCancelCheck = now;
+                    this.checkCancel().then(cancelled => {
+                        if (cancelled) this.isCancelled = true;
+                    }).catch(() => {});
+                }
+
+                if (now - lastProgressUpdate >= 3000 || downloaded === total) {
+                    lastProgressUpdate = now;
+                    const subPercent = total ? Math.floor((downloaded / total) * 100) : 0;
+                    const masterPercent = Math.min(65, 5 + Math.floor(subPercent * 0.60));
+                    const elapsedSec = (now - globalStartTime) / 1000;
+                    const speed = elapsedSec > 0 ? downloaded / elapsedSec : 0;
+                    const eta = speed > 0 ? (total - downloaded) / speed : 0;
+
+                    this.updateStatus(chatId, renderProgressCard({
+                        fileName, masterPercent, stageName: '📥⚡ دریافت فایل از تلگرام',
+                        stagePercent: subPercent, detailsText: `${formatBytes(downloaded)} / ${formatBytes(total)}`,
+                        speedText: formatSpeed(speed), etaText: formatEta(eta)
+                    }), false, true).catch(() => {});
+                }
+            },
+            this.abortController.signal
+        );
+
+        seqTargetPath = seqDownloadedFilePath;
+
+        if (isVideo) {
+            if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
+
+            fileName = `${path.parse(fileName).name}.mp4`;
+            const processedPath = path.join(config.performance.tempDir, `processed_${config.transferId}_${Date.now()}.mp4`);
+            
+            const cancelCheckInterval = setInterval(async () => {
+                if (await this.checkCancel()) {
+                    if (this.activeFFmpegProcess) this.activeFFmpegProcess.kill('SIGKILL');
+                }
+            }, 2000);
+
+            try {
+                const maxDim = shouldCompress ? 854 : 1280;
+                const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
+                const crfValue = shouldCompress ? '28' : '23';
+                const audioBitrate = shouldCompress ? '64k' : '128k';
+
+                lastProgressUpdate = 0;
+                await this.updateStatus(chatId, renderProgressCard({
+                    fileName, masterPercent: 65,
+                    stageName: shouldCompress ? '🗜 فشرده‌سازی و تغییر مقیاس (480p)' : '🎬 بهینه‌سازی ساختار ویدیو (720p)',
+                    stagePercent: 0, speedText: '1.0x', etaText: 'محاسبه...'
+                }), true, true);
+
+                await this.runFFmpeg([
+                    '-i', seqDownloadedFilePath, '-threads', '0', '-c:v', 'libx264',
+                    '-crf', crfValue, '-preset', 'veryfast', '-vf', scaleFilter,
+                    '-c:a', 'aac', '-b:a', audioBitrate, '-movflags', '+faststart', '-y', processedPath
+                ], (subPercent, speedStr, etaText) => {
+                    const now = Date.now();
+                    if (now - lastProgressUpdate >= 3500 || subPercent === 100) {
+                        lastProgressUpdate = now;
+                        const masterPercent = Math.min(85, 65 + Math.floor(subPercent * 0.20));
+                        this.updateStatus(chatId, renderProgressCard({
+                            fileName, masterPercent,
+                            stageName: shouldCompress ? '🗜 فشرده‌سازی و تغییر مقیاس (480p)' : '🎬 بهینه‌سازی ساختار ویدیو (720p)',
+                            stagePercent: subPercent, speedText: speedStr, etaText: etaText
+                        }), false, true).catch(() => {});
+                    }
+                }, this.abortController.signal);
+                
+                seqTargetPath = processedPath;
+            } catch (ffmpegErr) {
+                if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
+                throw new Error(`مشکل در ساختار فایل ویدیو.\n\nجزئیات فنی: ${ffmpegErr.message}`);
+            } finally {
+                clearInterval(cancelCheckInterval);
+            }
+        }
+
+        if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
+        this.isCriticalSection = true;
+
+        const fileStats = await fs.promises.stat(seqTargetPath);
+        const useMultipart = config.performance.multipartUpload.enabled && fileStats.size > config.performance.multipartUpload.thresholdBytes;
+        
+        const downloadLink = useMultipart 
+            ? await this.uploadToMinIOMultipart(seqTargetPath, fileName, (subPercent, sizeText, speedText, etaText) => {
+                const now = Date.now();
+                if (now - lastProgressUpdate >= 3500 || subPercent === 100) {
+                    lastProgressUpdate = now;
+                    const baseMaster = isVideo ? 85 : 65;
+                    const masterSpan = isVideo ? 13 : 33;
+                    const masterPercent = Math.min(98, baseMaster + Math.floor(subPercent * (masterSpan / 100)));
+                    this.updateStatus(chatId, renderProgressCard({
+                        fileName, masterPercent, stageName: '☁️⚡ آپلود موازی‌پارتیل به سرور',
+                        stagePercent: subPercent, detailsText: sizeText, speedText: speedText, etaText: etaText
+                    }), false, true).catch(() => {});
+                }
+            }, this.abortController.signal)
+            : await this.uploadToMinIO(seqTargetPath, fileName, (subPercent, sizeText, speedText, etaText) => {
+                const now = Date.now();
+                if (now - lastProgressUpdate >= 3500 || subPercent === 100) {
+                    lastProgressUpdate = now;
+                    const baseMaster = isVideo ? 85 : 65;
+                    const masterSpan = isVideo ? 13 : 33;
+                    const masterPercent = Math.min(98, baseMaster + Math.floor(subPercent * (masterSpan / 100)));
+                    this.updateStatus(chatId, renderProgressCard({
+                        fileName, masterPercent, stageName: '☁️ آپلود به سرور ابری',
+                        stagePercent: subPercent, detailsText: sizeText, speedText: speedText, etaText: etaText
+                    }), false, true).catch(() => {});
+                }
+            }, this.abortController.signal);
+
+        return downloadLink;
+    }
+
+    async uploadToMinIOMultipart(filePath, fileName, onProgress, signal) {
+        const bucket = config.minio.bucketName;
+        const { thresholdBytes, partSize, concurrency } = config.performance.multipartUpload;
+        
+        const stats = fs.statSync(filePath);
+        const totalSize = stats.size;
+        
+        if (!config.performance.multipartUpload.enabled || totalSize < thresholdBytes) {
+            return this.uploadToMinIO(filePath, fileName, onProgress, signal);
+        }
+        
+        console.log(`[Multipart] Starting parallel upload: ${fileName} (${formatBytes(totalSize)})`);
+        
+        try {
+            const multipartStartTime = Date.now();
+            const totalParts = Math.ceil(totalSize / partSize);
+            let completedParts = 0;
+            
+            for (let i = 0; i < totalParts; i += concurrency) {
+                if (signal?.aborted) throw new Error("انتقال توسط کاربر لغو شد.");
+                
+                const batch = [];
+                const batchEnd = Math.min(i + concurrency, totalParts);
+                
+                for (let j = i; j < batchEnd; j++) {
+                    const start = j * partSize;
+                    const end = Math.min(start + partSize, totalSize);
+                    
+                    const partStream = fs.createReadStream(filePath, { start, end: end - 1, highWaterMark: 10 * 1024 * 1024 });
+                    
+                    batch.push(new Promise((resolve, reject) => {
+                        partStream.on('error', reject);
+                        minioClient.putObject(bucket, `${fileName}.part${j}`, partStream, end - start)
+                            .then(resolve).catch(reject);
+                    }));
+                }
+                
+                await Promise.all(batch);
+                completedParts = batchEnd;
+                
+                if (onProgress) {
+                    const percent = Math.floor((completedParts / totalParts) * 100);
+                    const uploadedBytes = Math.min(completedParts * partSize, totalSize);
+                    const elapsedSec = Math.max(1, (Date.now() - multipartStartTime) / 1000);
+                    const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
+                    onProgress(percent, formatBytes(uploadedBytes) + " / " + formatBytes(totalSize), formatSpeed(speed), '');
+                }
+            }
+            
+            return await minioClient.presignedGetObject(bucket, fileName, 86400);
+            
+        } catch (error) {
+            console.error(`[Multipart] Upload failed, falling back:`, error.message);
+            return this.uploadToMinIO(filePath, fileName, onProgress, signal);
+        }
+    }
+
+    async cleanupFile(filePath) {
+        try { 
+            if (fs.existsSync(filePath)) {
+                await fs.promises.unlink(filePath);
+                console.log(`[Cleanup] Removed: ${filePath}`);
+            }
+        } catch (e) { 
+            console.warn(`[Cleanup] Failed to remove ${filePath}:`, e.message);
+        }
+    }
+
     async notifyCloudflare(payload) {
         if (!config.cloudflare.webhookUrl) return;
-        try { fetch(config.cloudflare.webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.cloudflare.apiToken}` }, body: JSON.stringify(payload) }); } catch (e) { }
+        try {
+            await fetch(config.cloudflare.webhookUrl, {
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.cloudflare.apiToken}` },
+                body: JSON.stringify(payload)
+            });
+        } catch (error) { }
     }
 }
 
-new FileTransferBot().start().catch(err => { process.exit(1); });
+// ============================================================================
+// START APPLICATION
+// ============================================================================
+console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║     ⚡ File Transfer Bot v${SYSTEM_VERSION} - STABLE PIPELINE ⚡            ║
+╠══════════════════════════════════════════════════════════════╣
+║  Pipeline Settings:                                          ║
+║  • Mode: Sequential Write Stream (workers: 1)                ║
+║  • FFmpeg Buffer: ${String(config.performance.pipeline.ffmpegInputBufferMB + 'MB').padEnd(41)} ║
+║  • Error Scope Handling: Enhanced                            ║
+╚══════════════════════════════════════════════════════════════╝
+`);
+
+new FileTransferBot().start().catch(err => {
+    console.error('[Fatal] Unhandled error:', err);
+    process.exit(1);
+});
