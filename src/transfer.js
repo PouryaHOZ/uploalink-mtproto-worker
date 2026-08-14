@@ -641,14 +641,17 @@ class TelegramDownloadStream extends Readable {
             
             if (!this.iterator) {
                 // Use iterDownload for streaming (if available), fallback to downloadMedia
+                // GRAMJS API: iterDownload(media, options) - returns AsyncGenerator<Buffer>
                 if (typeof this.client.iterDownload === 'function') {
                     console.log('[Pipeline] Using iterDownload for streaming');
-                    this.iterator = this.client.iterDownload({
-                        file: this.media,
-                        requestSize: this.options.requestSize || config.performance.pipeline.iterDownloadRequestSize,
-                        partSize: this.options.partSize || config.performance.downloadChunkSize,
-                        workers: this.options.workers || config.performance.downloadWorkers
-                    });
+                    this.iterator = this.client.iterDownload(
+                        this.media,  // First argument: media object
+                        {
+                            requestSize: this.options.requestSize || config.performance.pipeline.iterDownloadRequestSize,
+                            partSize: this.options.partSize || config.performance.downloadChunkSize,
+                            workers: this.options.workers || config.performance.downloadWorkers
+                        }
+                    );
                 } else {
                     // Fallback: Download to temp file then stream
                     console.log('[Pipeline] iterDownload not available, using file-based fallback');
