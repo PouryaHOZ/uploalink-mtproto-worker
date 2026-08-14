@@ -8,7 +8,7 @@ const { EventEmitter } = require("events");
 const { Readable, PassThrough } = require("stream");
 
 // ============================================================================
-// CONFIGURATION - Optimized for Pipeline Architecture v3.0.2 (EPIPE Fixed)
+// CONFIGURATION - Optimized for Pipeline Architecture v3.0.3 (Promise Handled)
 // ============================================================================
 const TEMP_DIR = fs.existsSync("/dev/shm") ? "/dev/shm/temp_transfers" : "./temp_transfers";
 const rawEndpoint = (process.env.MINIO_ENDPOINT || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -312,7 +312,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '3.0.2'; // EPIPE fixed version
+const SYSTEM_VERSION = '3.0.3'; // Unhandled Rejection fixed version
 
 function renderProgressCard({ fileName, masterPercent, stageName, stagePercent, speedText, etaText, detailsText, queuePosition = null, stages = null }) {
     if (stages && Array.isArray(stages)) {
@@ -490,6 +490,9 @@ class TelegramDownloadStream extends Readable {
                     outputFile: tempPath,
                     workers: 1, 
                     progressCallback: (downloaded, total) => {
+                        // 🔥 FIX: Prevent ghost downloads if Pipeline fails and destroys the stream
+                        if (this.destroyed) throw new Error("Pipeline aborted, stopping background stream");
+
                         this.downloadedBytes = downloaded;
                         this.totalBytes = total;
                         const elapsed = (Date.now() - downloadStart) / 1000;
@@ -516,8 +519,10 @@ class TelegramDownloadStream extends Readable {
                 streamStarted = true;
             }
         } catch (err) {
-            console.error(`[Pipeline] Download failed: ${err.message}`);
-            this.destroy(err);
+            if (!this.destroyed) {
+                console.error(`[Pipeline] Download failed: ${err.message}`);
+                this.destroy(err);
+            }
         }
     }
 
@@ -827,10 +832,9 @@ class FileTransferBot {
         
         this.activeFFmpegProcess = ffmpegProcess;
         
-        // 🔥 CRITICAL FIX: Handle stdin EPIPE to prevent Node.js crash
         ffmpegProcess.stdin.on('error', (err) => {
             if (err.code === 'EPIPE' || err.code === 'EOF') {
-                // Ignore EPIPE. FFmpeg closed its stdin, which is expected for some MP4s.
+                // Ignore EPIPE.
             } else {
                 console.error(`[Pipeline] FFmpeg stdin error:`, err.message);
             }
@@ -896,7 +900,6 @@ class FileTransferBot {
             const fileStream = fs.createReadStream(filePath, { highWaterMark: 16 * 1024 * 1024 });
             if (signal) signal.addEventListener('abort', () => fileStream.destroy(), { once: true });
 
-            // 🔥 FIX: Prevent crash on stream error
             fileStream.on('error', (err) => {
                 console.error('[Upload] fileStream error:', err.message);
             });
@@ -939,12 +942,10 @@ class FileTransferBot {
         inputStream.on('error', (err) => {
             console.error('[Pipeline] Input stream error during upload:', err.message);
             progressStream.destroy(err);
-            if (signal && !signal.aborted) {
-                this.abortController.abort(); 
-            }
+            // 🔥 FIX: DO NOT call this.abortController.abort() here! 
+            // It breaks the sequential fallback which uses the same controller.
         });
 
-        // 🔥 FIX: Prevent unhandled crash if progressStream fails
         progressStream.on('error', (err) => {
             console.error('[Pipeline] Progress stream error:', err.message);
         });
@@ -1121,7 +1122,6 @@ class FileTransferBot {
                 highWaterMark: config.performance.pipeline.ffmpegInputBufferMB * 1024 * 1024
             });
 
-            // 🔥 FIX: Prevent crash if downloadStream emits an error directly
             downloadStream.on('error', (err) => {
                 console.warn(`[Pipeline] Download stream error: ${err.message}`);
                 if (ffmpegProcess) {
@@ -1197,6 +1197,7 @@ class FileTransferBot {
             const outputFileName = `${path.parse(fileName).name}.mp4`;
             this.pipelineState.upload = { percent: 0, speed: '...', details: '...' };
             
+            // 🔥 FIX: Capture upload promise and suppress unhandled rejections if Pipeline aborts early
             const uploadPromise = this.uploadStreamToMinIO(
                 ffmpegProcess.stdout, 
                 outputFileName,
@@ -1207,8 +1208,10 @@ class FileTransferBot {
                 },
                 this.abortController.signal
             );
+            
+            // This prevents Node.js from crashing if uploadPromise rejects AFTER Promise.all has already thrown
+            uploadPromise.catch(() => {});
 
-            // 🔥 FIX: Reject the Promise.all immediately if downloadStream fails so it falls back!
             await Promise.all([
                 new Promise((resolve, reject) => {
                     ffmpegProcess.on('close', (code) => {
@@ -1216,7 +1219,7 @@ class FileTransferBot {
                         else reject(new Error(`FFmpeg exited with code ${code}`));
                     });
                     ffmpegProcess.on('error', reject);
-                    downloadStream.on('error', reject); // Catch stream errors
+                    downloadStream.on('error', reject); 
                 }),
                 uploadPromise
             ]);
@@ -1232,7 +1235,7 @@ class FileTransferBot {
                 try { ffmpegProcess.kill('SIGKILL'); } catch (e) {}
             }
             
-            throw err; // Throws to the main loop to trigger Fallback Sequence
+            throw err; 
         }
     }
 
@@ -1583,12 +1586,11 @@ class FileTransferBot {
 // ============================================================================
 console.log(`
 ╔══════════════════════════════════════════════════════════════╗
-║     ⚡ File Transfer Bot v${SYSTEM_VERSION} - STABLE PIPELINE ⚡            ║
+║     ⚡ File Transfer Bot v${SYSTEM_VERSION} - PROMISE FIX ⚡               ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Pipeline Settings:                                          ║
 ║  • Mode: Sequential Write Stream (workers: 1)                ║
-║  • FFmpeg Buffer: ${String(config.performance.pipeline.ffmpegInputBufferMB + 'MB').padEnd(41)} ║
-║  • Error Scope Handling: Enhanced                            ║
+║  • Error Scope Handling: Enhanced (Unhandled Rejection Fixed)║
 ╚══════════════════════════════════════════════════════════════╝
 `);
 
