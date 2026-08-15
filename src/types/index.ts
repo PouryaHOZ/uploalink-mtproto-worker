@@ -56,6 +56,15 @@ export interface TransferRequest {
     destinations?: ('bale' | 'rubika')[];
     account?: string;
     shouldCompress?: boolean;
+    
+    // Video metadata for dynamic estimation calculations
+    videoMetadata?: {
+        width?: number;
+        height?: number;
+        durationSeconds?: number;
+        bitrate?: number;
+        hasAudio?: boolean;
+    };
 }
 
 export interface ActiveTransfer {
