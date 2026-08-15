@@ -7,6 +7,7 @@ const Minio = require("minio");
 const { EventEmitter } = require("events");
 const { PassThrough } = require("stream");
 const http = require("http");
+const crypto = require("crypto");
 
 // ============================================================================
 // CONFIGURATION - Optimized for Pipeline Architecture v4.3.0 (Parallel Download + Fast Upload + UI Redesign)
@@ -87,6 +88,44 @@ const config = {
 };
 
 if (!fs.existsSync(config.performance.tempDir)) fs.mkdirSync(config.performance.tempDir, { recursive: true });
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Generate UUID filename while preserving original extension
+ * @param {string} originalFilename - Original file name (e.g., "video.mp4")
+ * @returns {string} - UUID-based filename (e.g., "a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4")
+ */
+function generateUuidFileName(originalFilename) {
+    const ext = path.extname(originalFilename); // e.g., ".mp4"
+    const uuid = crypto.randomUUID(); // e.g., "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    return `${uuid}${ext}`;
+}
+
+/**
+ * Schedule auto-deletion of MinIO object after specified time
+ * Uses setTimeout to remove object after expiry period
+ * @param {string} bucket - MinIO bucket name
+ * @param {string} fileName - Object name (UUID filename)
+ * @param {number} expireAfterMs - Time in milliseconds before deletion (default: 2 hours)
+ */
+function scheduleMinioDeletion(bucket, fileName, expireAfterMs = 2 * 60 * 60 * 1000) {
+    console.log(`[🗑️ Auto-Cleanup] Scheduled deletion in ${expireAfterMs / 1000 / 60} minutes: ${fileName}`);
+    
+    setTimeout(async () => {
+        try {
+            await minioClient.removeObject(bucket, fileName);
+            console.log(`[🗑️ Auto-Cleanup] ✅ Deleted expired file: ${fileName}`);
+        } catch (err) {
+            // Ignore errors if file already deleted or doesn't exist
+            if (!err.code === 'NoSuchKey') {
+                console.error(`[🗑️ Auto-Cleanup] ❌ Error deleting ${fileName}:`, err.message);
+            }
+        }
+    }, expireAfterMs);
+}
 
 // ============================================================================
 // MEMORY BUDGET MANAGER
@@ -1174,16 +1213,22 @@ class FileTransferBot {
     async uploadToMinIO(filePath, fileName, onProgress, signal) {
         const bucket = config.minio.bucketName;
         const uploadConfig = config.performance.upload;
+        
+        // Generate UUID filename to prevent overlaps
+        const uuidFileName = generateUuidFileName(fileName);
+        console.log(`[Upload⚡ v4.3] Filename mapping: ${fileName} → ${uuidFileName}`);
+        
         const metaData = { 
             'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
-            'X-Upload-Version': SYSTEM_VERSION
+            'X-Upload-Version': SYSTEM_VERSION,
+            'X-Original-Filename': fileName // Store original name for reference
         };
 
         const validation = await validateFile(filePath);
         if (!validation.valid) throw new Error(`Pre-upload validation failed: ${validation.error}`);
 
         const totalSize = validation.size;
-        console.log(`[Upload⚡ v4.3] Starting optimized upload: ${fileName} (${formatBytes(totalSize)})`);
+        console.log(`[Upload⚡ v4.3] Starting optimized upload: ${uuidFileName} (${formatBytes(totalSize)})`);
 
         return await withRetry('MinIO File Upload', async () => {
             // Use larger highWaterMark for faster reads (8MB buffer)
@@ -1224,26 +1269,36 @@ class FileTransferBot {
                 console.error('[Upload⚡] fileStream error:', err.message);
             });
 
-            // Use streaming upload for better performance
-            await minioClient.putObject(bucket, fileName, fileStream, totalSize, metaData);
+            // Use streaming upload for better performance (with UUID filename)
+            await minioClient.putObject(bucket, uuidFileName, fileStream, totalSize, metaData);
             
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             const avgSpeed = totalSize / parseFloat(elapsed);
-            console.log(`[Upload⚡] Completed: ${fileName} in ${elapsed}s (${formatBytes(avgSpeed)}/s avg)`);
+            console.log(`[Upload⚡] Completed: ${uuidFileName} in ${elapsed}s (${formatBytes(avgSpeed)}/s avg)`);
         }, 3, 5000);
 
-        return await minioClient.presignedGetObject(bucket, fileName, 7200);
+        // Schedule auto-deletion after 2 hours
+        scheduleMinioDeletion(bucket, uuidFileName);
+        
+        // Return clean URL only (presigning happens server-side when accessed)
+        return `https://${config.minio.endPoint}/${bucket}/${uuidFileName}`;
     }
 
     async uploadStreamToMinIO(inputStream, fileName, totalSize, onProgress, signal, pipelineContext) {
         const bucket = config.minio.bucketName;
         const uploadConfig = config.performance.upload;
+        
+        // Generate UUID filename to prevent overlaps
+        const uuidFileName = generateUuidFileName(fileName);
+        console.log(`[Pipeline Upload⚡ v4.3] Filename mapping: ${fileName} → ${uuidFileName}`);
+        
         const metaData = { 
             'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
-            'X-Upload-Version': SYSTEM_VERSION
+            'X-Upload-Version': SYSTEM_VERSION,
+            'X-Original-Filename': fileName // Store original name for reference
         };
 
-        console.log(`[Pipeline Upload⚡ v4.3] Starting optimized streaming: ${fileName}`);
+        console.log(`[Pipeline Upload⚡ v4.3] Starting optimized streaming: ${uuidFileName}`);
 
         // Create buffered pass-through stream for better performance
         const progressStream = new PassThrough({
@@ -1295,14 +1350,19 @@ class FileTransferBot {
             }, { once: true });
         }
 
-        const uploadPromise = minioClient.putObject(bucket, fileName, progressStream, undefined, metaData);
+        const uploadPromise = minioClient.putObject(bucket, uuidFileName, progressStream, undefined, metaData);
         
         try {
             await uploadPromise;
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             const avgSpeed = uploadedBytes / parseFloat(elapsed);
-            console.log(`[Pipeline Upload⚡] Completed: ${fileName} in ${elapsed}s (${formatBytes(avgSpeed)}/s avg)`);
-            return await minioClient.presignedGetObject(bucket, fileName, 7200);
+            console.log(`[Pipeline Upload⚡] Completed: ${uuidFileName} in ${elapsed}s (${formatBytes(avgSpeed)}/s avg)`);
+            
+            // Schedule auto-deletion after 2 hours
+            scheduleMinioDeletion(bucket, uuidFileName);
+            
+            // Return clean URL only (presigning happens server-side when accessed)
+            return `https://${config.minio.endPoint}/${bucket}/${uuidFileName}`;
         } catch (err) {
             if (pipelineContext.isAborting) return null; // Silent abort
             throw err;
@@ -1489,7 +1549,7 @@ class FileTransferBot {
 
             const outputFileName = `${path.parse(fileName).name}.mp4`;
             
-            // Safe upload task wrapping
+            // Safe upload task wrapping (UUID generation happens inside uploadStreamToMinIO)
             const uploadTask = this.uploadStreamToMinIO(
                 ffmpegProcess.stdout, 
                 outputFileName,
@@ -1520,7 +1580,8 @@ class FileTransferBot {
                 uploadTask
             ]);
 
-            return await minioClient.presignedGetObject(config.minio.bucketName, outputFileName, 7200);
+            // Return the URL from uploadTask (already contains UUID filename)
+            return uploadTask;
 
         } catch (err) {
             pipelineContext.isAborting = true; // Signals streams to die silently
@@ -1682,7 +1743,9 @@ class FileTransferBot {
             }
 
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
-            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⚠️ <b>لینک پس از ۲ ساعت منقضی می‌شود.</b>\n\n🔗 <a href="${downloadLink}">👉 لینک دانلود مستقیم 👈</a>`;
+            
+            // downloadLink is now always a clean URL string (presigning happens server-side)
+            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⏳ <b>لینک تا ۲ ساعت معتبر است.</b>\n\n🔗 <a href="${downloadLink}"><code>${downloadLink}</code></a>`;
 
             await this.updateStatus(chatId, successMsg, true);
             await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'completed' });
