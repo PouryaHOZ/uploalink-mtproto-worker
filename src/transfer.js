@@ -567,78 +567,107 @@ class TelegramHttpBridge extends EventEmitter {
 
     /**
      * Fetch multiple chunks in parallel using workers
-     * FIXED v4.9: Enforce Telegram's 1MB API limit to prevent LIMIT_INVALID errors
+     * FIXED v4.10: Progressive chunk size reduction for end-of-file handling
      */
     async _fetchChunksParallel(offsets, end) {
         const validOffsets = offsets.filter(off => off <= end && !this.chunkBuffer.has(off));
         if (validOffsets.length === 0) return;
         
         // Telegram's upload.GetFile has a HARD LIMIT of 1MB (1048576 bytes) per request
-        // Exceeding this causes 400: LIMIT_INVALID error
         const TELEGRAM_MAX_LIMIT = 1048576; // 1MB - Telegram's absolute maximum
+        
+        // Progressive fallback sizes if LIMIT_INVALID occurs
+        const FALLBACK_SIZES = [
+            1024 * 1024,    // 1MB (primary)
+            512 * 1024,     // 512KB (fallback 1)
+            256 * 1024,     // 256KB (fallback 2)
+            128 * 1024,     // 128KB (fallback 3)
+            64 * 1024,      // 64KB (fallback 4)
+            32 * 1024,      // 32KB (fallback 5)
+            16 * 1024       // 16KB (last resort)
+        ];
         
         // Split among workers
         const fetchPromises = validOffsets.map(async (offset) => {
             this.activeWorkers++;
             this.stats.totalRequests++;
             
-            try {
-                // Calculate remaining bytes from this offset to end
-                const remainingBytes = end - offset + 1;
-                
-                // CRITICAL: Never exceed Telegram's 1MB limit
-                // Also ensure we don't request 0 or negative bytes
-                let requestLimit = Math.min(this.chunkSize, remainingBytes, TELEGRAM_MAX_LIMIT);
-                
-                // Safety checks to prevent LIMIT_INVALID
-                if (requestLimit <= 0 || offset > end) {
-                    console.warn(`[Worker] Skipping invalid range: offset=${offset}, end=${end}, limit=${requestLimit}`);
-                    return;
-                }
-                
-                // Ensure offset is properly aligned (Telegram requires 4096-byte alignment)
-                const alignedOffset = this._alignOffset(offset);
-                
-                const result = await this.client.invoke(new Api.upload.GetFile({
-                    location: this.location,
-                    offset: BigInt(alignedOffset),
-                    limit: requestLimit
-                }));
-                
-                if (result && result.bytes && result.bytes.length > 0) {
-                    this.chunkBuffer.set(alignedOffset, { data: result.bytes, timestamp: Date.now() });
-                    this.stats.totalBytesFetched += result.bytes.length;
+            let lastError = null;
+            
+            // Try each chunk size until one works or we exhaust all options
+            for (const maxSize of FALLBACK_SIZES) {
+                try {
+                    // Calculate remaining bytes from this offset to end
+                    const remainingBytes = Math.max(0, end - offset + 1);
                     
-                    // Prevent buffer overflow
-                    this._evictOldChunksIfNeeded();
-                }
-            } catch (err) {
-                // Handle LIMIT_INVALID by retrying with smaller chunk size
-                if (err.message.includes('LIMIT_INVALID')) {
-                    console.warn(`[Worker] LIMIT_INVALID at offset ${offset}, retrying with reduced size...`);
-                    try {
-                        const retryLimit = Math.min(512 * 1024, end - offset + 1); // Retry with 512KB
-                        if (retryLimit > 0) {
-                            const retryResult = await this.client.invoke(new Api.upload.GetFile({
-                                location: this.location,
-                                offset: BigInt(this._alignOffset(offset)),
-                                limit: retryLimit
-                            }));
-                            if (retryResult && retryResult.bytes && retryResult.bytes.length > 0) {
-                                this.chunkBuffer.set(this._alignOffset(offset), { data: retryResult.bytes, timestamp: Date.now() });
-                                this.stats.totalBytesFetched += retryResult.bytes.length;
-                                return; // Success on retry
-                            }
-                        }
-                    } catch (retryErr) {
-                        console.error(`[Worker] Retry failed at offset ${offset}:`, retryErr.message);
+                    // Use the smaller of: configured chunk size, remaining bytes, or current fallback size
+                    let requestLimit = Math.min(this.chunkSize, remainingBytes, maxSize, TELEGRAM_MAX_LIMIT);
+                    
+                    // Safety checks
+                    if (requestLimit <= 0 || offset > end) {
+                        console.log(`[Worker] EOF reached: offset=${offset}, end=${end}, skipping`);
+                        return; // End of file - not an error
+                    }
+                    
+                    // Ensure offset is properly aligned (Telegram requires 4096-byte alignment)
+                    const alignedOffset = this._alignOffset(offset);
+                    
+                    // Final safety check: don't request more than what's left after alignment
+                    const actualRemaining = Math.max(0, end - alignedOffset + 1);
+                    requestLimit = Math.min(requestLimit, actualRemaining);
+                    
+                    if (requestLimit <= 0) {
+                        console.log(`[Worker] No data after alignment: alignedOffset=${alignedOffset}, end=${end}`);
+                        return; // Nothing to fetch
+                    }
+                    
+                    const result = await this.client.invoke(new Api.upload.GetFile({
+                        location: this.location,
+                        offset: BigInt(alignedOffset),
+                        limit: requestLimit
+                    }));
+                    
+                    if (result && result.bytes && result.bytes.length > 0) {
+                        this.chunkBuffer.set(alignedOffset, { data: result.bytes, timestamp: Date.now() });
+                        this.stats.totalBytesFetched += result.bytes.length;
+                        
+                        // Prevent buffer overflow
+                        this._evictOldChunksIfNeeded();
+                        
+                        return; // Success!
+                    } else {
+                        // Got empty response - likely EOF
+                        console.log(`[Worker] Empty response at ${alignedOffset} (EOF?)`);
+                        return; // Not necessarily an error
+                    }
+                    
+                } catch (err) {
+                    lastError = err;
+                    
+                    if (err.message.includes('LIMIT_INVALID')) {
+                        // Try next smaller size
+                        console.warn(`[Worker] LIMIT_INVALID at offset ${offset} with size=${maxSize}, trying smaller...`);
+                        continue;
+                    } else {
+                        // Non-LIMIT_INVALID error - don't retry
+                        break;
                     }
                 }
-                this.workerErrors.push(err);
-                console.error(`[Worker] Fetch failed at offset ${offset}:`, err.message);
-            } finally {
-                this.activeWorkers--;
             }
+            
+            // All attempts failed
+            if (lastError) {
+                this.workerErrors.push(lastError);
+                
+                // Only log as error if it's not just an EOF issue
+                if (!lastError.message.includes('LIMIT_INVALID')) {
+                    console.error(`[Worker] Fetch failed at offset ${offset}:`, lastError.message);
+                } else {
+                    console.warn(`[Worker] Could not fetch offset ${offset} even with smallest chunk size`);
+                }
+            }
+            
+            this.activeWorkers--;
         });
         
         await Promise.allSettled(fetchPromises);
@@ -779,7 +808,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.10.0';  // v4.10.0: Edit original message instead of sending new messages (multi-file support)
+const SYSTEM_VERSION = '4.10.1';  // v4.10.1: Fixed persistent LIMIT_INVALID - progressive chunk size + EOF handling
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
