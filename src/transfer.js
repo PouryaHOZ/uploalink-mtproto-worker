@@ -400,9 +400,16 @@ class TelegramHttpBridge extends EventEmitter {
             return res.end();
         }
 
+        console.log(`[HTTP Bridge] Request received: ${req.method} ${req.url} (range: ${req.headers.range || 'none'})`);
+        
         const range = req.headers.range;
         if (!range) {
-            res.writeHead(200, { 'Content-Length': this.totalSize, 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes' });
+            res.writeHead(200, { 
+                'Content-Length': this.totalSize, 
+                'Content-Type': 'video/mp4', 
+                'Accept-Ranges': 'bytes',
+                'Connection': 'keep-alive'
+            });
             await this.streamRangeParallel(0, this.totalSize - 1, res);
         } else {
             const positions = range.replace(/bytes=/, "").split("-");
@@ -772,7 +779,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.9.1';  // v4.9.1: Fixed LIMIT_INVALID error - enforce 1MB Telegram API limit + retry logic
+const SYSTEM_VERSION = '4.9.3';  // v4.9.3: Fixed FFmpeg 234 - added genpts, ignore_unknown, stream copy fallback
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
@@ -1267,18 +1274,23 @@ class FileTransferBot {
 
     spawnFFmpegPipeline(httpUrl, ffmpegOptions, onProgress, signal, pipelineContext) {
         const args = [
-            '-i', httpUrl, '-threads', '0', 
+            '-fflags', '+genpts',           // Generate PTS if missing from input
+            '-ignore_unknown',              // Skip unknown streams instead of failing
+            '-i', httpUrl, 
+            '-threads', '0', 
             '-c:v', 'libx264', '-crf', ffmpegOptions.crf || '28',
-            '-preset', ffmpegOptions.preset || 'medium',  // Slower preset = better compression
-            '-tune', 'zlib',  // Optimize for compression efficiency
+            '-preset', ffmpegOptions.preset || 'medium',
+            '-tune', 'fastdecode',
             '-vf', ffmpegOptions.scaleFilter || 'scale=854:-2',
             '-c:a', 'aac', '-b:a', ffmpegOptions.audioBitrate || '64k',
-            // 🔥 CRITICAL FIX: To pipe an MP4 out, it MUST be fragmented
+            // 🔥 CRITICAL: Fragmented MP4 for streaming output
             '-movflags', 'frag_keyframe+empty_moov', 
             '-f', 'mp4', 'pipe:1'
         ];
         
         console.log(`[Pipeline] Spawning FFmpeg via HTTP Bridge`);
+        console.log(`[Pipeline] FFmpeg args: ${args.join(' ')}`);
+        
         const ffmpegProcess = spawn('ffmpeg', args, {
             stdio: ['pipe', 'pipe', 'pipe'],
             signal
@@ -1702,6 +1714,19 @@ class FileTransferBot {
                 throw new Error("انتقال توسط کاربر لغو شد.");
             }
 
+            // CRITICAL: Wait for HTTP Bridge to initialize and start prefetching
+            // This prevents FFmpeg error 234 "Nothing was written into output file"
+            // because the parallel download needs time to fetch initial chunks
+            console.log(`[Pipeline] Waiting for HTTP Bridge to initialize...`);
+            await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second startup delay
+            
+            // Verify HTTP Bridge is still active before proceeding
+            if (!httpBridge.isActive) {
+                throw new Error("HTTP Bridge failed to initialize properly");
+            }
+            
+            console.log(`[Pipeline] HTTP Bridge ready, starting FFmpeg...`);
+
             const maxDim = shouldCompress ? 854 : 1280;
             const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
             
@@ -2074,9 +2099,13 @@ class FileTransferBot {
                     stagePercent: 0, speedText: '1.0x', etaText: 'محاسبه...'
                 }), true, true);
 
+                // First attempt: Re-encode with compression
                 await this.runFFmpeg([
-                    '-i', seqDownloadedFilePath, '-threads', '0', '-c:v', 'libx264',
-                    '-crf', crfValue, '-preset', ffmpegPreset, '-tune', 'zlib',
+                    '-fflags', '+genpts',           // Generate PTS if missing
+                    '-ignore_unknown',              // Skip unknown streams
+                    '-i', seqDownloadedFilePath, 
+                    '-threads', '0', '-c:v', 'libx264',
+                    '-crf', crfValue, '-preset', ffmpegPreset, '-tune', 'fastdecode',
                     '-vf', scaleFilter,
                     '-c:a', 'aac', '-b:a', audioBitrate, '-movflags', '+faststart', '-y', processedPath
                 ], (subPercent, speedStr, etaText) => {
@@ -2095,7 +2124,38 @@ class FileTransferBot {
                 seqTargetPath = processedPath;
             } catch (ffmpegErr) {
                 if (await this.checkCancel()) throw new Error("انتقال توسط کاربر لغو شد.");
-                throw new Error(`مشکل در ساختار فایل ویدیو.\n\nجزئیات فنی: ${ffmpegErr.message}`);
+                
+                // FALLBACK: Try stream copy mode if re-encoding fails
+                // This copies video/audio without re-encoding (faster, works with more formats)
+                console.warn(`[FFmpeg] Re-encode failed, trying stream copy fallback: ${ffmpegErr.message}`);
+                
+                try {
+                    await this.updateStatus(chatId, renderProgressCard({
+                        fileName, masterPercent: 65,
+                        stageName: '🔄 تلاش مجدد با حالت کپی...',
+                        stagePercent: 0, speedText: '...', etaText: '...'
+                    }), true, true);
+                    
+                    const copyPath = path.join(config.performance.tempDir, `copy_${config.transferId}_${Date.now()}.mp4`);
+                    
+                    await this.runFFmpeg([
+                        '-fflags', '+genpts',
+                        '-ignore_unknown',
+                        '-i', seqDownloadedFilePath,
+                        '-c:v', 'copy',     // Copy video stream (no re-encode)
+                        '-c:a', 'aac',       // Re-encode audio only (more compatible)
+                        '-b:a', audioBitrate,
+                        '-movflags', '+faststart',
+                        '-y', copyPath
+                    ], () => {}, this.abortController.signal);
+                    
+                    seqTargetPath = copyPath;
+                    console.log(`[FFmpeg] Stream copy fallback succeeded!`);
+                    
+                } catch (copyErr) {
+                    console.error(`[FFmpeg] Stream copy also failed: ${copyErr.message}`);
+                    throw new Error(`مشکل در ساختار فایل ویدیو.\n\nجزئیات فنی: ${ffmpegErr.message}\nFallback: ${copyErr.message}`);
+                }
             } finally {
                 clearInterval(cancelCheckInterval);
             }
