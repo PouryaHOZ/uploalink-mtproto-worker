@@ -779,7 +779,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.9.3';  // v4.9.3: Fixed FFmpeg 234 - added genpts, ignore_unknown, stream copy fallback
+const SYSTEM_VERSION = '4.10.0';  // v4.10.0: Edit original message instead of sending new messages (multi-file support)
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
@@ -968,6 +968,7 @@ class FileTransferBot {
     constructor() {
         this.telegramClient = new TelegramClientManager();
         this.statusMessageId = process.env.MESSAGE_ID ? parseInt(process.env.MESSAGE_ID) : null;
+        console.log(`[🎯 Message Tracking] Will edit message_id=${this.statusMessageId} for status updates`);
         this.isUpdatingStatus = false;
         this.activeFFmpegProcess = null;
         this.activeHttpBridge = null; // Track HTTP Bridge for stop functionality
@@ -1016,10 +1017,53 @@ class FileTransferBot {
         
         this.isUpdatingStatus = true;
         try {
-            const endpoint = this.statusMessageId ? 'editMessageText' : 'sendMessage';
-            const body = { chat_id: chatId, text: text, parse_mode: 'HTML', disable_web_page_preview: true };
+            // PRIORITY: Always try to edit the original "درخواست پذیرفته شد!" message
+            // This prevents message spam when multiple files are being transferred
+            if (this.statusMessageId) {
+                const body = { 
+                    chat_id: chatId, 
+                    message_id: this.statusMessageId,
+                    text: text, 
+                    parse_mode: 'HTML', 
+                    disable_web_page_preview: true 
+                };
+                
+                if (showStopButton && config.transferId) {
+                    body.reply_markup = JSON.stringify({
+                        inline_keyboard: [[{ text: '🛑 توقف انتقال', callback_data: `stop_${config.transferId}` }]]
+                    });
+                }
+
+                // Try editMessageText up to 2 times before falling back
+                for (let attempt = 1; attempt <= 2; attempt++) {
+                    const res = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/editMessageText`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    }).then(r => r.json());
+
+                    if (res.ok) {
+                        console.log(`[✅ Status Updated] message_id=${this.statusMessageId} (attempt ${attempt})`);
+                        return; // Success - we're done
+                    }
+                    
+                    // Log failure but retry once
+                    console.warn(`[⚠️ Edit Failed] attempt=${attempt}, error=${res.description || 'unknown'}, message_id=${this.statusMessageId}`);
+                    
+                    if (attempt < 2) {
+                        await new Promise(r => setTimeout(r, 500)); // Wait 500ms before retry
+                    } else {
+                        console.error(`[❌ Edit Failed Permanently] Falling back to sendMessage...`);
+                    }
+                }
+            }
             
-            if (this.statusMessageId) body.message_id = this.statusMessageId;
+            // FALLBACK: Only if editing failed or no statusMessageId exists
+            // This creates a NEW message (less ideal but ensures user sees progress)
+            const body = { 
+                chat_id: chatId, 
+                text: text, 
+                parse_mode: 'HTML', 
+                disable_web_page_preview: true 
+            };
 
             if (showStopButton && config.transferId) {
                 body.reply_markup = JSON.stringify({
@@ -1027,19 +1071,13 @@ class FileTransferBot {
                 });
             }
 
-            const res = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/${endpoint}`, {
+            const res = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/sendMessage`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
             }).then(r => r.json());
-
+            
             if (res.ok && res.result) {
-                if (!this.statusMessageId) this.statusMessageId = res.result.message_id;
-            } else if (endpoint === 'editMessageText') {
-                delete body.message_id;
-                delete body.reply_markup;
-                const fallbackRes = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/sendMessage`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-                }).then(r => r.json());
-                if (fallbackRes.ok && fallbackRes.result) this.statusMessageId = fallbackRes.result.message_id;
+                this.statusMessageId = res.result.message_id;
+                console.log(`[📝 New Message Created] message_id=${this.statusMessageId} (fallback mode)`);
             }
         } catch (e) {
             console.error("Failed to update status message:", e);
