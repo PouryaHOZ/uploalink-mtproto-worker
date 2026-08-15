@@ -921,6 +921,7 @@ class FileTransferBot {
         this.statusMessageId = process.env.MESSAGE_ID ? parseInt(process.env.MESSAGE_ID) : null;
         this.isUpdatingStatus = false;
         this.activeFFmpegProcess = null;
+        this.activeHttpBridge = null; // Track HTTP Bridge for stop functionality
         this.isCriticalSection = false;
         this.isCancelled = false;
         this.abortController = new AbortController();
@@ -1004,22 +1005,66 @@ class FileTransferBot {
         if (data.startsWith('stop_')) {
             const clickedTransferId = data.replace('stop_', '');
             if (clickedTransferId === config.transferId) {
+                console.log(`[🛑 Stop Button] User requested cancellation for transfer: ${config.transferId}`);
+                
                 try {
+                    // Answer the callback query immediately to show user feedback
                     await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/answerCallbackQuery`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ callback_query_id: callbackQuery.id, text: '✅ در حال توقف انتقال...', show_alert: false })
+                        body: JSON.stringify({ 
+                            callback_query_id: callbackQuery.id, 
+                            text: '🛑 در حال توقف انتقال...', 
+                            show_alert: true 
+                        })
                     });
-                } catch (e) {}
-                
-                this.isCancelled = true;
-                this.abortController.abort();
-                if (this.activeFFmpegProcess) {
-                    try { this.activeFFmpegProcess.kill('SIGKILL'); } catch (e) {}
+                } catch (e) {
+                    console.error('[🛑 Stop Button] Failed to answer callback:', e.message);
                 }
                 
+                // ===== IMMEDIATE ABORT ACTIONS =====
+                this.isCancelled = true;
+                this.currentFileName = this.currentFileName || fileName || 'unknown';
+                
+                // 1. Abort the main controller
+                console.log('[🛑 Stop Button] Aborting AbortController...');
+                this.abortController.abort();
+                
+                // 2. Kill FFmpeg process immediately if running
+                if (this.activeFFmpegProcess) {
+                    console.log('[🛑 Stop Button] Killing FFmpeg process...');
+                    try { 
+                        this.activeFFmpegProcess.kill('SIGKILL'); 
+                        this.activeFFmpegProcess = null;
+                    } catch (e) {
+                        console.error('[🛑 Stop Button] Error killing FFmpeg:', e.message);
+                    }
+                }
+                
+                // 3. Stop HTTP Bridge if active
+                if (this.activeHttpBridge) {
+                    console.log('[🛑 Stop Button] Stopping HTTP Bridge...');
+                    try { 
+                        this.activeHttpBridge.stop(); 
+                        this.activeHttpBridge = null;
+                    } catch (e) {
+                        console.error('[🛑 Stop Button] Error stopping HTTP Bridge:', e.message);
+                    }
+                }
+                
+                // 4. Update status to show cancellation
                 const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID || '';
+                console.log('[🛑 Stop Button] Updating status message...');
                 await this.updateStatus(chatId, `🛑 <b>انتقال لغو شد!</b>\n\n📁 فایل: <code>${escapeHtml(this.currentFileName)}</code>\n\n⚠️ توسط کاربر متوقف شد.`, true);
-                await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'cancelled', reason: 'user_requested' });
+                
+                // 5. Notify Cloudflare
+                await this.notifyCloudflare({ 
+                    action: 'action_update', 
+                    transferId: config.transferId, 
+                    status: 'cancelled', 
+                    reason: 'user_requested' 
+                }).catch(e => console.error('[🛑 Stop Button] Cloudflare notify error:', e.message));
+                
+                console.log('[🛑 Stop Button] ✅ Cancellation complete!');
                 return true;
             }
         }
@@ -1027,22 +1072,53 @@ class FileTransferBot {
     }
 
     startCallbackListener(chatId) {
-        if (!config.telegram.botToken || !config.transferId) return;
+        if (!config.telegram.botToken || !config.transferId) {
+            console.warn('[⚠️ Callback Listener] Missing botToken or transferId, listener not started');
+            return null;
+        }
+        
+        console.log(`[🔄 Callback Listener] Starting poll for transfer: ${config.transferId}`);
+        
         const pollInterval = setInterval(async () => {
+            // Check if already aborted
             if (this.abortController.signal.aborted) {
+                console.log('[🔄 Callback Listener] Already aborted, stopping poll');
                 clearInterval(pollInterval);
                 return;
             }
+            
             try {
-                const encodedTransferId = encodeURIComponent(config.transferId);
-                const res = await fetch(`${config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '')}/check-stop?transferId=${encodedTransferId}`, {
-                    headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }, signal: AbortSignal.timeout(2000)
-                }).then(r => r.json()).catch(() => ({}));
-                if (res.shouldStop) {
-                    await this.handleCallbackQuery({ data: `stop_${config.transferId}`, id: 'poll' });
+                // Method 1: Check via Cloudflare webhook (if available)
+                if (config.cloudflare.webhookUrl && config.cloudflare.apiToken) {
+                    const encodedTransferId = encodeURIComponent(config.transferId);
+                    const res = await fetch(`${config.cloudflare.webhookUrl.replace(/\/action-webhook\/?$/, '')}/check-stop?transferId=${encodedTransferId}`, {
+                        headers: { 'Authorization': `Bearer ${config.cloudflare.apiToken}` }, 
+                        signal: AbortSignal.timeout(2000)
+                    }).then(r => r.json()).catch(() => ({}));
+                    
+                    if (res.shouldStop) {
+                        console.log('[🔄 Callback Listener] Cloudflare signaled stop');
+                        await this.handleCallbackQuery({ data: `stop_${config.transferId}`, id: 'poll' });
+                        clearInterval(pollInterval);
+                        return;
+                    }
                 }
-            } catch (e) {}
-        }, 2000);
+                
+                // Method 2: Direct check of local abort state (more reliable)
+                if (this.isCancelled || this.abortController.signal.aborted) {
+                    console.log('[🔄 Callback Listener] Local abort detected, cleaning up');
+                    clearInterval(pollInterval);
+                    return;
+                }
+                
+            } catch (e) {
+                // Don't log every error to avoid noise, but log occasionally
+                if (Math.random() < 0.05) { // Log ~5% of errors
+                    console.debug('[🔄 Callback Listener] Poll error (occasional):', e.message);
+                }
+            }
+        }, 1500); // Poll every 1.5 seconds (faster response)
+        
         return pollInterval;
     }
 
@@ -1487,6 +1563,9 @@ class FileTransferBot {
         let httpBridge = null;
         let ffmpegProcess;
         
+        // Track current file name for stop button
+        this.currentFileName = fileName;
+        
         // v4.3: Track pipeline start time for ETA calculations
         this.pipelineStartTime = Date.now();
         this.totalFileSize = fileSize;
@@ -1509,9 +1588,17 @@ class FileTransferBot {
             if (!isVideo) throw new Error("NON_STREAMABLE_MEDIA"); // Force fallback for non-video
 
             httpBridge = new TelegramHttpBridge(client, message.media, fileSize);
+            this.activeHttpBridge = httpBridge; // Track for stop button  ← NEW LINE
             
             let lastDownloadUpdate = 0;
             httpBridge.on('progress', (downloaded, total) => {
+                // Check if aborted during download
+                if (this.abortController.signal.aborted || this.isCancelled) {
+                    console.log('[Pipeline] Download aborted via stop button');
+                    httpBridge.stop();
+                    return;
+                }
+                
                 const elapsed = (Date.now() - this.pipelineStartTime) / 1000;
                 const speed = elapsed > 0 ? downloaded / elapsed : 0;
                 const percent = total ? Math.floor((downloaded / total) * 100) : 0;
@@ -1528,7 +1615,18 @@ class FileTransferBot {
                 }
             });
 
+            // Check abort before starting HTTP bridge
+            if (this.abortController.signal.aborted || this.isCancelled) {
+                throw new Error("انتقال توسط کاربر لغو شد.");
+            }
+
             const httpUrl = await httpBridge.start();
+            
+            // Check abort after HTTP bridge starts
+            if (this.abortController.signal.aborted || this.isCancelled) {
+                httpBridge.stop();
+                throw new Error("انتقال توسط کاربر لغو شد.");
+            }
 
             const maxDim = shouldCompress ? 854 : 1280;
             const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
@@ -1580,13 +1678,23 @@ class FileTransferBot {
                 uploadTask
             ]);
 
+            // Cleanup: Clear tracked instances
+            this.activeHttpBridge = null;
+            this.activeFFmpegProcess = null;
+
             // Return the URL from uploadTask (already contains UUID filename)
             return uploadTask;
 
         } catch (err) {
             pipelineContext.isAborting = true; // Signals streams to die silently
-            if (httpBridge) httpBridge.stop();
-            if (ffmpegProcess) { try { ffmpegProcess.kill('SIGKILL'); } catch (e) {} }
+            if (httpBridge) { 
+                httpBridge.stop(); 
+                this.activeHttpBridge = null;
+            }
+            if (ffmpegProcess) { 
+                try { ffmpegProcess.kill('SIGKILL'); } catch (e) {} 
+                this.activeFFmpegProcess = null;
+            }
             throw err; 
         }
     }
