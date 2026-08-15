@@ -108,22 +108,24 @@ function estimateTransferMetrics(
     const stdHeight = Math.round(height * stdScaleFactor);
     const stdTotalPixels = stdWidth * stdHeight;
     
-    // Target bitrate for standard option: varies by target resolution
-    // Higher resolutions need more bits for quality
-    const stdBitratePerPixel = stdMaxDim >= 720 ? 8 : (stdMaxDim >= 480 ? 6 : 4);
+    // Target bitrate for standard option: AGGRESSIVE OPTIMIZATION
+    // With CRF 27, we achieve significant size reduction even at same resolution
+    // Typical compression ratios: 40-60% of original size
+    const stdBitratePerPixel = stdMaxDim >= 720 ? 5 : (stdMaxDim >= 480 ? 4 : 3); // Reduced from before
     const stdTargetBitrate = Math.min(
-        stdMaxDim >= 720 ? 4000000 : (stdMaxDim >= 480 ? 2000000 : 1000000),
+        stdMaxDim >= 720 ? 2500000 : (stdMaxDim >= 480 ? 1500000 : 800000), // Lower max targets
         Math.max(
-            stdMaxDim >= 720 ? 1500000 : (stdMaxDim >= 480 ? 800000 : 400000),
+            stdMaxDim >= 720 ? 800000 : (stdMaxDim >= 480 ? 500000 : 300000), // Lower minimums
             stdTotalPixels * stdBitratePerPixel
         )
     );
     
-    // Audio bitrate (if present)
-    const stdAudioBitrate = hasAudio ? 128000 : 0; // 128 kbps for standard audio
+    // Audio bitrate (reduced for optimization)
+    const stdAudioBitrate = hasAudio ? 96000 : 0; // 96 kbps (down from 128k)
     
-    // Calculate estimated output size
-    const stdVideoBitrate = Math.min(sourceBitrate * 0.7, stdTargetBitrate); // Don't exceed 70% of source or target
+    // Calculate estimated output size - MORE AGGRESSIVE COMPRESSION
+    // With CRF 27, expect 45-55% of original size for same-resolution
+    const stdVideoBitrate = Math.min(sourceBitrate * 0.5, stdTargetBitrate); // 50% of source (was 70%)
     const stdEstimatedSize = Math.floor((stdVideoBitrate + stdAudioBitrate) * duration / 8);
     
     // FFmpeg processing speed for light optimization
@@ -144,21 +146,24 @@ function estimateTransferMetrics(
     const compHeight = Math.round(height * compScaleFactor);
     const compTotalPixels = compWidth * compHeight;
     
-    // Target bitrate for compressed option: varies by target resolution
-    const compBitratePerPixel = compMaxDim >= 480 ? 6 : (compMaxDim >= 360 ? 4 : 3);
+    // Target bitrate for compressed option: MAXIMUM COMPRESSION
+    // With CRF 30, we achieve very aggressive size reduction
+    // Typical compression ratios: 25-40% of original size
+    const compBitratePerPixel = compMaxDim >= 480 ? 4 : (compMaxDim >= 360 ? 3 : 2);
     const compTargetBitrate = Math.min(
-        compMaxDim >= 480 ? 1500000 : (compMaxDim >= 360 ? 1000000 : 500000),
+        compMaxDim >= 480 ? 1200000 : (compMaxDim >= 360 ? 800000 : 400000), // Much lower targets
         Math.max(
-            compMaxDim >= 480 ? 500000 : (compMaxDim >= 360 ? 300000 : 200000),
+            compMaxDim >= 480 ? 300000 : (compMaxDim >= 360 ? 200000 : 100000), // Very low minimums
             compTotalPixels * compBitratePerPixel
         )
     );
     
     // Audio bitrate (lower for compressed version)
-    const compAudioBitrate = hasAudio ? 64000 : 0; // 64 kbps for compressed audio
+    const compAudioBitrate = hasAudio ? 64000 : 0; // 64 kbps
     
-    // Calculate estimated output size
-    const compVideoBitrate = Math.min(sourceBitrate * 0.4, compTargetBitrate); // More aggressive compression
+    // Calculate estimated output size - VERY AGGRESSIVE COMPRESSION
+    // With CRF 30 + downscaling, expect 25-35% of original size
+    const compVideoBitrate = Math.min(sourceBitrate * 0.35, compTargetBitrate); // 35% of source (was 40%)
     const compEstimatedSize = Math.floor((compVideoBitrate + compAudioBitrate) * duration / 8);
     
     // FFmpeg processing speed for heavy compression

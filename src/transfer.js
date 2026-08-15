@@ -1402,16 +1402,37 @@ class FileTransferBot {
             
             // Throttled progress updates for better performance
             const now = Date.now();
-            if (onProgress && totalSize && (now - lastProgressUpdate >= 500 || uploadedBytes >= totalSize)) {
+            if (onProgress && (now - lastProgressUpdate >= 500)) {
                 lastProgressUpdate = now;
-                const percent = Math.min(100, Math.floor((uploadedBytes / totalSize) * 100));
                 const elapsedSec = (now - startTime) / 1000;
                 const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
-                const etaSec = speed > 0 ? (totalSize - uploadedBytes) / speed : 0;
+                
+                // For uploads with unknown/estimated total size (compressed files):
+                // Show bytes uploaded + speed instead of percentage
+                // Only show percentage if we have a reliable totalSize AND haven't exceeded it
+                let percent = null;
+                let details;
+                
+                if (totalSize && uploadedBytes <= totalSize) {
+                    // Normal case: we know the size and haven't exceeded it
+                    percent = Math.min(100, Math.floor((uploadedBytes / totalSize) * 100));
+                    details = `${formatBytes(uploadedBytes)} / ${formatBytes(totalSize)}`;
+                } else if (totalSize && uploadedBytes > totalSize) {
+                    // Exceeded estimate (common with compressed files)
+                    // Show uncapped progress based on actual data
+                    percent = Math.min(150, Math.floor((uploadedBytes / totalSize) * 100));
+                    details = `${formatBytes(uploadedBytes)} (تخمین: ${formatBytes(totalSize)})`;
+                } else {
+                    // Unknown size - just show uploaded amount
+                    percent = null; // No percentage cap!
+                    details = `${formatBytes(uploadedBytes)} (در حال آپلود...)`;
+                }
+                
+                const etaSec = (totalSize && speed > 0) ? (Math.max(totalSize, uploadedBytes) - uploadedBytes) / speed : 0;
                 
                 onProgress(
                     percent, 
-                    `${formatBytes(uploadedBytes)} / ${formatBytes(totalSize)}`, 
+                    details, 
                     formatSpeed(speed), 
                     formatEta(etaSec),
                     speed // Return raw speed for overall calculation
@@ -1630,8 +1651,22 @@ class FileTransferBot {
 
             const maxDim = shouldCompress ? 854 : 1280;
             const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
-            const crfValue = shouldCompress ? '28' : '23';
-            const audioBitrate = shouldCompress ? '64k' : '128k';
+            
+            // AGGRESSIVE COMPRESSION SETTINGS FOR SIZE OPTIMIZATION
+            // Goal: Minimum file size while maintaining "good" visual quality
+            if (shouldCompress) {
+                // Compressed option (downscale): Maximum compression
+                var crfValue = '30';      // High CRF = much smaller files (still acceptable quality)
+                var audioBitrate = '64k'; // Low audio bitrate
+            } else {
+                // Standard option (same-scale or slight downscale): Aggressive optimization
+                // Even at same resolution, we can drastically reduce size via:
+                // - Higher CRF (more compression)
+                // - Lower audio bitrate  
+                // - Better preset balance
+                var crfValue = '27';      // Aggressive but still looks good
+                var audioBitrate = '96k'; // Reduced from 128k (saves significant space)
+            }
 
             ffmpegProcess = this.spawnFFmpegPipeline(httpUrl, {
                 crf: crfValue, scaleFilter: scaleFilter, audioBitrate: audioBitrate
@@ -1947,8 +1982,20 @@ class FileTransferBot {
             try {
                 const maxDim = shouldCompress ? 854 : 1280;
                 const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
-                const crfValue = shouldCompress ? '28' : '23';
-                const audioBitrate = shouldCompress ? '64k' : '128k';
+                
+                // AGGRESSIVE COMPRESSION SETTINGS (same as pipeline)
+                // Goal: Minimum file size while maintaining "good" visual quality
+                let crfValue, audioBitrate;
+                
+                if (shouldCompress) {
+                    // Compressed option (downscale): Maximum compression
+                    crfValue = '30';      // High CRF = much smaller files
+                    audioBitrate = '64k'; // Low audio bitrate
+                } else {
+                    // Standard option (same-scale): Aggressive optimization
+                    crfValue = '27';      // Aggressive but still looks good
+                    audioBitrate = '96k'; // Reduced from 128k (saves space)
+                }
 
                 lastProgressUpdate = 0;
                 await this.updateStatus(chatId, renderProgressCard({
