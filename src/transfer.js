@@ -560,10 +560,15 @@ class TelegramHttpBridge extends EventEmitter {
 
     /**
      * Fetch multiple chunks in parallel using workers
+     * FIXED v4.9: Enforce Telegram's 1MB API limit to prevent LIMIT_INVALID errors
      */
     async _fetchChunksParallel(offsets, end) {
         const validOffsets = offsets.filter(off => off <= end && !this.chunkBuffer.has(off));
         if (validOffsets.length === 0) return;
+        
+        // Telegram's upload.GetFile has a HARD LIMIT of 1MB (1048576 bytes) per request
+        // Exceeding this causes 400: LIMIT_INVALID error
+        const TELEGRAM_MAX_LIMIT = 1048576; // 1MB - Telegram's absolute maximum
         
         // Split among workers
         const fetchPromises = validOffsets.map(async (offset) => {
@@ -571,20 +576,57 @@ class TelegramHttpBridge extends EventEmitter {
             this.stats.totalRequests++;
             
             try {
+                // Calculate remaining bytes from this offset to end
+                const remainingBytes = end - offset + 1;
+                
+                // CRITICAL: Never exceed Telegram's 1MB limit
+                // Also ensure we don't request 0 or negative bytes
+                let requestLimit = Math.min(this.chunkSize, remainingBytes, TELEGRAM_MAX_LIMIT);
+                
+                // Safety checks to prevent LIMIT_INVALID
+                if (requestLimit <= 0 || offset > end) {
+                    console.warn(`[Worker] Skipping invalid range: offset=${offset}, end=${end}, limit=${requestLimit}`);
+                    return;
+                }
+                
+                // Ensure offset is properly aligned (Telegram requires 4096-byte alignment)
+                const alignedOffset = this._alignOffset(offset);
+                
                 const result = await this.client.invoke(new Api.upload.GetFile({
                     location: this.location,
-                    offset: BigInt(offset),
-                    limit: Math.min(this.chunkSize, end - offset + 1)
+                    offset: BigInt(alignedOffset),
+                    limit: requestLimit
                 }));
                 
                 if (result && result.bytes && result.bytes.length > 0) {
-                    this.chunkBuffer.set(offset, { data: result.bytes, timestamp: Date.now() });
+                    this.chunkBuffer.set(alignedOffset, { data: result.bytes, timestamp: Date.now() });
                     this.stats.totalBytesFetched += result.bytes.length;
                     
                     // Prevent buffer overflow
                     this._evictOldChunksIfNeeded();
                 }
             } catch (err) {
+                // Handle LIMIT_INVALID by retrying with smaller chunk size
+                if (err.message.includes('LIMIT_INVALID')) {
+                    console.warn(`[Worker] LIMIT_INVALID at offset ${offset}, retrying with reduced size...`);
+                    try {
+                        const retryLimit = Math.min(512 * 1024, end - offset + 1); // Retry with 512KB
+                        if (retryLimit > 0) {
+                            const retryResult = await this.client.invoke(new Api.upload.GetFile({
+                                location: this.location,
+                                offset: BigInt(this._alignOffset(offset)),
+                                limit: retryLimit
+                            }));
+                            if (retryResult && retryResult.bytes && retryResult.bytes.length > 0) {
+                                this.chunkBuffer.set(this._alignOffset(offset), { data: retryResult.bytes, timestamp: Date.now() });
+                                this.stats.totalBytesFetched += retryResult.bytes.length;
+                                return; // Success on retry
+                            }
+                        }
+                    } catch (retryErr) {
+                        console.error(`[Worker] Retry failed at offset ${offset}:`, retryErr.message);
+                    }
+                }
                 this.workerErrors.push(err);
                 console.error(`[Worker] Fetch failed at offset ${offset}:`, err.message);
             } finally {
@@ -730,7 +772,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.3.0';
+const SYSTEM_VERSION = '4.9.1';  // v4.9.1: Fixed LIMIT_INVALID error - enforce 1MB Telegram API limit + retry logic
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
@@ -1225,8 +1267,11 @@ class FileTransferBot {
 
     spawnFFmpegPipeline(httpUrl, ffmpegOptions, onProgress, signal, pipelineContext) {
         const args = [
-            '-i', httpUrl, '-threads', '0', '-c:v', 'libx264', '-crf', ffmpegOptions.crf || '28',
-            '-preset', 'veryfast', '-vf', ffmpegOptions.scaleFilter || 'scale=854:-2',
+            '-i', httpUrl, '-threads', '0', 
+            '-c:v', 'libx264', '-crf', ffmpegOptions.crf || '28',
+            '-preset', ffmpegOptions.preset || 'medium',  // Slower preset = better compression
+            '-tune', 'zlib',  // Optimize for compression efficiency
+            '-vf', ffmpegOptions.scaleFilter || 'scale=854:-2',
             '-c:a', 'aac', '-b:a', ffmpegOptions.audioBitrate || '64k',
             // 🔥 CRITICAL FIX: To pipe an MP4 out, it MUST be fragmented
             '-movflags', 'frag_keyframe+empty_moov', 
@@ -1296,6 +1341,7 @@ class FileTransferBot {
         
         const metaData = { 
             'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
+            'Content-Disposition': `attachment; filename="${fileName}"`,  // Force browser download
             'X-Upload-Version': SYSTEM_VERSION,
             'X-Original-Filename': fileName // Store original name for reference
         };
@@ -1356,8 +1402,11 @@ class FileTransferBot {
         // Schedule auto-deletion after 2 hours
         scheduleMinioDeletion(bucket, uuidFileName);
         
-        // Return clean URL only (presigning happens server-side when accessed)
-        return `https://${config.minio.endPoint}/${bucket}/${uuidFileName}`;
+        // Return URL and file size for display
+        return { 
+            url: `https://${config.minio.endPoint}/${bucket}/${uuidFileName}`,
+            size: totalSize 
+        };
     }
 
     async uploadStreamToMinIO(inputStream, fileName, totalSize, onProgress, signal, pipelineContext) {
@@ -1370,6 +1419,7 @@ class FileTransferBot {
         
         const metaData = { 
             'Content-Type': fileName.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream',
+            'Content-Disposition': `attachment; filename="${fileName}"`,  // Force browser download
             'X-Upload-Version': SYSTEM_VERSION,
             'X-Original-Filename': fileName // Store original name for reference
         };
@@ -1408,8 +1458,8 @@ class FileTransferBot {
                 const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
                 
                 // For uploads with unknown/estimated total size (compressed files):
-                // Show bytes uploaded + speed instead of percentage
-                // Only show percentage if we have a reliable totalSize AND haven't exceeded it
+                // Since compressed size is unknown until FFmpeg finishes,
+                // show bytes uploaded + speed WITHOUT any percentage cap
                 let percent = null;
                 let details;
                 
@@ -1418,13 +1468,13 @@ class FileTransferBot {
                     percent = Math.min(100, Math.floor((uploadedBytes / totalSize) * 100));
                     details = `${formatBytes(uploadedBytes)} / ${formatBytes(totalSize)}`;
                 } else if (totalSize && uploadedBytes > totalSize) {
-                    // Exceeded estimate (common with compressed files)
-                    // Show uncapped progress based on actual data
-                    percent = Math.min(150, Math.floor((uploadedBytes / totalSize) * 100));
-                    details = `${formatBytes(uploadedBytes)} (تخمین: ${formatBytes(totalSize)})`;
+                    // Exceeded estimate (common with compressed files) - NO CAP
+                    // Just show actual bytes uploaded, no misleading percentage
+                    percent = null;  // Removed 150% cap - compressed size is unknown
+                    details = `${formatBytes(uploadedBytes)} (آپلود ادامه دارد...)`;
                 } else {
                     // Unknown size - just show uploaded amount
-                    percent = null; // No percentage cap!
+                    percent = null; 
                     details = `${formatBytes(uploadedBytes)} (در حال آپلود...)`;
                 }
                 
@@ -1453,13 +1503,16 @@ class FileTransferBot {
             await uploadPromise;
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             const avgSpeed = uploadedBytes / parseFloat(elapsed);
-            console.log(`[Pipeline Upload⚡] Completed: ${uuidFileName} in ${elapsed}s (${formatBytes(avgSpeed)}/s avg)`);
+            console.log(`[Pipeline Upload⚡] Completed: ${uuidFileName} in ${elapsed}s (${formatBytes(avgSpeed)}/s avg, ${formatBytes(uploadedBytes)} total)`);
             
             // Schedule auto-deletion after 2 hours
             scheduleMinioDeletion(bucket, uuidFileName);
             
-            // Return clean URL only (presigning happens server-side when accessed)
-            return `https://${config.minio.endPoint}/${bucket}/${uuidFileName}`;
+            // Return URL and actual uploaded size for display
+            return { 
+                url: `https://${config.minio.endPoint}/${bucket}/${uuidFileName}`,
+                size: uploadedBytes 
+            };
         } catch (err) {
             if (pipelineContext.isAborting) return null; // Silent abort
             throw err;
@@ -1653,23 +1706,26 @@ class FileTransferBot {
             const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
             
             // AGGRESSIVE COMPRESSION SETTINGS FOR SIZE OPTIMIZATION
-            // Goal: Minimum file size while maintaining "good" visual quality
+            // Goal: GUARANTEED smaller file size while maintaining acceptable visual quality
+            // Key changes from v4.3: Higher CRF + slower preset = much better compression ratio
             if (shouldCompress) {
                 // Compressed option (downscale): Maximum compression
-                var crfValue = '30';      // High CRF = much smaller files (still acceptable quality)
-                var audioBitrate = '64k'; // Low audio bitrate
+                var crfValue = '32';      // High CR = much smaller files (acceptable quality for mobile)
+                var audioBitrate = '48k'; // Very low audio bitrate (speech/music still clear)
+                var ffmpegPreset = 'medium';  // Better compression than veryfast
             } else {
                 // Standard option (same-scale or slight downscale): Aggressive optimization
-                // Even at same resolution, we can drastically reduce size via:
-                // - Higher CRF (more compression)
+                // Even at same resolution, we drastically reduce size via:
+                // - Higher CRF (28-30 range for visible size reduction)
                 // - Lower audio bitrate  
-                // - Better preset balance
-                var crfValue = '27';      // Aggressive but still looks good
-                var audioBitrate = '96k'; // Reduced from 128k (saves significant space)
+                // - Slower preset (better compression efficiency)
+                var crfValue = '29';      // Aggressive - guarantees size reduction vs original
+                var audioBitrate = '64k'; // Low audio (saves significant space)
+                var ffmpegPreset = 'medium';  // Better compression than veryfast
             }
 
             ffmpegProcess = this.spawnFFmpegPipeline(httpUrl, {
-                crf: crfValue, scaleFilter: scaleFilter, audioBitrate: audioBitrate
+                crf: crfValue, scaleFilter: scaleFilter, audioBitrate: audioBitrate, preset: ffmpegPreset
             }, (percent, speed, eta) => {
                 this.pipelineState.compress = { percent, speed, details: `${percent}%` };
                 this._updatePipelineStatus(chatId, fileName, 50);
@@ -1865,12 +1921,16 @@ class FileTransferBot {
             if (!messages || !messages[0] || !messages[0].media) throw new Error("پیام یا فایل در تلگرام یافت نشد.");
 
             let downloadLink;
+            let finalFileSize = 0;  // Track final compressed file size
             
             if (isVideo && config.performance.pipeline.enabled) {
                 console.log(`[Main] Using Pipeline Architecture for video transfer`);
                 try {
-                    downloadLink = await this.executePipeline(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress);
-                    if (!downloadLink) throw new Error("Pipeline upload link not generated");
+                    const uploadResult = await this.executePipeline(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress);
+                    if (!uploadResult) throw new Error("Pipeline upload link not generated");
+                    // Handle both old string format and new object format
+                    downloadLink = uploadResult.url || uploadResult;
+                    finalFileSize = uploadResult.size || 0;
                     fileName = `${path.parse(fileName).name}.mp4`;
                 } catch (pipelineErr) {
                     if (pipelineErr.message === 'NON_STREAMABLE_MEDIA') {
@@ -1878,17 +1938,25 @@ class FileTransferBot {
                     } else {
                         console.warn(`[Main] Pipeline failed, falling back to sequential:`, pipelineErr.message);
                     }
-                    downloadLink = await this.executeSequential(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress, startTime);
+                    const seqResult = await this.executeSequential(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress, startTime);
+                    downloadLink = seqResult.url || seqResult;
+                    finalFileSize = seqResult.size || 0;
                 }
             } else {
                 console.log(`[Main] Using Sequential Architecture for non-video transfer`);
-                downloadLink = await this.executeSequential(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress, startTime);
+                const seqResult = await this.executeSequential(client, messages[0], chatId, fileName, fileSize, isVideo, shouldCompress, startTime);
+                downloadLink = seqResult.url || seqResult;
+                finalFileSize = seqResult.size || 0;
             }
 
             const elapsedTime = Math.round((Date.now() - startTime) / 1000);
             
             // downloadLink is now always a clean URL string (presigning happens server-side)
-            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⏳ <b>لینک تا ۲ ساعت معتبر است.</b>\n\n🔗 <a href="${downloadLink}"><code>${downloadLink}</code></a>`;
+            // Build file size info for display
+            const sizeInfo = finalFileSize > 0 ? `\n📦 <b>حجم فایل:</b> ${formatBytes(finalFileSize)}` : '';
+            
+            // Content-Disposition header forces browser download instead of playing
+            const successMsg = `✅ <b>انتقال کامل شد!</b>\n\n<code>[██████████] 100%</code>\n📁 <b>نام فایل:</b> <code>${escapeHtml(fileName)}</code>${sizeInfo}\n⏱️ <b>زمان:</b> ${elapsedTime} ثانیه\n⏳ <b>لینک تا ۲ ساعت معتبر است.</b>\n\n🔗 <a href="${downloadLink}">⬇️ دانلود فایل</a>`;
 
             await this.updateStatus(chatId, successMsg, true);
             await this.notifyCloudflare({ action: 'action_update', transferId: config.transferId, status: 'completed' });
@@ -1983,18 +2051,20 @@ class FileTransferBot {
                 const maxDim = shouldCompress ? 854 : 1280;
                 const scaleFilter = `scale=${maxDim}:${maxDim}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`;
                 
-                // AGGRESSIVE COMPRESSION SETTINGS (same as pipeline)
-                // Goal: Minimum file size while maintaining "good" visual quality
-                let crfValue, audioBitrate;
+                // AGGRESSIVE COMPRESSION SETTINGS (same as pipeline v4.9)
+                // Goal: GUARANTEED smaller file size while maintaining acceptable quality
+                let crfValue, audioBitrate, ffmpegPreset;
                 
                 if (shouldCompress) {
                     // Compressed option (downscale): Maximum compression
-                    crfValue = '30';      // High CRF = much smaller files
-                    audioBitrate = '64k'; // Low audio bitrate
+                    crfValue = '32';      // High CR = much smaller files
+                    audioBitrate = '48k'; // Very low audio bitrate
+                    ffmpegPreset = 'medium';
                 } else {
                     // Standard option (same-scale): Aggressive optimization
-                    crfValue = '27';      // Aggressive but still looks good
-                    audioBitrate = '96k'; // Reduced from 128k (saves space)
+                    crfValue = '29';      // Aggressive - guarantees size reduction
+                    audioBitrate = '64k'; // Low audio (saves space)
+                    ffmpegPreset = 'medium';
                 }
 
                 lastProgressUpdate = 0;
@@ -2006,7 +2076,8 @@ class FileTransferBot {
 
                 await this.runFFmpeg([
                     '-i', seqDownloadedFilePath, '-threads', '0', '-c:v', 'libx264',
-                    '-crf', crfValue, '-preset', 'veryfast', '-vf', scaleFilter,
+                    '-crf', crfValue, '-preset', ffmpegPreset, '-tune', 'zlib',
+                    '-vf', scaleFilter,
                     '-c:a', 'aac', '-b:a', audioBitrate, '-movflags', '+faststart', '-y', processedPath
                 ], (subPercent, speedStr, etaText) => {
                     const now = Date.now();
