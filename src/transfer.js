@@ -580,10 +580,15 @@ class TelegramHttpBridge extends EventEmitter {
     // Track consecutive LIMIT_INVALID failures to detect true EOF
     _consecutiveLimitInvalids = 0;
     _detectedEofOffset = null; // Offset where we detected actual EOF
+    _eofSuspected = false;     // v4.15.0: Early EOF suspicion flag
+    _firstLimitInvalidOffset = null; // v4.15.0: Track where we first saw LIMIT_INVALID
     
     /**
      * Fetch multiple chunks in parallel using workers
-     * FIXED v4.13: Dynamic EOF detection + adaptive timeout + graceful degradation
+     * FIXED v4.15.0: Aggressive early EOF detection - eliminates LIMIT_INVALID storm
+     * - Detects EOF suspicion on FIRST LIMIT_INVALID
+     * - Uses quick-probe mode when EOF suspected (64KB→16KB only)
+     * - Reduces API calls from 30+ to 2-3 for EOF detection
      */
     async _fetchChunksParallel(offsets, end) {
         // If we've already detected EOF, adjust end to prevent unnecessary requests
@@ -595,15 +600,17 @@ class TelegramHttpBridge extends EventEmitter {
         // Telegram's upload.GetFile has a HARD LIMIT of 1MB (1048576 bytes) per request
         const TELEGRAM_MAX_LIMIT = 1048576; // 1MB - Telegram's absolute maximum
         
-        // Progressive fallback sizes if LIMIT_INVALID occurs
-        const FALLBACK_SIZES = [
+        // v4.15.0: Two-tier fallback strategy based on EOF suspicion state
+        const NORMAL_FALLBACK_SIZES = [
             1024 * 1024,    // 1MB (primary)
             512 * 1024,     // 512KB (fallback 1)
-            256 * 1024,     // 256KB (fallback 2)
-            128 * 1024,     // 128KB (fallback 3)
-            64 * 1024,      // 64KB (fallback 4)
-            32 * 1024,      // 32KB (fallback 5)
-            16 * 1024       // 16KB (last resort)
+            256 * 1024      // 256KB (fallback 2) - stop here if LIMIT_INVALID, suspect EOF
+        ];
+        
+        // v4.15.0: Quick-probe sizes when EOF is suspected (minimal API calls)
+        const QUICK_PROBE_SIZES = [
+            64 * 1024,      // 64KB (quick probe)
+            16 * 1024       // 16KB (last resort confirmation)
         ];
         
         // Split among workers
@@ -614,8 +621,11 @@ class TelegramHttpBridge extends EventEmitter {
             let lastError = null;
             let gotLimitInvalid = false;
             
+            // v4.15.0: Choose fallback strategy based on EOF suspicion
+            const fallbackSizes = this._eofSuspected ? QUICK_PROBE_SIZES : NORMAL_FALLBACK_SIZES;
+            
             // Try each chunk size until one works or we exhaust all options
-            for (const maxSize of FALLBACK_SIZES) {
+            for (const maxSize of fallbackSizes) {
                 try {
                     // Calculate remaining bytes from this offset to effective end
                     const remainingBytes = Math.max(0, effectiveEnd - offset + 1);
@@ -653,8 +663,10 @@ class TelegramHttpBridge extends EventEmitter {
                         this.chunkBuffer.set(alignedOffset, { data: result.bytes, timestamp: Date.now() });
                         this.stats.totalBytesFetched += result.bytes.length;
                         
-                        // Reset consecutive failure counter on success
+                        // Reset consecutive failure counter and EOF suspicion on success
                         this._consecutiveLimitInvalids = 0;
+                        this._eofSuspected = false;
+                        this._firstLimitInvalidOffset = null;
                         
                         // Prevent buffer overflow
                         this._evictOldChunksIfNeeded();
@@ -674,8 +686,21 @@ class TelegramHttpBridge extends EventEmitter {
                     
                     if (err.message.includes('LIMIT_INVALID')) {
                         gotLimitInvalid = true;
-                        console.warn(`[Worker] LIMIT_INVALID at offset ${offset} with size=${maxSize}, trying smaller...`);
-                        continue; // Try next smaller size
+                        
+                        // v4.15.0: On FIRST LIMIT_INVALID, immediately suspect EOF
+                        if (!this._eofSuspected) {
+                            this._eofSuspected = true;
+                            this._firstLimitInvalidOffset = offset;
+                            this._consecutiveLimitInvalids++;
+                            console.warn(`[Worker] ⚠️ EOF SUSPECTED at offset ${offset} (first LIMIT_INVALID). Switching to quick-probe mode.`);
+                            
+                            // Don't continue with normal fallback - break to use quick-probe logic
+                            break;
+                        } else {
+                            // Already in quick-probe mode, log but continue
+                            console.warn(`[Worker] LIMIT_INVALID at offset ${offset} (quick-probe, size=${maxSize})`);
+                            continue;
+                        }
                     } else {
                         // Non-LIMIT_INVALID error - don't retry
                         break;
@@ -689,18 +714,19 @@ class TelegramHttpBridge extends EventEmitter {
                     // Track consecutive failures
                     this._consecutiveLimitInvalids++;
                     
-                    // If we've had multiple consecutive LIMIT_INVALID failures at different offsets,
-                    // we've likely reached the true end of file
-                    if (this._consecutiveLimitInvalids >= 3) {
+                    // v4.15.0: Lower threshold when EOF is suspected (2 instead of 3)
+                    const eofThreshold = this._eofSuspected ? 2 : 3;
+                    
+                    if (this._consecutiveLimitInvalids >= eofThreshold) {
                         this._markEofReached(offset);
-                        console.warn(`[Worker] Dynamic EOF detected at offset ${offset} (${this._consecutiveLimitInvalids} consecutive failures). Adjusting stream end.`);
+                        console.warn(`[Worker] ✅ Dynamic EOF detected at offset ${offset} (${this._consecutiveLimitInvalids} consecutive failures). Stream ending.`);
                         // Mark as fetched with empty data so consumer can continue
                         this.chunkBuffer.set(offset, { data: Buffer.alloc(0), timestamp: Date.now() });
                         this.activeWorkers--;
                         return; // Not an error - EOF
                     }
                     
-                    console.warn(`[Worker] Could not fetch offset ${offset} (failure #${this._consecutiveLimitInvalids})`);
+                    console.warn(`[Worker] Could not fetch offset ${offset} (failure #${this._consecutiveLimitInvalids}, eofSuspected=${this._eofSuspected})`);
                     // Don't add to workerErrors - might be transient
                 } else {
                     this.workerErrors.push(lastError);
@@ -885,7 +911,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.14.0';  // v4.14.0: Fixed logic error in NoSuchKey check + undefined fileName reference
+const SYSTEM_VERSION = '4.15.0';  // v4.15.0: Aggressive early EOF detection - eliminated LIMIT_INVALID storm (30+ calls → 2-3)
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
