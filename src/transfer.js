@@ -34,25 +34,25 @@ const config = {
         region: process.env.MINIO_REGION || 'us-east-1'
     },
     performance: {
-        downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '262144'), // 256KB (GramJS max for sequential)
-        parallelDownloadChunkSize: 1024 * 1024, // 1MB chunks for HTTP Bridge (MAX allowed!)
-        parallelWorkers: parseInt(process.env.PARALLEL_DOWNLOAD_WORKERS || '2'), // 2 workers (balanced)
-        readAheadBufferMB: 4, // 4MB buffer keeps FFmpeg fed
+        downloadChunkSize: parseInt(process.env.DOWNLOAD_CHUNK_SIZE || '524288'), // 512KB (increased from 256KB for fewer requests)
+        parallelDownloadChunkSize: 2 * 1024 * 1024, // 2MB chunks for HTTP Bridge (increased from 1MB!)
+        parallelWorkers: parseInt(process.env.PARALLEL_DOWNLOAD_WORKERS || '4'), // 4 workers (increased from 2 for faster parallel downloads)
+        readAheadBufferMB: 8, // 8MB buffer (doubled from 4MB for smoother streaming)
         downloadWorkers: parseInt(process.env.DOWNLOAD_WORKERS || '8'),
         maxConcurrentTransfers: parseInt(process.env.MAX_CONCURRENT_TRANSFERS || '5'),
         tempDir: TEMP_DIR,
         
         // Upload optimization settings
         upload: {
-            chunkSize: 16 * 1024 * 1024,      // 16MB parts for MinIO multipart
-            concurrency: 3,                   // 3 parallel upload streams
-            bufferMB: 8,                      // 8MB read buffer for uploads
+            chunkSize: 32 * 1024 * 1024,      // 32MB parts for MinIO multipart (doubled from 16MB)
+            concurrency: 4,                   // 4 parallel upload streams (increased from 3)
+            bufferMB: 16,                     // 16MB read buffer for uploads (doubled from 8MB)
             useMultipart: true                // Enable multipart upload for large files
         },
         
         pipeline: {
             enabled: true,
-            ffmpegInputBufferMB: 2,
+            ffmpegInputBufferMB: 4,  // Doubled from 2MB for better input buffering
         },
         
         memoryBudget: {
@@ -926,7 +926,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.17.0';  // v4.17.0: Dual Message IDs (USER_MESSAGE_ID + PROCESS_MESSAGE_ID) for proper progress tracking
+const SYSTEM_VERSION = '4.18.0';  // v4.18.0: Performance optimizations (faster downloads, better buffering, Node.js 24 fix)
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
