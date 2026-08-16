@@ -1,11 +1,7 @@
 # ============================================================================
-# Transfer Large File - v4.18.0 (Optimized)
+# Transfer Large File - v4.18.1 (Stable)
 # ============================================================================
-# Changes from v4.17.0:
-# - Fixed Node.js 20 deprecation warnings
-# - Combined cache steps for faster setup
-# - Added parallel job optimization
-# - Reduced total setup time by ~40%
+# Fixed: Syntax errors, cache issues, Node.js deprecation
 # ============================================================================
 
 name: Transfer Large File
@@ -23,99 +19,86 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     
-    # ========================================================================
-    # OPTIMIZATION: Use newer action versions to fix Node.js deprecation
-    # These versions have native Node.js 24 support
-    # ========================================================================
-    strategy:
-      fail-fast: false
-      max-parallel: 1
+    # Global env to fix Node.js deprecation for ALL steps
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
     steps:
       # ====================================================================
-      # Step 1: Checkout (Optimized)
-      # - Using latest v4 with persist-credentials: false (faster auth skip)
+      # Step 1: Checkout
       # ====================================================================
-      - name: Checkout repository (Shallow)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          persist-credentials: false  # Skip credential setup (faster)
 
       # ====================================================================
       # Step 2: Setup Node.js 24
-      # - Explicitly set node-version to avoid deprecation warning
       # ====================================================================
-      - name: Setup Node.js 24
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-        env:
-          # Suppress Node.js 20 deprecation warning temporarily
-          ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
       # ====================================================================
-      # Step 3: Combined Cache Restore (NEW - Saves ~3s)
-      # - Restores both node_modules AND FFmpeg in one step
-      # - Uses composite key for efficient cache hits
+      # Step 3: Cache node_modules
       # ====================================================================
-      - name: Restore combined cache
-        id: combined-cache
+      - name: Cache node_modules
+        id: cache-modules
         uses: actions/cache@v4
         with:
-          path: |
-            node_modules
-            ~/.local/bin/ffmpeg
-          key: ${{ runner.os }}-transfer-v3-${{ hashFiles('**/pnpm-lock.yaml') }}-ffmpeg-v1
-          restore-keys: |
-            ${{ runner.os }}-transfer-v3-${{ hashFiles('**/pnpm-lock.yaml') }}-
-            ${{ runner.os }}-transfer-v3-
+          path: node_modules
+          key: ${{ runner.os }}-node24-${{ hashFiles('**/pnpm-lock.yaml') }}
 
       # ====================================================================
-      # Step 4: Install dependencies (only on cache miss)
+      # Step 4: Cache FFmpeg
       # ====================================================================
-      - name: Install pnpm & Production Dependencies (On Cache Miss)
-        if: steps.combined-cache.outputs.cache-hit != 'true'
+      - name: Cache FFmpeg
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/ffmpeg
+          key: ${{ runner.os }}-ffmpeg-v1
+
+      # ====================================================================
+      # Step 5: Install dependencies (if cache miss)
+      # ====================================================================
+      - name: Install dependencies
+        if: steps.cache-modules.outputs.cache-hit != 'true'
         run: |
           corepack enable
           pnpm config set verify-deps-before-run false
           pnpm install --prod --no-frozen-lockfile --ignore-scripts
 
       # ====================================================================
-      # Step 5: Download FFmpeg (only if not in cache)
+      # Step 6: Download FFmpeg (if cache miss)
       # ====================================================================
-      - name: Download FFmpeg static binary (On Cache Miss)
-        if: steps.combined-cache.outputs.cache-hit != 'true'
+      - name: Install FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.local/bin
           curl -sL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ --strip-components=1 -C ~/.local/bin --wildcards '*/ffmpeg'
           chmod +x ~/.local/bin/ffmpeg
 
       # ====================================================================
-      # Step 6: Environment Setup (Optimized)
+      # Step 7: Setup environment
       # ====================================================================
-      - name: Export PATH & System Config
+      - name: Setup environment
         run: |
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           mkdir -p /dev/shm/temp_transfers
-          
-          # Pre-warm temp directory for faster I/O
-          dd if=/dev/zero of=/dev/shm/temp_transfers/.warmup bs=1M count=10 2>/dev/null || true
-          rm -f /dev/shm/temp_transfers/.warmup
 
       # ====================================================================
-      # Step 7: Execute Transfer Script (Optimized)
-      # - Increased heap size for better performance
-      # - Added NODE_OPTIONS for V8 optimizations
+      # Step 8: Run transfer script
       # ====================================================================
       - name: Execute Transfer Script
         run: node --max-old-space-size=8192 src/transfer.js
         env:
           DOWNLOAD_WORKERS: 8
-          DOWNLOAD_CHUNK_SIZE: 524288  # Increased from 262144 (512KB chunks)
-          PARALLEL_DOWNLOAD_WORKERS: 4   # Increased from 2
+          DOWNLOAD_CHUNK_SIZE: 524288
+          PARALLEL_DOWNLOAD_WORKERS: 4
           NODE_ENV: production
-          NODE_OPTIONS: '--max-old-space-size=8192 --optimize-for-size=false'  # V8 Engine Optimizations
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
@@ -139,10 +122,8 @@ jobs:
           TEMP_DIR: /dev/shm/temp_transfers
 
       # ====================================================================
-      # Step 8: Cleanup & Telemetry (Optional)
+      # Step 9: Cleanup
       # ====================================================================
-      - name: Post-transfer cleanup
+      - name: Cleanup
         if: always()
-        run: |
-          echo "Transfer completed at $(date)"
-          df -h /dev/shm  # Show memory usage
+        run: echo "Transfer completed at $(date)"
