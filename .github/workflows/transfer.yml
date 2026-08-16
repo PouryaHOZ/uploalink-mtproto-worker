@@ -37,7 +37,7 @@ jobs:
       # Step 1: Checkout (v5 = Node 24 native)
       # ====================================================================
       - name: Checkout repository
-        uses: actions/checkout
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -45,7 +45,7 @@ jobs:
       # Step 2: Setup Node.js 24 (v4 auto-upgraded to Node 24)
       # ====================================================================
       - name: Setup Node.js
-        uses: actions/setup-node
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
@@ -54,7 +54,7 @@ jobs:
       # ====================================================================
       - name: Cache node_modules
         id: cache-modules
-        uses: actions/cache
+        uses: actions/cache@v6
         with:
           path: node_modules
           key: ${{ runner.os }}-node24-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -64,7 +64,7 @@ jobs:
       # ====================================================================
       - name: Cache FFmpeg
         id: cache-ffmpeg
-        uses: actions/cache
+        uses: actions/cache@v6
         with:
           path: ~/.local/bin/ffmpeg
           key: ${{ runner.os }}-ffmpeg-v1
