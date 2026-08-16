@@ -109,13 +109,13 @@ jobs:
       # - Added NODE_OPTIONS for V8 optimizations
       # ====================================================================
       - name: Execute Transfer Script
-        run: |
-          node --max-old-space-size=8192 src/transfer.js
+        run: node --max-old-space-size=8192 src/transfer.js
         env:
           DOWNLOAD_WORKERS: 8
           DOWNLOAD_CHUNK_SIZE: 524288  # Increased from 262144 (512KB chunks)
           PARALLEL_DOWNLOAD_WORKERS: 4   # Increased from 2
           NODE_ENV: production
+          NODE_OPTIONS: '--max-old-space-size=8192 --optimize-for-size=false'  # V8 Engine Optimizations
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
@@ -137,9 +137,6 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TRANSFER_ID: ${{ github.event.client_payload.TRANSFER_ID }}
           TEMP_DIR: /dev/shm/temp_transfers
-        env:
-          # V8 Engine Optimizations
-          NODE_OPTIONS: '--max-old-space-size=8192 --optimize-for-size=false'
 
       # ====================================================================
       # Step 8: Cleanup & Telemetry (Optional)
