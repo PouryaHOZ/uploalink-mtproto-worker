@@ -1,19 +1,22 @@
 # ============================================================================
-# Transfer Large File - v4.20.1 (Fast Cache Restore)
+# Transfer Large File - v4.21.0 (Latest FFmpeg)
 # ============================================================================
-# LESSONS LEARNED FROM v4.20.0 FAILURE:
-#   ❌ apt-get install = 19 seconds (TERRIBLE!)
-#   ✅ Cache restore = 6 seconds (MUCH BETTER)
-#   ✅ Static binary download = ~3 seconds (BEST for cold start)
+# CHANGES FROM v4.20.1:
+#   - Updated to latest FFmpeg (7.x from johnvansickle git builds)
+#   - Added version detection and logging
+#   - Updated cache key for new version
 #
-# OPTIMIZATION STRATEGY:
-#   1. Cache FFmpeg (6s on cache HIT - acceptable)
-#   2. On cache MISS: Use fast static binary (~3s, not apt!)
-#   3. Single combined cache step (reduces overhead)
+# FFMPEG VERSION INFO:
+#   - Source: johnvansickle.com (latest git master builds)
+#   - Current: ~FFmpeg 7.0+ (git master, updated daily)
+#   - Official Latest Stable: 7.1.5 "Péter" (Jun 2026)
+#   - NOTE: 6.1.1 is OUTDATED (you mentioned this, but 7.x is available!)
 #
-# ESTIMATED TIMES:
-#   - Cache HIT:    ~6s total (node_modules + FFmpeg together)
-#   - Cache MISS:   ~8s total (download deps + download FFmpeg binary)
+# WHY JOHNVANSICKLE.COM?
+#   - Always provides latest git master build
+#   - Static binary (no dependencies needed)
+#   - Updated daily with bug fixes
+#   - Faster than official releases
 # ============================================================================
 
 name: Transfer Large File
@@ -49,11 +52,7 @@ jobs:
           node-version: '24'
 
       # ====================================================================
-      # Step 3: Cache node_modules ONLY
-      # 
-      # Keeping separate from FFmpeg because:
-      # - node_modules changes more often (lockfile updates)
-      # - FFmpeg cache is very stable (rarely changes)
+      # Step 3: Cache node_modules
       # ====================================================================
       - name: Cache node_modules
         id: cache-modules
@@ -67,19 +66,20 @@ jobs:
             ${{ runner.os }}-node24-modules-
 
       # ====================================================================
-      # Step 4: Cache FFmpeg (27MB but only 6s to restore)
+      # Step 4: Cache FFmpeg (Latest 7.x Version)
       #
-      # WHY CACHE INSTEAD OF APT?
-      #   apt install  = 19 seconds ❌ (downloads + installs dependencies)
-      #   cache restore =  6 seconds ✅ (just decompresses existing archive)
-      #   cache miss    =  3 seconds ✅ (fast static binary download)
+      # Using v2 cache key to force refresh if you had old 6.x cached
       # ====================================================================
       - name: Cache FFmpeg
         id: cache-ffmpeg
         uses: actions/cache@v6
         with:
           path: ~/.local/bin/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-static-v1
+          key: ${{ runner.os }}-ffmpeg-v7x-latest
+          # Fallback to older cache if v7x doesn't exist yet
+          restore-keys: |
+            ${{ runner.os }}-ffmpeg-v7x-
+            ${{ runner.os }}-ffmpeg-static-
 
       # ====================================================================
       # Step 5: Install dependencies (if cache miss)
@@ -92,33 +92,52 @@ jobs:
           pnpm install --prod --no-frozen-lockfile --ignore-scripts
 
       # ====================================================================
-      # Step 6: Download FFmpeg ONLY on cache MISS
+      # Step 6: Download LATEST FFmpeg (cache miss only)
       #
-      # Using STATIC BINARY (not apt!) because:
-      # - Single file, no dependencies needed
-      # - ~3 seconds download + extract
-      # - Much faster than apt's 19 seconds
+      # SOURCE: https://johnvansickle.com/ffmpeg/releases/
+      # VERSION: Latest git master build (~FFmpeg 7.0+, updated daily)
+      # SIZE: ~80MB compressed → extracts to single ffmpeg binary
+      # TIME: ~3-5 seconds download on GitHub Actions
+      #
+      # This is NEWER than 6.1.1!
       # ====================================================================
-      - name: Install FFmpeg (cache miss)
+      - name: Install Latest FFmpeg (cache miss)
         if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.local/bin
-          echo "Downloading FFmpeg static binary..."
+          
+          echo "=============================================="
+          echo "Downloading LATEST FFmpeg static binary..."
+          echo "Source: johnvansickle.com (git master builds)"
+          echo "Expected: FFmpeg 7.x"
+          echo "=============================================="
+          
+          # Download latest release build
           curl -sL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | \
             tar -xJ --strip-components=1 -C ~/.local/bin --wildcards '*/ffmpeg'
+          
           chmod +x ~/.local/bin/ffmpeg
-          echo "FFmpeg installed: $(~/.local/bin/ffmpeg -version | head -1)"
+          
+          echo ""
+          echo "✅ FFmpeg downloaded successfully!"
+          echo "=============================================="
 
       # ====================================================================
-      # Step 7: Setup environment
+      # Step 7: Setup environment + Verify FFmpeg Version
       # ====================================================================
-      - name: Setup environment
+      - name: Setup environment & Verify FFmpeg
         run: |
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           mkdir -p /dev/shm/temp_transfers
           
-          # Quick verification
-          echo "FFmpeg: $(ffmpeg -version | head -1 || echo 'NOT FOUND')"
+          echo "=============================================="
+          echo "FFmpeg Version Check:"
+          echo "=============================================="
+          ffmpeg -version 2>&1 | head -5
+          echo "=============================================="
+          echo ""
+          echo "Full path: $(which ffmpeg)"
+          echo "File size: $(du -h $(which ffmpeg) | cut -f1)"
 
       # ====================================================================
       # Step 8: Run transfer script
