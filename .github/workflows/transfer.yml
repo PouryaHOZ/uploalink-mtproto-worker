@@ -36,7 +36,7 @@ jobs:
       # Step 1: Checkout
       # ====================================================================
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -44,7 +44,7 @@ jobs:
       # Step 2: Setup Node.js 24
       # ====================================================================
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
@@ -53,7 +53,7 @@ jobs:
       # ====================================================================
       - name: Cache node_modules
         id: cache-modules
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             node_modules
@@ -77,7 +77,7 @@ jobs:
       # ====================================================================
       - name: Cache FFmpeg (Permanent)
         id: cache-ffmpeg
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.local/bin/ffmpeg
           # ⚠️ IMPORTANT: This key is INTENTIONALLY static!
