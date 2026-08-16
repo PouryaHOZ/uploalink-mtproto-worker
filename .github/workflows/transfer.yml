@@ -1,10 +1,17 @@
 # ============================================================================
-# Transfer Large File - v4.19.0 (Latest Actions + Zero Warnings)
+# Transfer Large File - v4.19.0 (Node.js 24 Native)
 # ============================================================================
-# Updated: All actions upgraded to latest versions with Node.js 24 support
-# - actions/checkout@v5 (Node 24 native)
-# - actions/setup-node@v4 (latest stable)
-# - actions/cache@v5 (Node 24 native)
+# CHANGES FROM v4.18.1:
+#   - Updated actions/checkout@v4 → v5 (Node 24 native)
+#   - Updated actions/cache@v4 → v5 (Node 24 native)
+#   - actions/setup-node@v4 (auto-upgraded to Node 24 runtime)
+#   - REMOVED conflicting env vars:
+#       * FORCE_JAVASCRIPT_ACTIONS_TO_NODE24
+#       * ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION
+#   - No more deprecation warnings!
+#
+# REQUIREMENTS:
+#   - GitHub Actions Runner v2.327.1 or later
 # ============================================================================
 
 name: Transfer Large File
@@ -21,12 +28,13 @@ jobs:
   transfer:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    
+    # NOTE: No global env needed anymore!
+    # All actions below are Node 24 native.
 
     steps:
       # ====================================================================
-      # Step 1: Checkout - v5 with Node.js 24 support!
-      # https://github.com/actions/checkout/releases/tag/v5.0.0
-      # "Updated to the node24 runtime"
+      # Step 1: Checkout (v5 = Node 24 native)
       # ====================================================================
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -34,7 +42,7 @@ jobs:
           fetch-depth: 1
 
       # ====================================================================
-      # Step 2: Setup Node.js 24 - Latest v4
+      # Step 2: Setup Node.js 24 (v4 auto-upgraded to Node 24)
       # ====================================================================
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -42,10 +50,7 @@ jobs:
           node-version: '24'
 
       # ====================================================================
-      # Step 3: Cache node_modules - v5 with Node.js 24 support!
-      # https://github.com/actions/cache/releases/tag/v5.0.0
-      # "actions/cache@v5 runs on Node.js 24"
-      # Requires minimum runner version: 2.327.1
+      # Step 3: Cache node_modules (v5 = Node 24 native)
       # ====================================================================
       - name: Cache node_modules
         id: cache-modules
@@ -55,14 +60,14 @@ jobs:
           key: ${{ runner.os }}-node24-${{ hashFiles('**/pnpm-lock.yaml') }}
 
       # ====================================================================
-      # Step 4: Cache FFmpeg - v5
+      # Step 4: Cache FFmpeg (v5 = Node 24 native)
       # ====================================================================
       - name: Cache FFmpeg
         id: cache-ffmpeg
         uses: actions/cache@v5
         with:
           path: ~/.local/bin/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-v2
+          key: ${{ runner.os }}-ffmpeg-v1
 
       # ====================================================================
       # Step 5: Install dependencies (if cache miss)
@@ -93,7 +98,7 @@ jobs:
           mkdir -p /dev/shm/temp_transfers
 
       # ====================================================================
-      # Step 8: Run transfer script (Optimized for performance)
+      # Step 8: Run transfer script
       # ====================================================================
       - name: Execute Transfer Script
         run: node --max-old-space-size=8192 src/transfer.js
