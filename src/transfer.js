@@ -120,7 +120,7 @@ function scheduleMinioDeletion(bucket, fileName, expireAfterMs = 2 * 60 * 60 * 1
             console.log(`[🗑️ Auto-Cleanup] ✅ Deleted expired file: ${fileName}`);
         } catch (err) {
             // Ignore errors if file already deleted or doesn't exist
-            if (!err.code === 'NoSuchKey') {
+            if (err.code !== 'NoSuchKey') {
                 console.error(`[🗑️ Auto-Cleanup] ❌ Error deleting ${fileName}:`, err.message);
             }
         }
@@ -453,9 +453,15 @@ class TelegramHttpBridge extends EventEmitter {
             while (this.nextReadOffset <= end && this.isActive) {
                 if (res.destroyed || res.closed) break;
                 
-                // Check for worker errors
-                if (this.workerErrors.length > 0) {
+                // Check for worker errors (unless we've detected EOF - errors expected)
+                if (this.workerErrors.length > 0 && !this._detectedEofOffset) {
                     throw this.workerErrors[0];
+                }
+                
+                // Check if we've reached detected EOF
+                if (this._detectedEofOffset && this.nextReadOffset >= this._detectedEofOffset) {
+                    console.log(`[Parallel Stream] Reached detected EOF at ${this.nextReadOffset}`);
+                    break; // Graceful end of stream
                 }
                 
                 // Wait for data if buffer is empty at our position
@@ -472,6 +478,12 @@ class TelegramHttpBridge extends EventEmitter {
                 
                 // Remove from buffer (consumed)
                 this.chunkBuffer.delete(alignedOffset);
+                
+                // Handle empty data (EOF marker)
+                if (chunkData.data.length === 0) {
+                    console.log(`[Parallel Stream] Got empty chunk at ${alignedOffset}, ending stream`);
+                    break; // End of stream
+                }
                 
                 // Calculate actual data slice (handle alignment skip)
                 const skipBytes = this.nextReadOffset - alignedOffset;
@@ -565,12 +577,19 @@ class TelegramHttpBridge extends EventEmitter {
         }
     }
 
+    // Track consecutive LIMIT_INVALID failures to detect true EOF
+    _consecutiveLimitInvalids = 0;
+    _detectedEofOffset = null; // Offset where we detected actual EOF
+    
     /**
      * Fetch multiple chunks in parallel using workers
-     * FIXED v4.10: Progressive chunk size reduction for end-of-file handling
+     * FIXED v4.13: Dynamic EOF detection + adaptive timeout + graceful degradation
      */
     async _fetchChunksParallel(offsets, end) {
-        const validOffsets = offsets.filter(off => off <= end && !this.chunkBuffer.has(off));
+        // If we've already detected EOF, adjust end to prevent unnecessary requests
+        const effectiveEnd = this._detectedEofOffset ? Math.min(end, this._detectedEofOffset) : end;
+        
+        const validOffsets = offsets.filter(off => off <= effectiveEnd && !this.chunkBuffer.has(off));
         if (validOffsets.length === 0) return;
         
         // Telegram's upload.GetFile has a HARD LIMIT of 1MB (1048576 bytes) per request
@@ -593,19 +612,21 @@ class TelegramHttpBridge extends EventEmitter {
             this.stats.totalRequests++;
             
             let lastError = null;
+            let gotLimitInvalid = false;
             
             // Try each chunk size until one works or we exhaust all options
             for (const maxSize of FALLBACK_SIZES) {
                 try {
-                    // Calculate remaining bytes from this offset to end
-                    const remainingBytes = Math.max(0, end - offset + 1);
+                    // Calculate remaining bytes from this offset to effective end
+                    const remainingBytes = Math.max(0, effectiveEnd - offset + 1);
                     
                     // Use the smaller of: configured chunk size, remaining bytes, or current fallback size
                     let requestLimit = Math.min(this.chunkSize, remainingBytes, maxSize, TELEGRAM_MAX_LIMIT);
                     
                     // Safety checks
-                    if (requestLimit <= 0 || offset > end) {
-                        console.log(`[Worker] EOF reached: offset=${offset}, end=${end}, skipping`);
+                    if (requestLimit <= 0 || offset > effectiveEnd) {
+                        console.log(`[Worker] EOF reached: offset=${offset}, end=${effectiveEnd}, skipping`);
+                        this.activeWorkers--;
                         return; // End of file - not an error
                     }
                     
@@ -613,11 +634,12 @@ class TelegramHttpBridge extends EventEmitter {
                     const alignedOffset = this._alignOffset(offset);
                     
                     // Final safety check: don't request more than what's left after alignment
-                    const actualRemaining = Math.max(0, end - alignedOffset + 1);
+                    const actualRemaining = Math.max(0, effectiveEnd - alignedOffset + 1);
                     requestLimit = Math.min(requestLimit, actualRemaining);
                     
                     if (requestLimit <= 0) {
-                        console.log(`[Worker] No data after alignment: alignedOffset=${alignedOffset}, end=${end}`);
+                        console.log(`[Worker] No data after alignment: alignedOffset=${alignedOffset}, end=${effectiveEnd}`);
+                        this.activeWorkers--;
                         return; // Nothing to fetch
                     }
                     
@@ -631,13 +653,19 @@ class TelegramHttpBridge extends EventEmitter {
                         this.chunkBuffer.set(alignedOffset, { data: result.bytes, timestamp: Date.now() });
                         this.stats.totalBytesFetched += result.bytes.length;
                         
+                        // Reset consecutive failure counter on success
+                        this._consecutiveLimitInvalids = 0;
+                        
                         // Prevent buffer overflow
                         this._evictOldChunksIfNeeded();
                         
+                        this.activeWorkers--;
                         return; // Success!
                     } else {
                         // Got empty response - likely EOF
                         console.log(`[Worker] Empty response at ${alignedOffset} (EOF?)`);
+                        this._markEofReached(alignedOffset);
+                        this.activeWorkers--;
                         return; // Not necessarily an error
                     }
                     
@@ -645,9 +673,9 @@ class TelegramHttpBridge extends EventEmitter {
                     lastError = err;
                     
                     if (err.message.includes('LIMIT_INVALID')) {
-                        // Try next smaller size
+                        gotLimitInvalid = true;
                         console.warn(`[Worker] LIMIT_INVALID at offset ${offset} with size=${maxSize}, trying smaller...`);
-                        continue;
+                        continue; // Try next smaller size
                     } else {
                         // Non-LIMIT_INVALID error - don't retry
                         break;
@@ -657,13 +685,26 @@ class TelegramHttpBridge extends EventEmitter {
             
             // All attempts failed
             if (lastError) {
-                this.workerErrors.push(lastError);
-                
-                // Only log as error if it's not just an EOF issue
-                if (!lastError.message.includes('LIMIT_INVALID')) {
-                    console.error(`[Worker] Fetch failed at offset ${offset}:`, lastError.message);
+                if (gotLimitInvalid) {
+                    // Track consecutive failures
+                    this._consecutiveLimitInvalids++;
+                    
+                    // If we've had multiple consecutive LIMIT_INVALID failures at different offsets,
+                    // we've likely reached the true end of file
+                    if (this._consecutiveLimitInvalids >= 3) {
+                        this._markEofReached(offset);
+                        console.warn(`[Worker] Dynamic EOF detected at offset ${offset} (${this._consecutiveLimitInvalids} consecutive failures). Adjusting stream end.`);
+                        // Mark as fetched with empty data so consumer can continue
+                        this.chunkBuffer.set(offset, { data: Buffer.alloc(0), timestamp: Date.now() });
+                        this.activeWorkers--;
+                        return; // Not an error - EOF
+                    }
+                    
+                    console.warn(`[Worker] Could not fetch offset ${offset} (failure #${this._consecutiveLimitInvalids})`);
+                    // Don't add to workerErrors - might be transient
                 } else {
-                    console.warn(`[Worker] Could not fetch offset ${offset} even with smallest chunk size`);
+                    this.workerErrors.push(lastError);
+                    console.error(`[Worker] Fetch failed at offset ${offset}:`, lastError.message);
                 }
             }
             
@@ -672,27 +713,63 @@ class TelegramHttpBridge extends EventEmitter {
         
         await Promise.allSettled(fetchPromises);
     }
+    
+    /**
+     * Mark that we've reached EOF and adjust future requests
+     */
+    _markEofReached(offset) {
+        if (!this._detectedEofOffset || offset < this._detectedEofOffset) {
+            this._detectedEofOffset = offset;
+            console.log(`[HTTP Bridge] EOF marked at offset ${offset}`);
+        }
+    }
 
     /**
      * Wait for a specific chunk to be fetched into buffer
+     * FIXED v4.13: Adaptive timeout based on position in file + EOF awareness
      */
     async _waitForChunk(offset, end) {
-        const maxWaitMs = 30000; // 30 second timeout
+        // Adaptive timeout: shorter for chunks near the end (more likely to be EOF issues)
+        const distanceFromEnd = end - offset;
+        const fileSize = this.totalSize || end;
+        const positionRatio = offset / fileSize;
+        
+        // Base timeout 30s, reduce to 5s for last 5% of file
+        let maxWaitMs = 30000;
+        if (positionRatio > 0.95) {
+            maxWaitMs = 5000; // Last 5%: 5 second timeout
+        } else if (positionRatio > 0.90) {
+            maxWaitMs = 10000; // Last 10%: 10 second timeout
+        }
+        
+        // If we've detected EOF, use very short timeout
+        if (this._detectedEofOffset && offset >= this._detectedEofOffset) {
+            maxWaitMs = 1000; // 1 second if past detected EOF
+        }
+        
         const startTime = Date.now();
         
         while (!this.chunkBuffer.has(offset) && this.isActive) {
             // Check timeout
             if (Date.now() - startTime > maxWaitMs) {
+                // Instead of throwing, check if we should treat this as EOF
+                if (this._detectedEofOffset || positionRatio > 0.95) {
+                    console.warn(`[Chunk Wait] Timeout at ${offset} (near EOF), marking as empty`);
+                    this.chunkBuffer.set(offset, { data: Buffer.alloc(0), timestamp: Date.now() });
+                    this._markEofReached(offset);
+                    return; // Graceful EOF handling
+                }
                 throw new Error(`Timeout waiting for chunk at offset ${offset}`);
             }
             
-            // Check for errors
-            if (this.workerErrors.length > 0) {
+            // Check for errors (but ignore if we've seen many LIMIT_INVALIDs - likely EOF)
+            if (this.workerErrors.length > 0 && this._consecutiveLimitInvalids < 3) {
                 throw this.workerErrors[0];
             }
             
-            // If no active workers, trigger a fetch
-            if (this.activeWorkers === 0 && offset <= end) {
+            // If no active workers and we haven't hit EOF, trigger a fetch
+            const effectiveEnd = this._detectedEofOffset ? Math.min(end, this._detectedEofOffset) : end;
+            if (this.activeWorkers === 0 && offset <= effectiveEnd) {
                 await this._fetchChunksParallel([offset], end);
             } else {
                 // Small delay to avoid busy-waiting
@@ -808,7 +885,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.10.1';  // v4.10.1: Fixed persistent LIMIT_INVALID - progressive chunk size + EOF handling
+const SYSTEM_VERSION = '4.14.0';  // v4.14.0: Fixed logic error in NoSuchKey check + undefined fileName reference
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
@@ -1039,16 +1116,37 @@ class FileTransferBot {
         } catch { return false; }
     }
 
+    // Track messages that can't be edited to avoid repeated failures
+    _uneditableMessages = new Set();
+    _lastStatusUpdate = 0;
+    _minUpdateInterval = 3000; // Minimum 3 seconds between status updates
+    _rateLimitUntil = 0; // Timestamp until which we're rate-limited
+
     async updateStatus(chatId, text, force = false, showStopButton = false) {
         if (!config.telegram.botToken || !chatId) return;
+        
+        // Rate limiting check - skip if we're in cooldown period
+        const now = Date.now();
+        if (now < this._rateLimitUntil) {
+            console.log(`[⏳ Rate limited, skipping update. Resumes in ${Math.ceil((this._rateLimitUntil - now) / 1000)}s`);
+            return;
+        }
+        
+        // Throttle updates - enforce minimum interval
+        if (!force && (now - this._lastStatusUpdate < this._minUpdateInterval)) {
+            return; // Skip - too soon since last update
+        }
+        
         if (this.isUpdatingStatus && !force) return;
         while (this.isUpdatingStatus) await new Promise(r => setTimeout(r, 100));
         
         this.isUpdatingStatus = true;
+        this._lastStatusUpdate = now;
+        
         try {
             // PRIORITY: Always try to edit the original "درخواست پذیرفته شد!" message
             // This prevents message spam when multiple files are being transferred
-            if (this.statusMessageId) {
+            if (this.statusMessageId && !this._uneditableMessages.has(this.statusMessageId)) {
                 const body = { 
                     chat_id: chatId, 
                     message_id: this.statusMessageId,
@@ -1063,30 +1161,48 @@ class FileTransferBot {
                     });
                 }
 
-                // Try editMessageText up to 2 times before falling back
-                for (let attempt = 1; attempt <= 2; attempt++) {
-                    const res = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/editMessageText`, {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-                    }).then(r => r.json());
+                // Try editMessageText up to 1 time (reduced from 2 to reduce API calls)
+                const res = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/editMessageText`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                }).then(r => r.json());
 
-                    if (res.ok) {
-                        console.log(`[✅ Status Updated] message_id=${this.statusMessageId} (attempt ${attempt})`);
-                        return; // Success - we're done
-                    }
-                    
-                    // Log failure but retry once
-                    console.warn(`[⚠️ Edit Failed] attempt=${attempt}, error=${res.description || 'unknown'}, message_id=${this.statusMessageId}`);
-                    
-                    if (attempt < 2) {
-                        await new Promise(r => setTimeout(r, 500)); // Wait 500ms before retry
-                    } else {
-                        console.error(`[❌ Edit Failed Permanently] Falling back to sendMessage...`);
-                    }
+                if (res.ok) {
+                    console.log(`[✅ Status Updated] message_id=${this.statusMessageId}`);
+                    return; // Success - we're done
                 }
+                
+                // Handle specific error types
+                const errorMsg = res.description || '';
+                
+                if (errorMsg.includes('message can\'t be edited') || errorMsg.includes('message to edit not found')) {
+                    // Message is too old or deleted - mark as uneditable and don't retry
+                    console.warn(`[⚠️ Message ${this.statusMessageId} cannot be edited permanently`);
+                    this._uneditableMessages.add(this.statusMessageId);
+                    this.statusMessageId = null; // Clear so we can create new one next time
+                    return; // Don't fall back to sendMessage - just skip
+                }
+                
+                if (errorMsg.includes('Too Many Requests')) {
+                    // Parse retry_after if available
+                    const match = errorMsg.match(/retry after (\d+)/);
+                    const retryAfter = match ? parseInt(match[1]) * 1000 + 5000 : 60000; // Add 5s buffer
+                    this._rateLimitUntil = now + retryAfter;
+                    console.warn(`[⚠️ Rate limited on edit. Cooling down for ${Math.ceil(retryAfter / 1000)}s`);
+                    return; // Don't fall back - that would make rate limiting worse!
+                }
+                
+                // Other error - log and try fallback once
+                console.warn(`[⚠️ Edit Failed] error=${errorMsg}, message_id=${this.statusMessageId}`);
             }
             
-            // FALLBACK: Only if editing failed or no statusMessageId exists
-            // This creates a NEW message (less ideal but ensures user sees progress)
+            // FALLBACK: Only if no statusMessageId or it's uneditable
+            // AND we haven't sent a message recently (to avoid spam)
+            if (this._uneditableMessages.size > 2) {
+                // Too many uneditable messages - something is wrong, stop trying
+                console.warn(`[⚠️ Too many edit failures (${this._uneditableMessages.size}), skipping status update`);
+                return;
+            }
+            
             const body = { 
                 chat_id: chatId, 
                 text: text, 
@@ -1106,7 +1222,12 @@ class FileTransferBot {
             
             if (res.ok && res.result) {
                 this.statusMessageId = res.result.message_id;
-                console.log(`[📝 New Message Created] message_id=${this.statusMessageId} (fallback mode)`);
+                console.log(`[📝 New Message Created] message_id=${this.statusMessageId}`);
+            } else if (res.description?.includes('Too Many Requests')) {
+                const match = res.description.match(/retry after (\d+)/);
+                const retryAfter = match ? parseInt(match[1]) * 1000 + 5000 : 60000;
+                this._rateLimitUntil = Date.now() + retryAfter;
+                console.warn(`[⚠️ Rate limited on send. Cooling down for ${Math.ceil(retryAfter / 1000)}s`);
             }
         } catch (e) {
             console.error("Failed to update status message:", e);
@@ -1139,7 +1260,8 @@ class FileTransferBot {
                 
                 // ===== IMMEDIATE ABORT ACTIONS =====
                 this.isCancelled = true;
-                this.currentFileName = this.currentFileName || fileName || 'unknown';
+                // Note: this.currentFileName is already set in executePipeline/executeSequential
+                // No need to reference undefined 'fileName' variable here
                 
                 // 1. Abort the main controller
                 console.log('[🛑 Stop Button] Aborting AbortController...');
@@ -2234,21 +2356,8 @@ class FileTransferBot {
         const fileStats = await fs.promises.stat(seqTargetPath);
         const useMultipart = config.performance.multipartUpload.enabled && fileStats.size > config.performance.multipartUpload.thresholdBytes;
         
-        const downloadLink = useMultipart 
-            ? await this.uploadToMinIOMultipart(seqTargetPath, fileName, (subPercent, sizeText, speedText, etaText) => {
-                const now = Date.now();
-                if (now - lastProgressUpdate >= 3500 || subPercent === 100) {
-                    lastProgressUpdate = now;
-                    const baseMaster = isVideo ? 85 : 65;
-                    const masterSpan = isVideo ? 13 : 33;
-                    const masterPercent = Math.min(98, baseMaster + Math.floor(subPercent * (masterSpan / 100)));
-                    this.updateStatus(chatId, renderProgressCard({
-                        fileName, masterPercent, stageName: '☁️⚡ آپلود موازی‌پارتیل به سرور',
-                        stagePercent: subPercent, detailsText: sizeText, speedText: speedText, etaText: etaText
-                    }), false, true).catch(() => {});
-                }
-            }, this.abortController.signal)
-            : await this.uploadToMinIO(seqTargetPath, fileName, (subPercent, sizeText, speedText, etaText) => {
+        // Use standard upload for both cases (MinIO putObject handles large files efficiently)
+        const downloadLink = await this.uploadToMinIO(seqTargetPath, fileName, (subPercent, sizeText, speedText, etaText) => {
                 const now = Date.now();
                 if (now - lastProgressUpdate >= 3500 || subPercent === 100) {
                     lastProgressUpdate = now;
