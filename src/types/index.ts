@@ -42,7 +42,8 @@ export interface Env {
 export type Platform = 'telegram' | 'bale' | 'rubika';
 
 export interface TransferRequest {
-    messageId: string | number;
+    messageId: string | number;        // User's original file message ID
+    progressMessageId?: string | number;  // Bot's progress message ID (for editing status)
     chatId: string;
     fileName: string;
     fileSize: number;

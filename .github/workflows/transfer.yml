@@ -75,6 +75,7 @@ jobs:
           MINIO_PORT: ${{ secrets.MINIO_PORT }}
           MINIO_USE_SSL: ${{ secrets.MINIO_USE_SSL }}
           MESSAGE_ID: ${{ github.event.client_payload.MESSAGE_ID }}
+          PROCESS_MESSAGE_ID: ${{ github.event.client_payload.PROCESS_MESSAGE_ID }}
           FILE_NAME: ${{ github.event.client_payload.FILE_NAME }}
           FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE }}
           IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO }}

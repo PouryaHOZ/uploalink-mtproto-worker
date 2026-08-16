@@ -926,7 +926,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.16.0';  // v4.16.0: New UI (single پردازش meter) + Message ID validation + Timestamped logs
+const SYSTEM_VERSION = '4.17.0';  // v4.17.0: Dual Message IDs (USER_MESSAGE_ID + PROCESS_MESSAGE_ID) for proper progress tracking
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
@@ -1174,8 +1174,10 @@ async function validateFile(filePath, expectedSize = null) {
 class FileTransferBot {
     constructor() {
         this.telegramClient = new TelegramClientManager();
-        this.statusMessageId = process.env.MESSAGE_ID ? parseInt(process.env.MESSAGE_ID) : null;
-        console.log(`[🎯 Message Tracking] Received MESSAGE_ID=${this.statusMessageId} from environment`);
+        // v4.17.0: Two separate message IDs
+        this.userMessageId = process.env.MESSAGE_ID ? parseInt(process.env.MESSAGE_ID) : null;  // User's original file message
+        this.statusMessageId = process.env.PROCESS_MESSAGE_ID ? parseInt(process.env.PROCESS_MESSAGE_ID) : null;  // Bot's progress message (editable)
+        console.log(`[🎯 Message Tracking] USER_MESSAGE_ID=${this.userMessageId} (original file), PROCESS_MESSAGE_ID=${this.statusMessageId} (progress display)`);
         this.isUpdatingStatus = false;
         this.activeFFmpegProcess = null;
         this.activeHttpBridge = null; // Track HTTP Bridge for stop functionality

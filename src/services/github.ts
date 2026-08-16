@@ -19,6 +19,7 @@ export async function triggerGitHubWorkflow(env: Env, transferId: string, transf
         client_payload: {
             TRANSFER_ID: transferId,
             MESSAGE_ID: transferRequest.messageId.toString(),
+            PROCESS_MESSAGE_ID: transferRequest.progressMessageId?.toString() || transferRequest.messageId.toString(),
             CHAT_ID: transferRequest.chatId,
             FILE_NAME: transferRequest.fileName,
             FILE_SIZE: transferRequest.fileSize.toString(),

@@ -42,6 +42,8 @@ async function processQueue(env: Env, kv: KVService, messenger: Messenger) {
             createdAt: Date.now()
         });
 
+        // v4.17.0: Send progress message for queue-triggered transfers
+        // Note: For queue messages, transfer.js will create its own status update if PROCESS_MESSAGE_ID is not set
         await messenger.sendMessage(
             req.chatId,
             `⚡ <b>مقداردهی و راه‌اندازی سرور:</b>\n\n` +
@@ -727,6 +729,8 @@ export default {
 
             if (transferReq) {
                 transferReq.shouldCompress = shouldCompress;
+                // v4.17.0: Save progress message ID (this message will be edited with progress)
+                transferReq.progressMessageId = messageId;
                 await kv.saveTransferRequest(transferId, transferReq);
 
                 const MAX_CONCURRENT = parseInt(env.MAX_CONCURRENT_TRANSFERS || '3');
