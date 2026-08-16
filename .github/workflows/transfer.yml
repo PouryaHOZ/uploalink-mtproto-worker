@@ -1,85 +1,136 @@
 name: Transfer Large File
 
 on:
+  # Manual trigger (for testing)
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Direct download URL of the file'
+        required: true
+        type: string
+      filename:
+        description: 'Output filename (with extension)'
+        required: true
+        type: string
+      destination:
+        description: 'Destination platform'
+        required: false
+        default: 'telegram'
+        type: choice
+        options:
+          - telegram
+          - bale
+          - rubika
+      chat_id:
+        description: 'Target chat ID'
+        required: true
+        type: string
+      message_id:
+        description: 'Message ID of "درخواست پذیرفته شد!" status message (for UI updates)'
+        required: false
+        type: string
+        default: ''
+
+  # Automated trigger from Cloudflare Worker (via repository_dispatch)
   repository_dispatch:
     types: [forward_file]
 
-concurrency:
-  group: transfer-${{ github.event.client_payload.TRANSFER_ID || github.run_id }}
-  cancel-in-progress: true
+permissions:
+  contents: read
+  actions: write
+  packages: write
+
+env:
+  NODE_VERSION: '22'
 
 jobs:
   transfer:
+    name: Transfer File
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 120
+    
     steps:
-      - name: Checkout repository (Shallow)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          node-version: ${{ env.NODE_VERSION }}
 
-      - name: Setup Node.js 24
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
 
-      - name: Cache node_modules
-        id: cache-node-modules
-        uses: actions/cache@v4
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
         with:
-          path: node_modules
-          key: ${{ runner.os }}-node24-modules-${{ hashFiles('**/pnpm-lock.yaml') }}
+          version: 9
 
-      - name: Install pnpm & Production Dependencies (On Cache Miss)
-        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ====================================================================
+      # EXTRACT MESSAGE_ID from different trigger sources
+      # ====================================================================
+      - name: Extract Message ID
+        id: extract
         run: |
-          corepack enable
-          pnpm config set verify-deps-before-run false
-          pnpm install --prod --no-frozen-lockfile --ignore-scripts
+          # For workflow_dispatch: use input directly
+          MESSAGE_ID="${{ github.event.inputs.message_id }}"
+          
+          # For repository_dispatch: use client_payload (from Cloudflare Worker)
+          if [ -z "$MESSAGE_ID" ] || [ "$MESSAGE_ID" = "" ]; then
+            MESSAGE_ID="${{ github.event.client_payload.MESSAGE_ID }}"
+          fi
+          
+          # Output for next step (handle empty/0 values)
+          echo "message_id=${MESSAGE_ID:-}" >> $GITHUB_OUTPUT
+          echo "📝 Extracted MESSAGE_ID: '${MESSAGE_ID:-NOT PROVIDED}'"
 
-      - name: Cache FFmpeg static binary
-        id: cache-ffmpeg
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/bin/ffmpeg
-          key: ${{ runner.os }}-ffmpeg-static-v1
-
-      - name: Download FFmpeg static binary (On Cache Miss)
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/.local/bin
-          curl -sL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz | tar -xJ --strip-components=1 -C ~/.local/bin --wildcards '*/ffmpeg'
-          chmod +x ~/.local/bin/ffmpeg
-
-      - name: Export PATH & System Config
-        run: |
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          mkdir -p /dev/shm/temp_transfers
-
-      - name: Execute Transfer Script
-        run: node --max-old-space-size=4096 src/transfer.js
+      - name: Download and transfer file
         env:
-          DOWNLOAD_WORKERS: 8
-          DOWNLOAD_CHUNK_SIZE: 262144
-          NODE_ENV: production
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          FILE_URL: ${{ github.event.inputs.file_url || github.event.client_payload.FILE_URL }}
+          FILENAME: ${{ github.event.inputs.filename || github.event.client_payload.FILE_NAME }}
+          DESTINATION: ${{ github.event.inputs.destination || 'telegram' }}
+          CHAT_ID: ${{ github.event.inputs.chat_id || github.event.client_payload.CHAT_ID }}
+          MESSAGE_ID: ${{ steps.extract.outputs.message_id }}
+          TRANSFER_ID: ${{ github.event.client_payload.TRANSFER_ID || format('TR{0}', github.run_id) }}
+          FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE || '0' }}
+          IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO || 'false' }}
+          SHOULD_COMPRESS: ${{ github.event.client_payload.SHOULD_COMPRESS || 'false' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ github.event.client_payload.CHAT_ID }}
-          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-          MINIO_BUCKET_NAME: ${{ secrets.MINIO_BUCKET_NAME }}
-          MINIO_PORT: ${{ secrets.MINIO_PORT }}
-          MINIO_USE_SSL: ${{ secrets.MINIO_USE_SSL }}
-          MESSAGE_ID: ${{ github.event.client_payload.MESSAGE_ID }}
-          FILE_NAME: ${{ github.event.client_payload.FILE_NAME }}
-          FILE_SIZE: ${{ github.event.client_payload.FILE_SIZE }}
-          IS_VIDEO: ${{ github.event.client_payload.IS_VIDEO }}
-          SHOULD_COMPRESS: ${{ github.event.client_payload.SHOULD_COMPRESS }}
-          CLOUDFLARE_WEBHOOK_URL: ${{ secrets.CLOUDFLARE_WEBHOOK_URL }}
+          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          TRANSFER_ID: ${{ github.event.client_payload.TRANSFER_ID }}
-          TEMP_DIR: /dev/shm/temp_transfers
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "=========================================="
+          echo "🚀 Starting File Transfer"
+          echo "=========================================="
+          echo "FILE_URL: ${FILE_URL:0:50}..."
+          echo "FILENAME: $FILENAME"
+          echo "CHAT_ID: $CHAT_ID"
+          echo "MESSAGE_ID: $MESSAGE_ID"
+          echo "TRANSFER_ID: $TRANSFER_ID"
+          echo "IS_VIDEO: $IS_VIDEO"
+          echo "SHOULD_COMPRESS: $SHOULD_COMPRESS"
+          echo "=========================================="
+          
+          node src/transfer.js
+
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          echo "Transfer failed. Check logs for details."
+          exit 1
+
+  cleanup:
+    name: Post-job cleanup
+    runs-on: ubuntu-latest
+    needs: transfer
+    if: always()
+    
+    steps:
+      - name: Clean up workspace
+        run: |
+          echo "Cleanup completed"

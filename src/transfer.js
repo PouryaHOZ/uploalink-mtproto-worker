@@ -90,6 +90,21 @@ const config = {
 if (!fs.existsSync(config.performance.tempDir)) fs.mkdirSync(config.performance.tempDir, { recursive: true });
 
 // ============================================================================
+// TIMESTAMPED LOGGER v4.16.0 - All logs include timestamps for bottleneck analysis
+// ============================================================================
+const _originalConsoleLog = console.log;
+const _originalConsoleWarn = console.warn;
+const _originalConsoleError = console.error;
+
+function getTimestamp() {
+    return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+console.log = (...args) => _originalConsoleLog(`[${getTimestamp()}]`, ...args);
+console.warn = (...args) => _originalConsoleWarn(`[${getTimestamp()}]`, ...args);
+console.error = (...args) => _originalConsoleError(`[${getTimestamp()}]`, ...args);
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
@@ -911,7 +926,7 @@ function drawProgressBar(percent, length = 10) {
     return "█".repeat(filled) + "░".repeat(length - filled);
 }
 
-const SYSTEM_VERSION = '4.15.0';  // v4.15.0: Aggressive early EOF detection - eliminated LIMIT_INVALID storm (30+ calls → 2-3)
+const SYSTEM_VERSION = '4.16.0';  // v4.16.0: New UI (single پردازش meter) + Message ID validation + Timestamped logs
 
 /**
  * Format time in HH:MM:SS or MM:SS format (Persian digits)
@@ -947,11 +962,71 @@ function renderProgressCard({
     overallSpeed = null,
     elapsed = null,
     eta = null,
-    estimatedCompletion = null
+    estimatedCompletion = null,
+    // NEW v4.16.0: Single meter UI fields
+    mode = null,  // 'processing' | 'uploading' | null (legacy)
+    processingPercent = null,
+    uploadPercent = null,
+    uploadedMB = null,
+    totalMB = null,
+    processingSpeed = null,
+    uploadSpeed = null
 }) {
     // Truncate long filenames for mobile
     const displayName = fileName.length > 25 ? fileName.substring(0, 22) + '...' : fileName;
     
+    // ========== v4.16.0: NEW SINGLE-METER UI ==========
+    if (mode === 'processing') {
+        let card = `🎬 <b>${escapeHtml(displayName)}</b> ⚡v${SYSTEM_VERSION}\n\n`;
+        
+        card += `━━━━ پردازش ━━━━\n`;
+        card += `<code>${drawProgressBar(processingPercent || 0, 16)}</code>\n`;
+        card += `<b>${processingPercent || 0}%</b>\n\n`;
+        
+        // Time info
+        if (elapsed !== null || eta !== null) {
+            const elapsedStr = elapsed !== null ? `⏱ ${formatTime(elapsed)} passed` : '';
+            const etaStr = eta !== null ? `⏳ ~${formatTime(eta)} left` : '';
+            const speedStr = processingSpeed ? `⚡ ${processingSpeed}` : '';
+            
+            if (elapsedStr || etaStr) card += `<i>${elapsedStr} | ${etaStr}</i>\n`;
+            if (speedStr) card += `<b>${speedStr}</b>\n`;
+        }
+        
+        card += `\n🔄 در حال پردازش و فشرده‌سازی...`;
+        
+        return card.trim();
+    }
+    
+    if (mode === 'uploading') {
+        let card = `🎬 <b>${escapeHtml(displayName)}</b> ⚡v${SYSTEM_VERSION}\n\n`;
+        
+        // Show completion banner
+        card += `✅ پردازش کامل شد! (${totalMB ? totalMB.toFixed(1) : '?'} MB)\n\n`;
+        
+        card += `━━━━ آپلود ━━━━\n`;
+        card += `<code>${drawProgressBar(uploadPercent || 0, 16)}</code>\n`;
+        card += `<b>${uploadPercent || 0}%</b>\n\n`;
+        
+        // Upload details with MB info
+        if (uploadedMB !== null && totalMB !== null) {
+            card += `📦 <b>${uploadedMB.toFixed(1)}</b> / ${totalMB.toFixed(1)} MB آپلود شده\n`;
+        }
+        
+        // Speed and time
+        const speedStr = uploadSpeed ? `⚡ ${uploadSpeed}` : '';
+        const etaStr = eta !== null ? `⏳ ~${formatTime(eta)} remaining` : '';
+        
+        if (speedStr || etaStr) {
+            card += `${speedStr}${speedStr && etaStr ? ' | ' : ''}${etaStr}\n`;
+        }
+        
+        card += `\n⬆️ در حال تکمیل آپلود...`;
+        
+        return card.trim();
+    }
+    
+    // ========== LEGACY: Multi-stage UI (fallback) ==========
     if (stages && Array.isArray(stages)) {
         let card = `🎬 <b>${escapeHtml(displayName)}</b> ⚡v${SYSTEM_VERSION}\n\n`;
         
@@ -1100,7 +1175,7 @@ class FileTransferBot {
     constructor() {
         this.telegramClient = new TelegramClientManager();
         this.statusMessageId = process.env.MESSAGE_ID ? parseInt(process.env.MESSAGE_ID) : null;
-        console.log(`[🎯 Message Tracking] Will edit message_id=${this.statusMessageId} for status updates`);
+        console.log(`[🎯 Message Tracking] Received MESSAGE_ID=${this.statusMessageId} from environment`);
         this.isUpdatingStatus = false;
         this.activeFFmpegProcess = null;
         this.activeHttpBridge = null; // Track HTTP Bridge for stop functionality
@@ -1125,6 +1200,62 @@ class FileTransferBot {
         this.concurrencyController.on('queued', ({ transferId, position }) => {
             console.log(`[Concurrency] Transfer ${transferId} queued at position ${position}`);
         });
+    }
+
+    /**
+     * v4.16.0: Pre-validate message ID at startup
+     * Detects if the provided MESSAGE_ID is editable (not a user message)
+     * Returns true if valid, false if we should create our own message
+     */
+    async validateMessageId(chatId) {
+        if (!this.statusMessageId || !chatId || !config.telegram.botToken) {
+            console.log(`[🎯 Validation] No MESSAGE_ID or missing config, will create new message`);
+            return false;
+        }
+
+        try {
+            console.log(`[🎯 Validation] Testing if message_id=${this.statusMessageId} is editable...`);
+            
+            // Try to edit the message with a minimal test (empty edit that doesn't change content)
+            const testRes = await fetch(`${config.telegram.baseUrl}/bot${config.telegram.botToken}/editMessageText`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    message_id: this.statusMessageId,
+                    text: '.', // Minimal test content
+                    parse_mode: 'HTML'
+                })
+            }).then(r => r.json());
+
+            if (testRes.ok) {
+                console.log(`[✅ Validation] message_id=${this.statusMessageId} is editable - will use it`);
+                
+                // Revert the test by setting proper initial status immediately
+                return true;
+            } else {
+                const errorMsg = testRes.description || 'Unknown error';
+                
+                if (errorMsg.includes('message can\'t be edited') || 
+                    errorMsg.includes('message to edit not found') ||
+                    errorMsg.includes('message is not modified')) {
+                    
+                    console.warn(`[⚠️ Validation] message_id=${this.statusMessageId} is NOT editable: "${errorMsg}"`);
+                    console.warn(`[⚠️ Validation] This appears to be a user message (not bot's). Will create new status message.`);
+                    
+                    // Clear invalid message ID so we create our own
+                    this.statusMessageId = null;
+                    return false;
+                } else {
+                    console.warn(`[⚠️ Validation] Unexpected error testing message: "${errorMsg}"`);
+                    console.warn(`[⚠️ Validation] Will try to use it anyway and fallback if needed`);
+                    return true; // Might work with actual content
+                }
+            }
+        } catch (err) {
+            console.error(`[❌ Validation] Failed to test message:`, err.message);
+            return true; // Assume it might work, let normal flow handle errors
+        }
     }
 
     async checkCancel() {
@@ -2037,8 +2168,7 @@ class FileTransferBot {
             const dl = this.pipelineState.download.percent || 0;
             const co = this.pipelineState.compress.percent || 0;
             const ul = this.pipelineState.upload.percent || 0;
-            const masterPercent = Math.min(98, Math.floor(dl * 0.4 + co * 0.35 + ul * 0.25 + baseMasterPercent * 0.2));
-
+            
             // Calculate time estimates for v4.3
             const elapsedSec = this.pipelineStartTime ? (now - this.pipelineStartTime) / 1000 : 0;
             
@@ -2051,7 +2181,7 @@ class FileTransferBot {
             };
             
             const dlSpeed = parseSpeed(this.pipelineState.download.speed);
-            const coSpeed = parseSpeed(this.pipelineState.compress.speed); // This is usually in "x" multiplier
+            const coSpeed = this.pipelineState.compress.speed; // This is usually in "x" multiplier
             const ulSpeed = parseSpeed(this.pipelineState.upload.speed);
             
             // Calculate weighted overall speed (prioritize active stages)
@@ -2082,23 +2212,44 @@ class FileTransferBot {
             const totalRemaining = remainingDownloadBytes + remainingUploadBytes;
             const etaSeconds = overallSpeed > 0 ? totalRemaining / overallSpeed : null;
             
-            // Estimated completion time
-            const estimatedCompletion = etaSeconds ? new Date(now + etaSeconds * 1000) : null;
-
-            const text = renderProgressCard({
-                fileName, 
-                masterPercent,
-                stages: [
-                    { icon: '📥', name: 'دانلود', percent: dl, speed: this.pipelineState.download.speed, details: this.pipelineState.download.details },
-                    { icon: '🗜', name: 'فشرده‌سازی', percent: co, speed: this.pipelineState.compress.speed, details: this.pipelineState.compress.details },
-                    { icon: '⬆️', name: 'آپلود', percent: ul, speed: this.pipelineState.upload.speed, details: this.pipelineState.upload.details }
-                ],
-                // NEW v4.3: Time estimates for master progress
-                overallSpeed: overallSpeed * 1024 * 1024, // Convert to bytes/s for formatBytes
-                elapsed: elapsedSec,
-                eta: etaSeconds,
-                estimatedCompletion: estimatedCompletion
-            });
+            // ========== v4.16.0: NEW SINGLE-METER UI LOGIC ==========
+            
+            // Determine which mode to show
+            const isProcessingComplete = co >= 100 || dl >= 100; // Compression or download done
+            const isUploadActive = ul > 0 && ul < 100;
+            
+            // Calculate upload MB values
+            const totalMB = this.estimatedOutputSize ? this.estimatedOutputSize / (1024 * 1024) : null;
+            const uploadedMB = totalMB ? (totalMB * ul / 100) : null;
+            
+            let text;
+            
+            if (isProcessingComplete && isUploadActive) {
+                // UPLOAD COMPLETION MODE: Processing done, showing upload progress
+                text = renderProgressCard({
+                    fileName,
+                    mode: 'uploading',
+                    uploadPercent: Math.min(99, ul),
+                    uploadedMB: uploadedMB,
+                    totalMB: totalMB,
+                    uploadSpeed: this.pipelineState.upload.speed,
+                    eta: etaSeconds,
+                    elapsed: elapsedSec
+                });
+            } else {
+                // PROCESSING MODE: Showing main processing progress (compression/download)
+                // Use compression percent as primary, fallback to download percent
+                const primaryPercent = co > 0 ? co : dl;
+                
+                text = renderProgressCard({
+                    fileName,
+                    mode: 'processing',
+                    processingPercent: Math.min(99, primaryPercent),
+                    processingSpeed: co > 0 ? coSpeed : (dlSpeed ? formatBytes(dlSpeed * 1024 * 1024) + '/s' : null),
+                    elapsed: elapsedSec,
+                    eta: etaSeconds
+                });
+            }
 
             this.updateStatus(chatId, text, false, true).catch(() => {});
         }
@@ -2116,6 +2267,9 @@ class FileTransferBot {
         const transferId = config.transferId || `transfer_${Date.now()}`;
         
         this.currentFileName = fileName;
+
+        // v4.16.0: Pre-validate message ID BEFORE any status updates
+        await this.validateMessageId(chatId);
 
         const callbackPoller = this.startCallbackListener(chatId);
 
